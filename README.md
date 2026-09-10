@@ -22,6 +22,7 @@
 - [docs/architecture.md](docs/architecture.md) — как устроен пайплайн, структура репозитория, модель БД
 - [docs/api_contract.md](docs/api_contract.md) — контракт backend↔frontend, все эндпоинты
 - [docs/decision_log.md](docs/decision_log.md) — **почему** сделано именно так (пригодится для защиты — там же аргументы для судей)
+- [docs/worklog.md](docs/worklog.md) — хронологический журнал того, что уже сделано и когда
 
 ## Статус на сейчас
 
