@@ -23,10 +23,10 @@ class Utility:
 @dataclass
 class Zone:
     """A non-utility spatial constraint or context object: building, road,
-    zoning polygon, existing greenery, territory boundary, etc."""
+    zoning polygon, existing greenery, territory outline, etc."""
 
     geometry: BaseGeometry
-    zone_type: str  # e.g. "building", "road", "zoning", "existing_greenery", "boundary"
+    zone_type: str  # e.g. "building", "road", "zoning", "existing_greenery", "territory"
     attrs: dict = field(default_factory=dict)
 
 

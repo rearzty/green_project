@@ -14,6 +14,20 @@ def test_buildable_area_is_subset_of_territory(synthetic_scene):
     assert buildable.within(territory.buffer(1e-6))
 
 
+def test_buildable_area_excludes_existing_greenery(synthetic_scene):
+    """existing_greenery must be a hard obstacle (exact footprint subtracted),
+    not just a soft ml_scoring distance feature — otherwise the placement
+    algorithm can recommend planting directly inside already-planted areas.
+    """
+    territory, utilities, zones = synthetic_scene["territory"], synthetic_scene["utilities"], synthetic_scene["zones"]
+    greenery = next(z.geometry for z in zones if z.zone_type == "existing_greenery")
+
+    exclusion = build_exclusion_zone(utilities, zones, "tree", NORMS)
+    buildable = buildable_area(territory, exclusion, zones)
+
+    assert buildable.intersection(greenery).area < 1e-6
+
+
 def test_exclusion_zone_grows_with_more_utilities(synthetic_scene):
     utilities, zones = synthetic_scene["utilities"], synthetic_scene["zones"]
     small = build_exclusion_zone(utilities[:1], [], "tree", NORMS)

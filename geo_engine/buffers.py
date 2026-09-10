@@ -40,11 +40,19 @@ def build_exclusion_zone(
     return unary_union(buffered)
 
 
+HARD_OBSTACLE_ZONE_TYPES = ("building", "road", "existing_greenery")
+
+
 def buildable_area(territory: BaseGeometry, exclusion_zone: BaseGeometry, other_zones: list[Zone]) -> BaseGeometry:
     """Territory minus the exclusion zone minus any hard obstacles (buildings,
-    existing pavement/roads) that are never plantable regardless of setback.
+    existing pavement/roads, already-planted greenery) that are never
+    plantable regardless of setback — unlike the setback buffers, these are
+    subtracted as their exact footprint, not grown by a distance. Otherwise
+    a candidate could land directly inside e.g. an existing tree/shrub bed;
+    `ml_scoring` layering `existing_greenery_gap_score` on top only ranks
+    candidates that are already legal, it doesn't make them legal.
     """
-    hard_obstacles = [z.geometry for z in other_zones if z.zone_type in ("building", "road")]
+    hard_obstacles = [z.geometry for z in other_zones if z.zone_type in HARD_OBSTACLE_ZONE_TYPES]
     if exclusion_zone is not None and not exclusion_zone.is_empty:
         result = territory.difference(exclusion_zone)
     else:

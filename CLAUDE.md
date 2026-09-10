@@ -56,6 +56,10 @@ read (geo_engine/io/*) -> Utility/Zone (нормализация по слоям
 
 Нормативы — конфиг, не код: `geo_engine/config/planting_norms.yaml`, читается через `geo_engine/norms.py::load_norms()`. Значения — черновик из текста задания, ждут сверки по полному ТЗ 15.09.
 
+**`zone_type="territory"` — обязательный межмодульный контракт**: `pipeline_service._territory_polygon()` ищет ровно эту зону, чтобы найти границу участка, и все ридеры обязаны её производить единообразно (`shp_geojson_reader`/`generate_synthetic_data.py` — напрямую через `object_type="territory"`, `dxf_reader.DEFAULT_LAYER_MAP` — слой `BOUNDARY`). Раньше DXF-слой `BOUNDARY` маплился в `zone_type="boundary"`, из-за чего DXF-импорт вообще не мог сгенерировать план (`_territory_polygon` не находил зону) — если добавляешь новый ридер или layer_map, следи, чтобы граница участка выходила именно как `"territory"`.
+
+**`buildable_area()` — твёрдые препятствия vs отступы**: `building`/`road`/`existing_greenery` (`buffers.HARD_OBSTACLE_ZONE_TYPES`) вычитаются из buildable-территории по точной геометрии, а не буфером-отступом — кандидат физически не может оказаться внутри уже существующей зелени. `ml_scoring`'овский `existing_greenery_gap_score` работает поверх этого как мягкий ранжирующий фактор (предпочесть больший отступ среди уже легальных кандидатов), а не как замена жёсткому исключению.
+
 **Геометрия в БД (`backend/app/db/models.py`)**: колонки — `Geometry(geometry_type="GEOMETRY", srid=0)`, намеренно без фиксированного SRID, потому что CRS каждого проекта заранее неизвестна. `Project.source_crs` (свободный текст) хранит, в какой CRS реально лежит геометрия проекта; перепроекция в WGS84 для GeoJSON делается в `backend/app/services/geo_io.py::_to_wgs84()` через `pyproj.Transformer` напрямую, а не через PostGIS SRID transform.
 
 **Известный пробел**: `geo_engine/crs.py::ensure_metric_crs()` (авто-определение UTM-зоны и репроекция в метрическую CRS) написана, но нигде не вызывается в реальном потоке — `project_service.create_project_from_file()` кладёт геометрию как есть. Пока всё на синтетике (уже в метрах) это не страшно, но до доверия к буферам на реальных геоданных это нужно подключить.

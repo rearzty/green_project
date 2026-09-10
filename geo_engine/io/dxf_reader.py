@@ -22,7 +22,10 @@ Kind = Literal["utility", "zone"]
 
 # layer name -> (kind, object_type). object_type must match a key in
 # planting_norms.yaml's setbacks_m for utilities, or a zone_type geo_engine
-# understands ("building", "road", "zoning", "existing_greenery", "boundary").
+# understands ("building", "road", "zoning", "existing_greenery", "territory").
+# "territory" is the one zone_type pipeline_service._territory_polygon()
+# requires to find the overall site outline — must match across every
+# reader (see shp_geojson_reader / generate_synthetic_data.py).
 LayerMap = dict[str, tuple[Kind, str]]
 
 DEFAULT_LAYER_MAP: LayerMap = {
@@ -36,7 +39,7 @@ DEFAULT_LAYER_MAP: LayerMap = {
     "ROAD": ("zone", "road"),
     "ZONING": ("zone", "zoning"),
     "EXISTING_GREENERY": ("zone", "existing_greenery"),
-    "BOUNDARY": ("zone", "boundary"),
+    "BOUNDARY": ("zone", "territory"),
 }
 
 
