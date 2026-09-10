@@ -1,0 +1,18 @@
+# Build context is the repo root (see infra/docker-compose.yml).
+FROM node:20-slim AS deps
+WORKDIR /app
+COPY frontend/package.json ./
+RUN npm install
+
+FROM node:20-slim AS build
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY frontend ./
+RUN npm run build
+
+FROM node:20-slim
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=build /app ./
+EXPOSE 3000
+CMD ["npm", "start"]

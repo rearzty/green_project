@@ -1,0 +1,21 @@
+# Build context is the repo root (see infra/docker-compose.yml).
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY pyproject.toml ./
+COPY backend ./backend
+COPY geo_engine ./geo_engine
+COPY ml_scoring ./ml_scoring
+COPY scripts ./scripts
+
+RUN pip install --no-cache-dir -e .
+
+# Bake a fresh weak-labeled synthetic model into the image at build time
+# rather than relying on a gitignored local artifact being present on the
+# host — see ml_scoring/train_synthetic.py for the methodology.
+RUN python -m ml_scoring.train_synthetic
+
+EXPOSE 8000
+
+CMD ["python", "-m", "uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]

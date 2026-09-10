@@ -1,0 +1,10 @@
+.git/
+.venv/
+.idea/
+node_modules/
+frontend/.next/
+frontend/out/
+data/synthetic/*.geojson
+**/__pycache__/
+*.pyc
+.pytest_cache/
