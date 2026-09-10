@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import geopandas as gpd
+import pandas as pd
 
 from geo_engine.model import Utility, Zone
 
@@ -40,13 +41,19 @@ def read_vector_file(
     zones: list[Zone] = []
 
     for _, row in gdf.iterrows():
-        raw_type = str(row.get(type_field, "unknown"))
+        # GeoPandas fills every feature's missing properties with NaN rather
+        # than omitting the column (the DataFrame schema is the union of all
+        # features' properties across the whole file) — treat NaN as "field
+        # absent", not as the literal string "nan", and never let it leak
+        # into `attrs` (NaN isn't valid JSON, so it would fail on insert).
+        raw_value = row.get(type_field)
+        raw_type = "unknown" if pd.isna(raw_value) else str(raw_value)
         object_type = type_map.get(raw_type, raw_type)
         geometry = row.geometry
         if geometry is None or geometry.is_empty:
             continue
 
-        attrs = {k: v for k, v in row.items() if k not in (type_field, "geometry")}
+        attrs = {k: v for k, v in row.items() if k not in (type_field, "geometry") and not pd.isna(v)}
 
         if object_type in UTILITY_TYPES:
             utilities.append(Utility(geometry=geometry, object_type=object_type, layer_source=str(path), attrs=attrs))

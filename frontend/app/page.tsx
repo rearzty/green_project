@@ -23,21 +23,21 @@ const MapView = dynamic(() => import("@/components/MapView"), { ssr: false });
 export default function Home() {
   const [project, setProject] = useState<ProjectOut | null>(null);
   const [plan, setPlan] = useState<PlanOut | null>(null);
-  const [violations, setViolations] = useState<ValidationViolation[]>([]);
+  const [violations, setViolations] = useState<ValidationViolation[] | null>(null);
 
   async function handleUpload(file: File, name: string, sourceCrs: string) {
     const { project_id } = await uploadProject(name, file, sourceCrs || undefined);
     const fetched = await getProject(project_id);
     setProject(fetched);
     setPlan(null);
-    setViolations([]);
+    setViolations(null);
   }
 
   async function handleGenerate(plantingTypes: PlantingType[], scoringMode: ScoringMode) {
     if (!project) return;
     const generated = await generatePlan(project.id, plantingTypes, scoringMode);
     setPlan(generated);
-    setViolations([]);
+    setViolations(null);
   }
 
   async function handleValidate() {

@@ -24,7 +24,7 @@ def patch_item(
     item = get_item_or_404(plan, item_id)
     geometry_dict = patch.geometry.model_dump() if patch.geometry is not None else None
     updated = apply_item_patch(session, item, geometry_dict, patch.planting_type, patch.species)
-    return planting_item_to_geojson_feature(updated)
+    return planting_item_to_geojson_feature(updated, plan.project.source_crs)
 
 
 @router.post("/edit-structured", status_code=204)

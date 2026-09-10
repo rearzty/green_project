@@ -21,6 +21,12 @@ class UnknownOperationError(ValueError):
 def apply_item_patch(session: Session, item: PlantingItemRow, geometry: dict | None, planting_type: str | None, species: str | None) -> PlantingItemRow:
     diff: dict = {}
     if geometry is not None:
+        # TODO(post-15.09): the frontend drags markers in WGS84 (Leaflet's
+        # native CRS), but every other stored geometry is in the project's
+        # source_crs — for a project with a real source_crs set, this needs
+        # a WGS84 -> source_crs reprojection symmetric to geo_io._to_wgs84,
+        # or graphical edits will silently drift off the other geometries.
+        # A no-op today since no project has source_crs set yet.
         diff["geometry"] = geometry
         item.geometry = shape_to_db(shape(geometry))
     if planting_type is not None:

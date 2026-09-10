@@ -76,11 +76,18 @@ def _feature(geometry, **properties) -> dict:
 
 
 def to_geojson(scene: dict) -> dict:
-    features = [_feature(scene["territory"], kind="territory")]
+    """Every feature carries a single `object_type` property — utilities and
+    zones share the same classification field, matching what
+    geo_engine.io.shp_geojson_reader.read_vector_file expects (it tells them
+    apart by checking whether the value is a known utility type). The
+    territory itself is one of scene["zones"] (zone_type="territory"), not a
+    separate feature, so it isn't exported twice.
+    """
+    features = []
     for utility in scene["utilities"]:
-        features.append(_feature(utility.geometry, kind="utility", object_type=utility.object_type))
+        features.append(_feature(utility.geometry, object_type=utility.object_type))
     for zone in scene["zones"]:
-        features.append(_feature(zone.geometry, kind="zone", zone_type=zone.zone_type, **zone.attrs))
+        features.append(_feature(zone.geometry, object_type=zone.zone_type, **zone.attrs))
     return {"type": "FeatureCollection", "features": features}
 
 

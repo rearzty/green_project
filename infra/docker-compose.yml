@@ -19,6 +19,7 @@ services:
     build:
       context: ..
       dockerfile: infra/Dockerfile.backend
+    restart: on-failure
     environment:
       GREENPROJECT_DATABASE_URL: postgresql+psycopg2://greenproject:greenproject@db:5432/greenproject
       GREENPROJECT_CORS_ORIGINS: '["http://localhost:3000"]'

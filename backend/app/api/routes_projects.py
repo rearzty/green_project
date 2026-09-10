@@ -45,5 +45,5 @@ def get_project(project: Project = Depends(get_project_or_404)) -> ProjectOut:
         name=project.name,
         source_crs=project.source_crs,
         created_at=project.created_at,
-        layers=layers_to_feature_collection(project.layers),
+        layers=layers_to_feature_collection(project.layers, project.source_crs),
     )

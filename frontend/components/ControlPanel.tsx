@@ -14,7 +14,8 @@ const PLANTING_TYPE_LABELS: Record<PlantingType, string> = {
 export interface ControlPanelProps {
   hasProject: boolean;
   hasPlan: boolean;
-  violations: ValidationViolation[];
+  /** null = validation hasn't been run yet for the current plan. */
+  violations: ValidationViolation[] | null;
   onUpload: (file: File, name: string, sourceCrs: string) => Promise<void>;
   onGenerate: (plantingTypes: PlantingType[], scoringMode: ScoringMode) => Promise<void>;
   onValidate: () => Promise<void>;
@@ -120,14 +121,14 @@ export function ControlPanel({ hasProject, hasPlan, violations, onUpload, onGene
         <Button variant="outline" disabled={!hasPlan || busy} onClick={() => guarded(onValidate)}>
           Проверить нормативы
         </Button>
-        {violations.length > 0 && (
+        {violations !== null && violations.length > 0 && (
           <ul className="rounded border border-amber-300 bg-amber-50 p-2 text-xs text-amber-800">
             {violations.map((v) => (
               <li key={v.item_id}>{v.message}</li>
             ))}
           </ul>
         )}
-        {hasPlan && violations.length === 0 && (
+        {violations !== null && violations.length === 0 && (
           <p className="text-xs text-greenery-700">Нарушений отступов не найдено.</p>
         )}
         <a href={exportHref} aria-disabled={!hasPlan}>

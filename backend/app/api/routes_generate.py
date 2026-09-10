@@ -17,7 +17,7 @@ def _to_plan_out(plan: Plan) -> PlanOut:
     return PlanOut(
         plan_id=plan.id,
         scoring_mode=plan.scoring_mode,
-        features=planting_items_to_feature_collection(plan.items),
+        features=planting_items_to_feature_collection(plan.items, plan.project.source_crs),
     )
 
 
