@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, HTTPException
 
-from backend.app.api.deps import get_item_or_404, get_plan_or_404, get_project_or_404
-from backend.app.db.models import Plan, Project
-from backend.app.db.session import get_session
+from backend.app.api.deps import PlanDep, ProjectDep, SessionDep, get_item_or_404
 from backend.app.schemas.geo import GeoJSONFeature
 from backend.app.schemas.plan import ItemPatch, StructuredEditRequest, ValidateResponse, ValidationViolation
 from backend.app.services.edit_service import UnknownOperationError, apply_item_patch, apply_structured_edit, validate_plan
@@ -15,12 +12,7 @@ router = APIRouter(prefix="/api/projects/{project_id}/plans/{plan_id}", tags=["e
 
 
 @router.patch("/items/{item_id}", response_model=GeoJSONFeature)
-def patch_item(
-    item_id: str,
-    patch: ItemPatch,
-    plan: Plan = Depends(get_plan_or_404),
-    session: Session = Depends(get_session),
-) -> GeoJSONFeature:
+def patch_item(item_id: str, patch: ItemPatch, plan: PlanDep, session: SessionDep) -> GeoJSONFeature:
     item = get_item_or_404(plan, item_id)
     geometry_dict = patch.geometry.model_dump() if patch.geometry is not None else None
     updated = apply_item_patch(session, item, geometry_dict, patch.planting_type, patch.species)
@@ -28,11 +20,7 @@ def patch_item(
 
 
 @router.post("/edit-structured", status_code=204)
-def edit_structured(
-    request: StructuredEditRequest,
-    plan: Plan = Depends(get_plan_or_404),
-    session: Session = Depends(get_session),
-) -> None:
+def edit_structured(request: StructuredEditRequest, plan: PlanDep, session: SessionDep) -> None:
     try:
         apply_structured_edit(session, plan, request.operation, request.params)
     except UnknownOperationError as exc:
@@ -42,9 +30,6 @@ def edit_structured(
 
 
 @router.post("/validate", response_model=ValidateResponse)
-def validate(
-    project: Project = Depends(get_project_or_404),
-    plan: Plan = Depends(get_plan_or_404),
-) -> ValidateResponse:
+def validate(project: ProjectDep, plan: PlanDep) -> ValidateResponse:
     violations = validate_plan(project, plan)
     return ValidateResponse(violations=[ValidationViolation(**v) for v in violations])

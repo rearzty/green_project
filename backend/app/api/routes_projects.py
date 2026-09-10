@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from backend.app.api.deps import get_project_or_404
-from backend.app.db.models import Project
-from backend.app.db.session import get_session
+from backend.app.api.deps import ProjectDep, SessionDep
 from backend.app.schemas.project import ProjectCreateResponse, ProjectOut
 from backend.app.services.geo_io import layers_to_feature_collection
 from backend.app.services.project_service import UnsupportedFileTypeError, create_project_from_file
@@ -18,10 +16,10 @@ router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 @router.post("", response_model=ProjectCreateResponse)
 def upload_project(
-    name: str = Form(...),
-    source_crs: str | None = Form(None),
-    file: UploadFile = File(...),
-    session: Session = Depends(get_session),
+    name: Annotated[str, Form()],
+    file: Annotated[UploadFile, File()],
+    session: SessionDep,
+    source_crs: Annotated[str | None, Form()] = None,
 ) -> ProjectCreateResponse:
     suffix = Path(file.filename or "").suffix.lower()
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -39,7 +37,7 @@ def upload_project(
 
 
 @router.get("/{project_id}", response_model=ProjectOut)
-def get_project(project: Project = Depends(get_project_or_404)) -> ProjectOut:
+def get_project(project: ProjectDep) -> ProjectOut:
     return ProjectOut(
         id=project.id,
         name=project.name,
