@@ -1,0 +1,33 @@
+[project]
+name = "greenproject"
+version = "0.1.0"
+description = "AI-assisted urban greening layout planner (LCT 2026 hackathon)"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "sqlalchemy>=2.0",
+    "geoalchemy2>=0.15",
+    "alembic>=1.13",
+    "psycopg2-binary>=2.9",
+    "geopandas>=1.0",
+    "shapely>=2.0",
+    "pyproj>=3.6",
+    "ezdxf>=1.3",
+    "scikit-learn>=1.5",
+    "joblib>=1.4",
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "httpx>=0.27",
+]
+
+[tool.setuptools.packages.find]
+include = ["backend*", "geo_engine*", "ml_scoring*"]
