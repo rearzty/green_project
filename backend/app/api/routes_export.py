@@ -3,7 +3,8 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, BackgroundTasks
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 
 from backend.app.api.deps import PlanDep
@@ -13,9 +14,10 @@ router = APIRouter(prefix="/api/projects/{project_id}/plans/{plan_id}", tags=["e
 
 
 @router.get("/export.dxf")
-def export_dxf(plan: PlanDep) -> FileResponse:
+async def export_dxf(plan: PlanDep, background_tasks: BackgroundTasks) -> FileResponse:
     output_path = Path(tempfile.gettempdir()) / f"plan_{plan.id}.dxf"
-    plan_to_dxf(plan, output_path)
+    await run_in_threadpool(plan_to_dxf, plan, output_path)
+    background_tasks.add_task(output_path.unlink, missing_ok=True)
     return FileResponse(
         path=output_path,
         media_type="application/dxf",

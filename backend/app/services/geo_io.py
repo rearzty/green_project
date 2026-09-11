@@ -4,6 +4,7 @@ plain shapely-based domain objects, and the GeoJSON the frontend speaks.
 
 from __future__ import annotations
 
+import uuid
 from functools import lru_cache
 
 from geoalchemy2.shape import from_shape, to_shape
@@ -30,6 +31,11 @@ def _transformer_to_wgs84(source_crs: str) -> Transformer:
     return Transformer.from_crs(source_crs, "EPSG:4326", always_xy=True)
 
 
+@lru_cache(maxsize=32)
+def _transformer_from_wgs84(source_crs: str) -> Transformer:
+    return Transformer.from_crs("EPSG:4326", source_crs, always_xy=True)
+
+
 def _to_wgs84(geometry: BaseGeometry, source_crs: str | None) -> BaseGeometry:
     """Reproject a single geometry to WGS84 for GeoJSON/Leaflet output.
 
@@ -44,6 +50,18 @@ def _to_wgs84(geometry: BaseGeometry, source_crs: str | None) -> BaseGeometry:
     if not source_crs:
         return geometry
     return shapely_transform(_transformer_to_wgs84(source_crs).transform, geometry)
+
+
+def from_wgs84(geometry: BaseGeometry, source_crs: str | None) -> BaseGeometry:
+    """Inverse of `_to_wgs84` — reproject a geometry the frontend sent in
+    WGS84 (Leaflet's native CRS: a dragged marker, a click-drawn edit
+    polygon) back into the project's own `source_crs` before storing it or
+    comparing it against other stored geometry, which is *not* WGS84 whenever
+    source_crs is set. Same no-op passthrough as `_to_wgs84` when it's unset.
+    """
+    if not source_crs:
+        return geometry
+    return shapely_transform(_transformer_from_wgs84(source_crs).transform, geometry)
 
 
 def layer_to_domain(layer: Layer) -> Utility | Zone:
@@ -98,13 +116,21 @@ def planting_items_to_feature_collection(
     return GeoJSONFeatureCollection(features=[planting_item_to_geojson_feature(i, source_crs) for i in items])
 
 
-def domain_item_to_row(plan_id: str, item: PlantingItem) -> PlantingItemRow:
-    return PlantingItemRow(
-        plan_id=plan_id,
-        geometry=shape_to_db(item.geometry),
-        planting_type=item.planting_type,
-        species=item.species,
-        score=item.score,
-        rationale=item.rationale,
-        is_manual_edit=item.is_manual_edit,
-    )
+def domain_item_to_row_values(plan_id: str, item: PlantingItem) -> dict:
+    """Plain dict of PlantingItemRow column values, for a Core bulk INSERT
+    (`sqlalchemy.insert(PlantingItemRow), rows`) rather than individually
+    `session.add()`-ed ORM objects -- generate_plan can produce thousands of
+    these per request, and per-object ORM tracking measured at ~2.5ms/row
+    (no statement batching) where a single bulk INSERT takes a fraction of
+    a second regardless of row count.
+    """
+    return {
+        "id": str(uuid.uuid4()),
+        "plan_id": plan_id,
+        "geometry": shape_to_db(item.geometry),
+        "planting_type": item.planting_type,
+        "species": item.species,
+        "score": item.score,
+        "rationale": item.rationale,
+        "is_manual_edit": item.is_manual_edit,
+    }

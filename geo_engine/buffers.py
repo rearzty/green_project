@@ -11,6 +11,16 @@ from geo_engine.model import PlantingType, Utility, Zone
 from geo_engine.norms import PlantingNorms
 
 
+# Shapely approximates a buffer's round caps/corners with a polygon of
+# `quad_segs` segments per quarter-circle; the default (8) leaves a chordal
+# gap of a couple millimeters at a setback of a few tenths of a meter (now
+# that lawn's setbacks are 0.3-0.5m, not just tree/shrub's 1.5-5.0m, that gap
+# is no longer negligible relative to the required distance). A higher
+# resolution keeps the buffered boundary within ~0.1mm of the true circle at
+# any setback distance we use.
+_BUFFER_QUAD_SEGS = 32
+
+
 def build_exclusion_zone(
     utilities: list[Utility],
     zones: list[Zone],
@@ -24,14 +34,21 @@ def build_exclusion_zone(
     buffered: list[BaseGeometry] = []
 
     for utility in utilities:
+        # Round join/cap: a utility is a line (possibly bent), and a rounded
+        # clearance radius around a pipe/cable is physically the right shape.
         setback = norms.setback_for(utility.object_type, planting_type)
-        buffered.append(utility.geometry.buffer(setback))
+        buffered.append(utility.geometry.buffer(setback, quad_segs=_BUFFER_QUAD_SEGS))
 
     for zone in zones:
         if zone.zone_type not in norms.setbacks_m:
             continue
+        # Mitre join: a zone (building, road) is rectilinear, and offsetting
+        # it should stay rectilinear too -- shapely's default round join
+        # rounds every corner, which for e.g. a building turns a rectangular
+        # setback strip into a blob-cornered shape (visibly wrong on the map)
+        # and bloats the corner into ~30 extra vertices for no reason.
         setback = norms.setback_for(zone.zone_type, planting_type)
-        buffered.append(zone.geometry.buffer(setback))
+        buffered.append(zone.geometry.buffer(setback, quad_segs=_BUFFER_QUAD_SEGS, join_style="mitre"))
 
     if not buffered:
         # No constraints at all -> empty exclusion zone (everything is candidate territory).

@@ -8,6 +8,9 @@ export type GeoJSONFeatureCollection = { type: "FeatureCollection"; features: Ge
 
 export type ScoringMode = "heuristic" | "ml";
 export type PlantingType = "tree" | "shrub" | "lawn";
+export type StructuredEditOperation = "remove_within_radius" | "replace_type_in_zone" | "exclude_polygon";
+/** "none" is a frontend-only state (nothing being drawn) — never sent to the API. */
+export type EditMode = "none" | StructuredEditOperation;
 
 export interface ProjectOut {
   id: string;
@@ -21,6 +24,14 @@ export interface PlanOut {
   plan_id: string;
   scoring_mode: ScoringMode;
   features: GeoJSONFeatureCollection;
+}
+
+export interface PlanSummary {
+  plan_id: string;
+  scoring_mode: ScoringMode;
+  created_at: string;
+  is_current: boolean;
+  item_count: number;
 }
 
 export interface ValidationViolation {
@@ -66,6 +77,13 @@ export async function getPlan(projectId: string, planId: string): Promise<PlanOu
   return request(`/api/projects/${projectId}/plans/${planId}`);
 }
 
+/** Every plan ever generated for this project (heuristic and ml alike) —
+ * lets the UI show which plan is actually on screen instead of only ever
+ * tracking the most recently generated one. */
+export async function listPlans(projectId: string): Promise<PlanSummary[]> {
+  return request(`/api/projects/${projectId}/plans`);
+}
+
 export async function patchItem(
   projectId: string,
   planId: string,
@@ -79,10 +97,14 @@ export async function patchItem(
   });
 }
 
+export async function deleteItem(projectId: string, planId: string, itemId: string): Promise<void> {
+  return request(`/api/projects/${projectId}/plans/${planId}/items/${itemId}`, { method: "DELETE" });
+}
+
 export async function applyStructuredEdit(
   projectId: string,
   planId: string,
-  operation: "remove_within_radius" | "replace_type_in_zone" | "exclude_polygon",
+  operation: StructuredEditOperation,
   params: Record<string, unknown>
 ): Promise<void> {
   return request(`/api/projects/${projectId}/plans/${planId}/edit-structured`, {

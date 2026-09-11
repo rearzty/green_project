@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sqlalchemy.orm import Session
+from fastapi.concurrency import run_in_threadpool
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.db.models import Layer, Project
 from backend.app.services.geo_io import shape_to_db
@@ -36,17 +37,20 @@ def parse_territory_file(path: Path) -> tuple[list[Utility], list[Zone]]:
     )
 
 
-def create_project_from_file(
-    session: Session,
+async def create_project_from_file(
+    session: AsyncSession,
     name: str,
     upload_path: Path,
     source_crs: str | None = None,
 ) -> Project:
-    utilities, zones = parse_territory_file(upload_path)
+    # Parsing (ezdxf/geopandas) is blocking file I/O + CPU work with no
+    # async path of its own -- run it off the event loop rather than
+    # stalling every other request for however long a large file takes.
+    utilities, zones = await run_in_threadpool(parse_territory_file, upload_path)
 
     project = Project(name=name, source_crs=source_crs)
     session.add(project)
-    session.flush()  # assigns project.id
+    await session.flush()  # assigns project.id
 
     for utility in utilities:
         session.add(
@@ -69,6 +73,6 @@ def create_project_from_file(
             )
         )
 
-    session.commit()
-    session.refresh(project)
+    await session.commit()
+    await session.refresh(project)
     return project

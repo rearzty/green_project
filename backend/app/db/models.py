@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timezone
 
 from geoalchemy2 import Geometry
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -59,13 +59,29 @@ class Layer(Base):
 
 
 class Plan(Base):
+    """A `Plan` row is the *recipe* that produced a plan (scoring_mode +
+    planting_types), not necessarily its materialized `planting_items` rows.
+    `generate_plan` is a pure function of (project layers, norms, model
+    artifact, this recipe) -- see CLAUDE.md -- so a plan that nobody has
+    hand-edited is fully reproducible and doesn't need its (potentially
+    hundreds of thousands of) item rows kept at rest forever. `materialized`
+    tracks whether they currently exist; `pipeline_service.ensure_materialized`
+    recomputes them on demand when a pruned plan is opened again.
+    `has_manual_edits` plans are never pruned -- a human-authored change isn't
+    derivable from the recipe, so it has to stay real data.
+    """
+
     __tablename__ = "plans"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_new_uuid)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
     scoring_mode: Mapped[str] = mapped_column(String, default="heuristic")
+    planting_types: Mapped[list[str]] = mapped_column(JSONB, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     is_current: Mapped[bool] = mapped_column(Boolean, default=True)
+    item_count: Mapped[int] = mapped_column(Integer, default=0)
+    materialized: Mapped[bool] = mapped_column(Boolean, default=True)
+    has_manual_edits: Mapped[bool] = mapped_column(Boolean, default=False)
 
     project: Mapped["Project"] = relationship(back_populates="plans")
     items: Mapped[list["PlantingItemRow"]] = relationship(back_populates="plan", cascade="all, delete-orphan")

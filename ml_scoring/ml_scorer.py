@@ -46,10 +46,16 @@ class MLScorer(ScoringStrategy):
         self.existing_greenery = existing_greenery or []
 
     def score(self, candidate: PlantingCandidate) -> tuple[float, str]:
-        features = compute_features(candidate, self.norms, self.existing_greenery)
-        vector = [feature_vector(features)]
-        probability = float(self.pipeline.predict_proba(vector)[0][1])
-        rationale = (
-            f"ML-модель (обучена на синтетических данных): вероятность пригодности {probability:.2f}."
-        )
-        return probability, rationale
+        return self.score_batch([candidate])[0]
+
+    def score_batch(self, candidates: list[PlantingCandidate]) -> list[tuple[float, str]]:
+        if not candidates:
+            return []
+        vectors = [feature_vector(compute_features(c, self.norms, self.existing_greenery)) for c in candidates]
+        # One vectorized sklearn call over the whole batch, not one Python
+        # call per candidate -- see ScoringStrategy.score_batch.
+        probabilities = self.pipeline.predict_proba(vectors)[:, 1]
+        return [
+            (float(p), f"ML-модель (обучена на синтетических данных): вероятность пригодности {p:.2f}.")
+            for p in probabilities
+        ]
