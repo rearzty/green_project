@@ -15,7 +15,7 @@ router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 
 @router.post("", response_model=ProjectCreateResponse)
-def upload_project(
+async def upload_project(
     name: Annotated[str, Form()],
     file: Annotated[UploadFile, File()],
     session: SessionDep,
@@ -23,11 +23,11 @@ def upload_project(
 ) -> ProjectCreateResponse:
     suffix = Path(file.filename or "").suffix.lower()
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(file.file.read())
+        tmp.write(await file.read())
         tmp_path = Path(tmp.name)
 
     try:
-        project = create_project_from_file(session, name=name, upload_path=tmp_path, source_crs=source_crs)
+        project = await create_project_from_file(session, name=name, upload_path=tmp_path, source_crs=source_crs)
     except UnsupportedFileTypeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
@@ -37,7 +37,7 @@ def upload_project(
 
 
 @router.get("/{project_id}", response_model=ProjectOut)
-def get_project(project: ProjectDep) -> ProjectOut:
+async def get_project(project: ProjectDep) -> ProjectOut:
     return ProjectOut(
         id=project.id,
         name=project.name,

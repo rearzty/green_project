@@ -7,6 +7,7 @@ __pycache__/
 ml_scoring/artifacts/*.joblib
 
 data/synthetic/*.geojson
+data/synthetic/*.dxf
 !data/synthetic/.gitkeep
 
 node_modules/

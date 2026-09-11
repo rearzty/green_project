@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel
@@ -19,6 +20,20 @@ class PlanOut(BaseModel):
     plan_id: str
     scoring_mode: ScoringMode
     features: GeoJSONFeatureCollection
+
+
+class PlanSummary(BaseModel):
+    """One row in the project's plan history — lets the UI show every past
+    generation (heuristic vs ml, one run vs another) instead of only ever
+    tracking whichever plan was generated most recently, which is what made
+    separate generations look like they were "getting mixed up" together.
+    """
+
+    plan_id: str
+    scoring_mode: ScoringMode
+    created_at: datetime
+    is_current: bool
+    item_count: int
 
 
 class ItemPatch(BaseModel):

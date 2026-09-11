@@ -15,7 +15,7 @@ from backend.app.db.session import init_db
 async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     # Dev/demo convenience: creates tables if they don't exist yet.
     # Swap for Alembic migrations (backend/app/db/migrations) once schema churn settles.
-    init_db()
+    await init_db()
     yield
 
 

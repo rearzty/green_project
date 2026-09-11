@@ -12,6 +12,7 @@ dependencies = [
     "geoalchemy2>=0.15",
     "alembic>=1.13",
     "psycopg2-binary>=2.9",
+    "asyncpg>=0.29",
     "geopandas>=1.0",
     "shapely>=2.0",
     "pyproj>=3.6",

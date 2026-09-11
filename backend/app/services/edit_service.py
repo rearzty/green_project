@@ -6,11 +6,11 @@ from __future__ import annotations
 
 from shapely.geometry import Point, shape
 from shapely.geometry.base import BaseGeometry
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.config import settings
 from backend.app.db.models import EditHistory, Plan, PlantingItemRow, Project
-from backend.app.services.geo_io import db_to_shape, layers_to_domain, shape_to_db
+from backend.app.services.geo_io import db_to_shape, from_wgs84, layers_to_domain, shape_to_db
 from geo_engine.buffers import build_exclusion_zone
 from geo_engine.norms import load_norms
 
@@ -43,8 +43,18 @@ def _assert_planting_type_matches_geometry(planting_type: str, geometry: BaseGeo
         )
 
 
-def apply_item_patch(session: Session, item: PlantingItemRow, geometry: dict | None, planting_type: str | None, species: str | None) -> PlantingItemRow:
-    new_geometry = shape(geometry) if geometry is not None else None
+async def apply_item_patch(
+    session: AsyncSession,
+    item: PlantingItemRow,
+    geometry: dict | None,
+    planting_type: str | None,
+    species: str | None,
+    source_crs: str | None,
+) -> PlantingItemRow:
+    # The frontend drags markers in WGS84 (Leaflet's native CRS) -- every
+    # other stored geometry is in the project's source_crs, so reproject back
+    # before storing/validating or this silently drifts off everything else.
+    new_geometry = from_wgs84(shape(geometry), source_crs) if geometry is not None else None
     if geometry is not None or planting_type is not None:
         _assert_planting_type_matches_geometry(
             planting_type if planting_type is not None else item.planting_type,
@@ -53,12 +63,6 @@ def apply_item_patch(session: Session, item: PlantingItemRow, geometry: dict | N
 
     diff: dict = {}
     if geometry is not None:
-        # TODO(post-15.09): the frontend drags markers in WGS84 (Leaflet's
-        # native CRS), but every other stored geometry is in the project's
-        # source_crs — for a project with a real source_crs set, this needs
-        # a WGS84 -> source_crs reprojection symmetric to geo_io._to_wgs84,
-        # or graphical edits will silently drift off the other geometries.
-        # A no-op today since no project has source_crs set yet.
         diff["geometry"] = geometry
         item.geometry = shape_to_db(new_geometry)
     if planting_type is not None:
@@ -69,22 +73,42 @@ def apply_item_patch(session: Session, item: PlantingItemRow, geometry: dict | N
         item.species = species
 
     item.is_manual_edit = True
+    item.plan.has_manual_edits = True  # a hand-edited plan is no longer just a recipe -- see Plan's docstring, never pruned by _prune_stale_plans
     session.add(EditHistory(planting_item_id=item.id, diff=diff))
-    session.commit()
-    session.refresh(item)
+    await session.commit()
+    await session.refresh(item)
     return item
 
 
-def apply_structured_edit(session: Session, plan: Plan, operation: str, params: dict) -> None:
+async def delete_item(session: AsyncSession, item: PlantingItemRow) -> None:
+    """Remove a single planting item by id -- the point-and-click counterpart
+    to the area-based `remove_within_radius`/`exclude_polygon` structured
+    edits, for deleting exactly one tree/shrub a designer clicked on. No
+    EditHistory row for this one (same as the other two delete operations,
+    above) -- it would reference a planting_item_id that no longer exists the
+    moment this commits, which is a contradiction, not an audit trail.
+    """
+    plan = item.plan
+    await session.delete(item)
+    plan.item_count -= 1
+    plan.has_manual_edits = True  # see Plan's docstring: never pruned by _prune_stale_plans once a human has touched it
+    await session.commit()
+
+
+async def apply_structured_edit(session: AsyncSession, plan: Plan, operation: str, params: dict, source_crs: str | None) -> None:
+    """`params`' coordinates (x/y, polygon) arrive in WGS84 — same reasoning
+    as apply_item_patch's geometry reprojection, since these come from
+    clicks/drawing on the Leaflet map, not from the project's own CRS."""
     if operation == "remove_within_radius":
-        center = Point(params["x"], params["y"])
+        center = from_wgs84(Point(params["x"], params["y"]), source_crs)
         radius = float(params["radius_m"])
         for item in list(plan.items):
             if db_to_shape(item.geometry).distance(center) <= radius:
-                session.delete(item)
+                await session.delete(item)
+                plan.item_count -= 1
 
     elif operation == "replace_type_in_zone":
-        zone_geom = shape(params["polygon"])
+        zone_geom = from_wgs84(shape(params["polygon"]), source_crs)
         new_type = params["planting_type"]
         matching_items = [item for item in plan.items if db_to_shape(item.geometry).within(zone_geom)]
         for item in matching_items:
@@ -95,15 +119,34 @@ def apply_structured_edit(session: Session, plan: Plan, operation: str, params: 
             session.add(EditHistory(planting_item_id=item.id, diff={"operation": operation, "params": params}))
 
     elif operation == "exclude_polygon":
-        zone_geom = shape(params["polygon"])
+        zone_geom = from_wgs84(shape(params["polygon"]), source_crs)
         for item in list(plan.items):
             if db_to_shape(item.geometry).intersects(zone_geom):
-                session.delete(item)
+                await session.delete(item)
+                plan.item_count -= 1
 
     else:
         raise UnknownOperationError(f"Unknown structured edit operation: {operation}")
 
-    session.commit()
+    plan.has_manual_edits = True  # see Plan's docstring: this plan now holds real, non-derivable data -- never pruned
+    await session.commit()
+
+
+_VIOLATION_AREA_TOLERANCE_M2 = 1e-6
+
+
+def _violates_setback(geometry, exclusion) -> bool:
+    """A Point (tree/shrub) either is or isn't inside the exclusion buffer,
+    so `intersects` is the right check there. A Polygon (lawn) footprint is
+    carved out as exactly `territory.difference(exclusion_zone)`
+    (buffers.buildable_area) though, so its boundary always touches the
+    exclusion zone's boundary by construction -- `intersects` would flag
+    essentially every lawn item as a false positive. Compare the actual
+    overlapping area instead, which ignores boundary-only contact.
+    """
+    if geometry.geom_type == "Point":
+        return geometry.intersects(exclusion)
+    return geometry.intersection(exclusion).area > _VIOLATION_AREA_TOLERANCE_M2
 
 
 def validate_plan(project: Project, plan: Plan) -> list[dict]:
@@ -125,7 +168,7 @@ def validate_plan(project: Project, plan: Plan) -> list[dict]:
             if item.planting_type != planting_type:
                 continue
             geometry = db_to_shape(item.geometry)
-            if geometry.intersects(exclusion):
+            if _violates_setback(geometry, exclusion):
                 violations.append(
                     {
                         "item_id": item.id,

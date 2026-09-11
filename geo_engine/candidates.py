@@ -5,6 +5,7 @@ planting candidates: a point grid for trees/shrubs, whole sub-polygons for lawns
 from __future__ import annotations
 
 import numpy as np
+import shapely
 from shapely.geometry import Point
 from shapely.geometry.base import BaseGeometry
 
@@ -43,7 +44,15 @@ def generate_point_candidates(
     zoning_zones: list[Zone] | None = None,
 ) -> list[PlantingCandidate]:
     """Grid-sample points inside buildable_area, spaced by the species' minimum
-    distance requirement, for point-planted types (tree, shrub)."""
+    distance requirement, for point-planted types (tree, shrub).
+
+    The containment/clearance checks run as vectorized shapely calls over the
+    whole coordinate grid at once rather than one `Point(...).contains(...)`
+    per grid cell in a Python loop — a fine species spacing (e.g. shrub's 1m)
+    over a real (not 100x80m synthetic) territory can put the raw grid in the
+    millions of points, where the per-point Python-level loop is the
+    bottleneck (measured: minutes, vs. a couple of seconds vectorized).
+    """
     spacing = norms.spacing_for(planting_type).min_distance_m
     zoning_zones = zoning_zones or []
     candidates: list[PlantingCandidate] = []
@@ -54,19 +63,29 @@ def generate_point_candidates(
         minx, miny, maxx, maxy = polygon.bounds
         xs = np.arange(minx, maxx + spacing, spacing)
         ys = np.arange(miny, maxy + spacing, spacing)
-        for x in xs:
-            for y in ys:
-                point = Point(x, y)
-                if not polygon.contains(point):
-                    continue
-                candidates.append(
-                    PlantingCandidate(
-                        geometry=point,
-                        planting_type=planting_type,
-                        clearance_m=_clearance(point, exclusion_zone),
-                        zoning=_zoning_at(point, zoning_zones),
-                    )
+        if xs.size == 0 or ys.size == 0:
+            continue
+
+        xx, yy = np.meshgrid(xs, ys)
+        grid_points = shapely.points(xx.ravel(), yy.ravel())
+        inside_points = grid_points[shapely.contains(polygon, grid_points)]
+        if inside_points.size == 0:
+            continue
+
+        if exclusion_zone is not None and not exclusion_zone.is_empty:
+            clearances = shapely.distance(inside_points, exclusion_zone)
+        else:
+            clearances = np.full(inside_points.size, float("inf"))
+
+        for point, clearance in zip(inside_points, clearances):
+            candidates.append(
+                PlantingCandidate(
+                    geometry=point,
+                    planting_type=planting_type,
+                    clearance_m=float(clearance),
+                    zoning=_zoning_at(point, zoning_zones),
                 )
+            )
     return candidates
 
 
