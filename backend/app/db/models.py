@@ -100,15 +100,3 @@ class PlantingItemRow(Base):
     is_manual_edit: Mapped[bool] = mapped_column(Boolean, default=False)
 
     plan: Mapped["Plan"] = relationship(back_populates="items")
-    edits: Mapped[list["EditHistory"]] = relationship(back_populates="item", cascade="all, delete-orphan")
-
-
-class EditHistory(Base):
-    __tablename__ = "edit_history"
-
-    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_new_uuid)
-    planting_item_id: Mapped[str] = mapped_column(ForeignKey("planting_items.id"), nullable=False)
-    diff: Mapped[dict] = mapped_column(JSONB, default=dict)
-    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-
-    item: Mapped["PlantingItemRow"] = relationship(back_populates="edits")

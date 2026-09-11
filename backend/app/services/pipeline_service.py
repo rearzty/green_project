@@ -22,11 +22,19 @@ from ml_scoring.ml_scorer import MLScorer
 from ml_scoring.scoring_strategy import ScoringStrategy
 
 
-def _territory_polygon(zones):
+class MissingTerritoryError(ValueError):
+    """The uploaded file has no territory boundary zone -- nothing can be
+    planned or placed without one. Message is shown to the user as-is."""
+
+
+def territory_polygon(zones):
+    """Not private (despite the rest of this module's helpers) -- edit_service
+    also needs it, to reject manual edits that would place a point outside
+    the project's own territory boundary."""
     for zone in zones:
         if zone.zone_type == "territory":
             return zone.geometry
-    raise ValueError("Project has no 'territory' zone layer — cannot generate a plan.")
+    raise MissingTerritoryError("В загруженном файле нет границы участка (слой territory / BOUNDARY) — план построить нельзя.")
 
 
 def _existing_greenery(zones):
@@ -115,7 +123,7 @@ async def ensure_materialized(session: AsyncSession, plan: Plan) -> Plan:
 
     norms = load_norms(settings.planting_norms_path)
     utilities, zones = layers_to_domain(plan.project.layers)
-    territory = _territory_polygon(zones)
+    territory = territory_polygon(zones)
     existing_greenery = _existing_greenery(zones)
     scorer = build_scorer(plan.scoring_mode, norms, existing_greenery)
 
@@ -156,7 +164,7 @@ async def generate_plan(session: AsyncSession, project: Project, planting_types:
 
     norms = load_norms(settings.planting_norms_path)
     utilities, zones = layers_to_domain(project.layers)
-    territory = _territory_polygon(zones)
+    territory = territory_polygon(zones)
     existing_greenery = _existing_greenery(zones)
     scorer = build_scorer(scoring_mode, norms, existing_greenery)
 

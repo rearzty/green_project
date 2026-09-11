@@ -1,20 +1,21 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
+import { Loader2, Redo2, Shrub, SquareDashedMousePointer, Trash2, TreeDeciduous, Undo2, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import type { EditMode, PlanSummary, PlantingType, ScoringMode, ValidationViolation } from "@/lib/api";
+import { Kbd } from "@/components/ui/kbd";
+import type { PlanSummary, PlantingType, ScoringMode, ValidationViolation } from "@/lib/api";
+import { countLabel, OBJECT_FORMS, PLANTING_TYPE_FORMS, PLANTING_TYPE_LABELS } from "@/lib/format";
+import type { SelectionSummary } from "@/lib/hooks/useSelection";
+import { errorMessage, toast } from "@/lib/toast";
 
-const PLANTING_TYPE_LABELS: Record<PlantingType, string> = {
+export type { SelectionSummary };
+
+const GENERATE_TYPE_LABELS: Record<PlantingType, string> = {
   tree: "Деревья",
   shrub: "Кустарники",
   lawn: "Газон",
-};
-
-const EDIT_MODE_LABELS: Record<Exclude<EditMode, "none">, string> = {
-  remove_within_radius: "Убрать посадки в радиусе",
-  exclude_polygon: "Исключить область (полигон)",
-  replace_type_in_zone: "Заменить тип в области",
 };
 
 function formatPlanLabel(plan: PlanSummary): string {
@@ -27,54 +28,69 @@ export interface ControlPanelProps {
   hasProject: boolean;
   hasPlan: boolean;
   /** True only during the brief client-side restore-from-localStorage pass
-   * right after the page loads (see app/page.tsx) — nothing to click yet,
-   * just avoids a flash of the empty "no project" state while that fetch
-   * is in flight. */
+   * right after the page loads (see app/page.tsx). */
   restoring?: boolean;
-  /** null = validation hasn't been run yet for the current plan. */
-  violations: ValidationViolation[] | null;
+  /** True while a generate job is running server-side (candidate generation
+   * + placement can take tens of seconds on a real-scale territory) --
+   * generation now runs as a background job the frontend polls, see
+   * lib/api.ts::generatePlan. */
+  generating?: boolean;
   onUpload: (file: File, name: string, sourceCrs: string) => Promise<void>;
   onGenerate: (plantingTypes: PlantingType[], scoringMode: ScoringMode) => Promise<void>;
-  onValidate: () => Promise<void>;
   /** Forgets the locally-remembered project/plan (see app/page.tsx) and
    * resets the UI to its empty state. Local-only — does not delete anything
    * from the backend. */
   onClearAll: () => void;
   exportHref?: string;
-  /** Whether the imported utility/zone layers and the generated plan are
-   * currently drawn on the map — separate from *having* them (hasProject/
-   * hasPlan), so a project can stay loaded but be hidden to declutter the
-   * view when several uploads' worth of geometry would otherwise stack. */
   showLayers: boolean;
   showPlan: boolean;
   onToggleShowLayers: (show: boolean) => void;
   onToggleShowPlan: (show: boolean) => void;
-  /** Every plan generated so far for the current project — each `generate`
-   * call makes a new one rather than overwriting the last, which used to
-   * look like heuristic/ml results "getting mixed up" with no way to tell
-   * which plan was actually on screen. */
+  /** Every plan generated so far for the current project. */
   plans: PlanSummary[];
   currentPlanId?: string;
   onSelectPlan: (planId: string) => Promise<void>;
-  editMode: EditMode;
-  onSetEditMode: (mode: EditMode) => void;
-  editRadiusM: number;
-  onSetEditRadiusM: (radius: number) => void;
-  editTargetType: PlantingType;
-  onSetEditTargetType: (type: PlantingType) => void;
-  canApplyEdit: boolean;
-  onApplyEdit: () => Promise<void>;
-  onCancelEdit: () => void;
+
+  /** An edit is being saved — edit actions and plan switching wait for it. */
+  editBusy: boolean;
+  /** Last-5-edits local undo/redo — see lib/undoStack.ts. */
+  canUndo: boolean;
+  canRedo: boolean;
+  onUndo: () => void;
+  onRedo: () => void;
+  selectMode: boolean;
+  onToggleSelectMode: () => void;
+  selection: SelectionSummary | null;
+  onRetypeSelection: (type: "tree" | "shrub") => void;
+  onDeleteSelection: () => void;
+  onClearSelection: () => void;
+  onSelectAll: () => void;
+
+  /** Re-checked automatically after every edit and whenever a plan opens. */
+  validating: boolean;
+  /** null = not checked yet for the current plan. */
+  violations: ValidationViolation[] | null;
+  onFocusItem: (itemId: string) => void;
+}
+
+function describeSelection(selection: SelectionSummary): string {
+  if (selection.single) {
+    const score = Number.isFinite(selection.single.score) ? ` · оценка ${selection.single.score.toFixed(2)}` : "";
+    return `${PLANTING_TYPE_LABELS[selection.single.type]}${score}`;
+  }
+  return (Object.keys(selection.counts) as PlantingType[])
+    .filter((type) => selection.counts[type] > 0)
+    .map((type) => countLabel(selection.counts[type], PLANTING_TYPE_FORMS[type]))
+    .join(", ");
 }
 
 export function ControlPanel({
   hasProject,
   hasPlan,
   restoring = false,
-  violations,
+  generating = false,
   onUpload,
   onGenerate,
-  onValidate,
   onClearAll,
   exportHref,
   showLayers,
@@ -84,15 +100,21 @@ export function ControlPanel({
   plans,
   currentPlanId,
   onSelectPlan,
-  editMode,
-  onSetEditMode,
-  editRadiusM,
-  onSetEditRadiusM,
-  editTargetType,
-  onSetEditTargetType,
-  canApplyEdit,
-  onApplyEdit,
-  onCancelEdit,
+  editBusy,
+  canUndo,
+  canRedo,
+  onUndo,
+  onRedo,
+  selectMode,
+  onToggleSelectMode,
+  selection,
+  onRetypeSelection,
+  onDeleteSelection,
+  onClearSelection,
+  onSelectAll,
+  validating,
+  violations,
+  onFocusItem,
 }: ControlPanelProps) {
   const [file, setFile] = useState<File | null>(null);
   const [name, setName] = useState("Тестовая территория");
@@ -104,15 +126,15 @@ export function ControlPanel({
   const [plantingTypes, setPlantingTypes] = useState<PlantingType[]>(["tree", "shrub", "lawn"]);
   const [scoringMode, setScoringMode] = useState<ScoringMode>("heuristic");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // Per violation group: how many times "show on map" was clicked, to step through its items.
+  const [violationCursor, setViolationCursor] = useState<Record<string, number>>({});
 
   async function guarded(action: () => Promise<void>) {
     setBusy(true);
-    setError(null);
     try {
       await action();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      toast.error(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -122,8 +144,23 @@ export function ControlPanel({
     setPlantingTypes((prev) => (prev.includes(type) ? prev.filter((t) => t !== type) : [...prev, type]));
   }
 
+  // Every violation of one kind carries the same message -- one row per
+  // kind with a count reads better than the same sentence repeated N times.
+  const violationGroups = useMemo(() => {
+    const groups = new Map<string, string[]>();
+    for (const v of violations ?? []) {
+      const ids = groups.get(v.message) ?? [];
+      ids.push(v.item_id);
+      groups.set(v.message, ids);
+    }
+    return [...groups.entries()];
+  }, [violations]);
+
+  const hasSelection = selection !== null && selection.total > 0;
+  const canEdit = hasPlan && !editBusy;
+
   return (
-    <aside className="flex h-full w-80 flex-col gap-4 overflow-y-auto border-r border-stone-200 bg-white p-4">
+    <aside className="flex h-full w-80 flex-none flex-col gap-4 overflow-y-auto border-r border-stone-200 bg-white p-4">
       <div className="flex items-start justify-between gap-2">
         <div>
           <h1 className="text-lg font-semibold text-greenery-700">GreenProject</h1>
@@ -157,37 +194,33 @@ export function ControlPanel({
           placeholder="CRS (необязательно, напр. EPSG:32637)"
           className="rounded border border-stone-300 px-2 py-1 text-sm"
         />
-        <input
-          type="file"
-          accept=".dxf,.geojson,.json,.shp"
-          onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-          className="text-sm"
-        />
-        <Button
-          disabled={!file || busy}
-          onClick={() => file && guarded(() => onUpload(file, name, sourceCrs))}
-        >
+        <input type="file" accept=".dxf,.geojson,.json,.shp" onChange={(e) => setFile(e.target.files?.[0] ?? null)} className="text-sm" />
+        <Button disabled={!file || busy} onClick={() => file && guarded(() => onUpload(file, name, sourceCrs))}>
           Загрузить
         </Button>
       </section>
 
       <section className="flex flex-col gap-2 border-t border-stone-200 pt-3">
-        <h2 className="text-sm font-medium">2. Сгенерировать план</h2>
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-medium">2. Сгенерировать план</h2>
+          {generating && (
+            <span className="flex items-center gap-1 text-xs text-stone-500">
+              <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+              Генерация…
+            </span>
+          )}
+        </div>
         <div className="flex flex-col gap-1 text-sm">
-          {(Object.keys(PLANTING_TYPE_LABELS) as PlantingType[]).map((type) => (
+          {(Object.keys(GENERATE_TYPE_LABELS) as PlantingType[]).map((type) => (
             <label key={type} className="flex items-center gap-2">
               <input type="checkbox" checked={plantingTypes.includes(type)} onChange={() => toggleType(type)} />
-              {PLANTING_TYPE_LABELS[type]}
+              {GENERATE_TYPE_LABELS[type]}
             </label>
           ))}
         </div>
         <div className="flex gap-3 text-sm">
           <label className="flex items-center gap-1">
-            <input
-              type="radio"
-              checked={scoringMode === "heuristic"}
-              onChange={() => setScoringMode("heuristic")}
-            />
+            <input type="radio" checked={scoringMode === "heuristic"} onChange={() => setScoringMode("heuristic")} />
             Эвристика
           </label>
           <label className="flex items-center gap-1">
@@ -196,7 +229,7 @@ export function ControlPanel({
           </label>
         </div>
         <Button
-          disabled={!hasProject || plantingTypes.length === 0 || busy}
+          disabled={!hasProject || plantingTypes.length === 0 || busy || editBusy || generating}
           onClick={() => guarded(() => onGenerate(plantingTypes, scoringMode))}
         >
           Сгенерировать план
@@ -210,7 +243,7 @@ export function ControlPanel({
             {plans.map((p) => (
               <li key={p.plan_id}>
                 <button
-                  disabled={busy}
+                  disabled={busy || editBusy}
                   onClick={() => guarded(() => onSelectPlan(p.plan_id))}
                   className={`w-full rounded border px-2 py-1 text-left ${
                     p.plan_id === currentPlanId ? "border-greenery-500 bg-greenery-50" : "border-stone-200"
@@ -225,62 +258,101 @@ export function ControlPanel({
       )}
 
       <section className="flex flex-col gap-2 border-t border-stone-200 pt-3">
-        <h2 className="text-sm font-medium">Ручная правка плана</h2>
-        <p className="text-xs text-stone-500">
-          Клик по дереву/кусту на карте — сменить тип или удалить; перетаскивание — переместить. Операции ниже — массовые, по области.
-        </p>
-        <select
-          value={editMode}
-          disabled={!hasPlan}
-          onChange={(e) => onSetEditMode(e.target.value as EditMode)}
-          className="rounded border border-stone-300 px-2 py-1 text-sm"
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-medium">Правка плана</h2>
+          {editBusy && (
+            <span className="flex items-center gap-1 text-xs text-stone-500">
+              <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+              Сохранение…
+            </span>
+          )}
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          <Button variant="outline" size="sm" disabled={!canUndo || !canEdit} onClick={onUndo} title="Отменить последнюю правку">
+            <Undo2 className="mr-1.5 h-4 w-4" aria-hidden />
+            Отменить
+            <Kbd className="ml-auto">Ctrl+Z</Kbd>
+          </Button>
+          <Button variant="outline" size="sm" disabled={!canRedo || !canEdit} onClick={onRedo} title="Повторить отменённую правку">
+            <Redo2 className="mr-1.5 h-4 w-4" aria-hidden />
+            Повторить
+            <Kbd className="ml-auto">Ctrl+Y</Kbd>
+          </Button>
+        </div>
+
+        <Button
+          variant={selectMode ? "default" : "outline"}
+          size="sm"
+          disabled={!hasPlan || !showPlan}
+          onClick={onToggleSelectMode}
+          aria-pressed={selectMode}
+          title="Левой кнопкой по карте — рамка выделения вместо перемещения карты"
         >
-          <option value="none">Не редактировать</option>
-          {(Object.keys(EDIT_MODE_LABELS) as (keyof typeof EDIT_MODE_LABELS)[]).map((mode) => (
-            <option key={mode} value={mode}>
-              {EDIT_MODE_LABELS[mode]}
-            </option>
-          ))}
-        </select>
-        {editMode === "remove_within_radius" && (
-          <label className="flex items-center gap-2 text-sm">
-            Радиус, м
-            <input
-              type="number"
-              min={1}
-              value={editRadiusM}
-              onChange={(e) => onSetEditRadiusM(Number(e.target.value))}
-              className="w-20 rounded border border-stone-300 px-2 py-1"
-            />
-          </label>
-        )}
-        {editMode === "replace_type_in_zone" && (
-          <label className="flex items-center gap-2 text-sm">
-            Новый тип
-            <select value={editTargetType} onChange={(e) => onSetEditTargetType(e.target.value as PlantingType)} className="rounded border border-stone-300 px-2 py-1">
-              {(Object.keys(PLANTING_TYPE_LABELS) as PlantingType[]).map((type) => (
-                <option key={type} value={type}>
-                  {PLANTING_TYPE_LABELS[type]}
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
-        {editMode !== "none" && (
-          <p className="text-xs text-stone-500">
-            {editMode === "remove_within_radius" ? "Кликните на карте, чтобы поставить центр." : "Кликайте на карте, чтобы отметить вершины области."}
-          </p>
-        )}
-        {editMode !== "none" && (
-          <div className="flex gap-2">
-            <Button disabled={!canApplyEdit || busy} onClick={() => guarded(onApplyEdit)} className="flex-1">
-              Применить
+          <SquareDashedMousePointer className="mr-1.5 h-4 w-4" aria-hidden />
+          {selectMode ? "Режим выделения: вкл" : "Режим выделения: выкл"}
+          <Kbd className={`ml-auto ${selectMode ? "border-greenery-500 bg-greenery-700 text-white" : ""}`}>S</Kbd>
+        </Button>
+
+        <p className="text-xs text-stone-500">
+          {selectMode
+            ? "Потяните по карте — выделить рамкой (с Shift — добавить к выделению). Потяните выделенное — переместить."
+            : "Клик по объекту — выделить (Shift — несколько), перетаскивание точки — переместить. Для рамки включите режим выделения."}{" "}
+          ПКМ — меню действий.
+        </p>
+
+        <div className={`flex flex-col gap-2 rounded-md border p-2 ${hasSelection ? "border-blue-200 bg-blue-50/60" : "border-stone-200"}`}>
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0 text-xs">
+              {hasSelection ? (
+                <>
+                  <p className="font-medium text-stone-800">Выделено: {countLabel(selection.total, OBJECT_FORMS)}</p>
+                  <p className="truncate text-stone-600">{describeSelection(selection)}</p>
+                  {selection.single?.violation && <p className="text-red-700">Нарушен норматив отступа</p>}
+                </>
+              ) : (
+                <p className="text-stone-500">Ничего не выделено</p>
+              )}
+            </div>
+            {hasSelection ? (
+              <button onClick={onClearSelection} className="flex items-center gap-1 rounded px-1 text-xs text-stone-500 hover:bg-white" title="Снять выделение">
+                <X className="h-3.5 w-3.5" aria-hidden />
+                <Kbd>Esc</Kbd>
+              </button>
+            ) : (
+              <button
+                onClick={onSelectAll}
+                disabled={!hasPlan || !showPlan}
+                className="rounded px-1 text-xs text-greenery-700 hover:bg-greenery-50 disabled:opacity-40"
+              >
+                Выделить всё <Kbd>Ctrl+A</Kbd>
+              </button>
+            )}
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <Button variant="outline" size="sm" disabled={!hasSelection || !canEdit} onClick={() => onRetypeSelection("tree")}>
+              <TreeDeciduous className="mr-1.5 h-4 w-4" aria-hidden />
+              Дерево
+              <Kbd className="ml-auto">1</Kbd>
             </Button>
-            <Button variant="outline" onClick={onCancelEdit} className="flex-1">
-              Отмена
+            <Button variant="outline" size="sm" disabled={!hasSelection || !canEdit} onClick={() => onRetypeSelection("shrub")}>
+              <Shrub className="mr-1.5 h-4 w-4" aria-hidden />
+              Кустарник
+              <Kbd className="ml-auto">2</Kbd>
             </Button>
           </div>
-        )}
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={!hasSelection || !canEdit}
+            onClick={onDeleteSelection}
+            className="border-red-200 text-red-700 hover:bg-red-50"
+          >
+            <Trash2 className="mr-1.5 h-4 w-4" aria-hidden />
+            Удалить
+            <Kbd className="ml-auto">Del</Kbd>
+          </Button>
+        </div>
       </section>
 
       <section className="flex flex-col gap-2 border-t border-stone-200 pt-3">
@@ -296,19 +368,47 @@ export function ControlPanel({
       </section>
 
       <section className="flex flex-col gap-2 border-t border-stone-200 pt-3">
-        <h2 className="text-sm font-medium">3. Проверить и экспортировать</h2>
-        <Button variant="outline" disabled={!hasPlan || busy} onClick={() => guarded(onValidate)}>
-          Проверить нормативы
-        </Button>
-        {violations !== null && violations.length > 0 && (
-          <ul className="rounded border border-amber-300 bg-amber-50 p-2 text-xs text-amber-800">
-            {violations.map((v) => (
-              <li key={v.item_id}>{v.message}</li>
-            ))}
-          </ul>
-        )}
-        {violations !== null && violations.length === 0 && (
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-medium">3. Нормативы и экспорт</h2>
+          {validating && hasPlan && (
+            <span className="flex items-center gap-1 text-xs text-stone-500">
+              <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+              Проверка…
+            </span>
+          )}
+        </div>
+        {hasPlan && violations !== null && violations.length === 0 && (
           <p className="text-xs text-greenery-700">Нарушений отступов не найдено.</p>
+        )}
+        {hasPlan && violations !== null && violations.length > 0 && (
+          <div className="rounded-md border border-red-200 bg-red-50 p-2 text-xs text-red-800">
+            <p className="flex items-center gap-1.5 font-medium">
+              <span className="inline-block h-2.5 w-2.5 flex-none rounded-full bg-red-600" aria-hidden />
+              Нарушений: {violations.length} — отмечены на карте красным
+            </p>
+            <ul className="mt-1.5 flex flex-col gap-1">
+              {violationGroups.map(([message, ids]) => {
+                const clicks = violationCursor[message] ?? 0;
+                return (
+                  <li key={message} className="flex items-center justify-between gap-2">
+                    <span className="min-w-0">
+                      {message} <span className="text-red-600">× {ids.length}</span>
+                    </span>
+                    <button
+                      disabled={!showPlan}
+                      onClick={() => {
+                        onFocusItem(ids[clicks % ids.length]);
+                        setViolationCursor((c) => ({ ...c, [message]: clicks + 1 }));
+                      }}
+                      className="flex-none rounded border border-red-200 bg-white px-1.5 py-0.5 text-red-700 hover:bg-red-100 disabled:opacity-40"
+                    >
+                      {clicks === 0 || ids.length === 1 ? "Показать" : `Следующее ${(clicks % ids.length) + 1}/${ids.length}`}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
         )}
         <a href={exportHref} aria-disabled={!hasPlan}>
           <Button variant="outline" disabled={!hasPlan} className="w-full">
@@ -316,8 +416,6 @@ export function ControlPanel({
           </Button>
         </a>
       </section>
-
-      {error && <p className="rounded border border-red-300 bg-red-50 p-2 text-xs text-red-700">{error}</p>}
     </aside>
   );
 }

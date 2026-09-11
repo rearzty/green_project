@@ -19,6 +19,13 @@ class Settings(BaseSettings):
     # error on every request ("failed to fetch" with no server-side trace,
     # since the browser blocks the request before it's sent).
     cors_origins: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    # Also match any device on a private LAN (phone on the same wifi, e.g.
+    # testing from http://192.168.1.43:3000) regardless of which address
+    # DHCP happens to hand out -- a fixed IP in cors_origins would break the
+    # moment the router reassigns it. Covers all of RFC 1918 (10.0.0.0/8,
+    # 172.16.0.0/12, 192.168.0.0/16), not just 192.168.x.x, since which
+    # private range a given router uses varies.
+    cors_origin_regex: str = r"^http://(192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}):3000$"
 
     model_config = SettingsConfigDict(env_prefix="GREENPROJECT_", env_file=".env", extra="ignore")
 

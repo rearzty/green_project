@@ -1,8 +1,11 @@
 # Build context is the repo root (see infra/docker-compose.yml).
 FROM node:20-slim AS deps
 WORKDIR /app
-COPY frontend/package.json ./
-RUN npm install
+COPY frontend/package.json frontend/package-lock.json ./
+# npm ci, not npm install -- installs exactly what's pinned in
+# package-lock.json (reproducible across machines/CI) and is faster (skips
+# npm's own dependency-resolution step, which install always redoes).
+RUN npm ci
 
 FROM node:20-slim AS build
 WORKDIR /app

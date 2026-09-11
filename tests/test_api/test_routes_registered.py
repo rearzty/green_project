@@ -31,9 +31,14 @@ def test_expected_routes_are_registered():
     assert "/api/projects" in paths
     assert "/api/projects/{project_id}" in paths
     assert "/api/projects/{project_id}/generate" in paths
+    assert "/api/projects/{project_id}/generate/{job_id}" in paths
     assert "/api/projects/{project_id}/plans/{plan_id}" in paths
     assert "/api/projects/{project_id}/plans/{plan_id}/items/{item_id}" in paths
-    assert "/api/projects/{project_id}/plans/{plan_id}/edit-structured" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/items/delete" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/items/retype" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/items/move" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/items/restore" in paths
     assert "/api/projects/{project_id}/plans/{plan_id}/validate" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/validate/items" in paths
     assert "/api/projects/{project_id}/plans/{plan_id}/export.dxf" in paths
     assert "/api/config/planting-norms" in paths

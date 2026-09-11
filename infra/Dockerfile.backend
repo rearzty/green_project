@@ -4,12 +4,29 @@ FROM python:3.11-slim
 WORKDIR /app
 
 COPY pyproject.toml ./
+
+# Third-party dependencies only, straight from pyproject.toml's own
+# [project.dependencies] list -- this heavy layer (numpy/scipy/shapely/
+# geopandas/scikit-learn/...) then only invalidates when pyproject.toml
+# itself changes, not on every source edit below. `pip install -e .` here
+# instead (reading the local source to figure out what to install) would key
+# Docker's layer cache off the COPY'd source, so any one-line code change
+# forced a full dependency reinstall from scratch (measured ~2 minutes) --
+# the actual local package below is a near-instant --no-deps link once its
+# dependencies are already satisfied.
+RUN python -c "import tomllib; print('\n'.join(tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']))" > /tmp/requirements.txt \
+    && pip install --no-cache-dir -r /tmp/requirements.txt
+
 COPY backend ./backend
 COPY geo_engine ./geo_engine
 COPY ml_scoring ./ml_scoring
 COPY scripts ./scripts
+# Alembic migrations live under backend/app/db/migrations (already copied
+# above) -- alembic.ini itself is at the repo root, and db/session.py's
+# init_db() needs it at startup to run `alembic upgrade head`.
+COPY alembic.ini ./
 
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir -e . --no-deps
 
 # Bake a fresh weak-labeled synthetic model into the image at build time
 # rather than relying on a gitignored local artifact being present on the

@@ -33,8 +33,13 @@ services:
     build:
       context: ..
       dockerfile: infra/Dockerfile.frontend
-    environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8000
+    # No NEXT_PUBLIC_API_URL here -- Next.js inlines NEXT_PUBLIC_* at `next
+    # build` time (inside Dockerfile.frontend's `npm run build` layer), which
+    # runs before this `environment:` block exists at all (that's `docker
+    # run`, after the image is already built) -- setting it here was always
+    # a no-op. frontend/lib/api.ts derives the API host from the page's own
+    # hostname at runtime instead, which also means it doesn't need to know
+    # this machine's LAN IP up front.
     ports:
       - "3000:3000"
     depends_on:

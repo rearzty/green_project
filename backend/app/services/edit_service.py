@@ -1,25 +1,31 @@
-"""Manual plan corrections: point-and-drag item patches, the fixed-vocabulary
-structured "text" edits, and post-edit normative validation.
+"""Manual plan corrections: single-item patches, id-based batch edits (what
+the map's selection tool and the frontend's local undo/redo drive), and
+normative validation.
+
+User-facing error messages here are Russian on purpose -- the frontend shows
+them to the designer as-is in its toast notifications.
 """
 
 from __future__ import annotations
 
+import numpy as np
+import shapely
+from shapely.affinity import translate
 from shapely.geometry import Point, shape
 from shapely.geometry.base import BaseGeometry
+from sqlalchemy import delete, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.core.config import settings
-from backend.app.db.models import EditHistory, Plan, PlantingItemRow, Project
-from backend.app.services.geo_io import db_to_shape, from_wgs84, layers_to_domain, shape_to_db
-from geo_engine.buffers import build_exclusion_zone
-from geo_engine.norms import load_norms
+from backend.app.db.models import Plan, PlantingItemRow, Project
+from backend.app.services import exclusion_cache
+from backend.app.services.geo_io import db_to_shape, from_wgs84, planting_items_to_geojson_dicts, shape_to_db
 
 _POINT_PLANTING_TYPES = {"tree", "shrub"}
 _POLYGON_PLANTING_TYPES = {"lawn"}
+_PLANTING_TYPE_LABELS = {"tree": "Дерево", "shrub": "Кустарник", "lawn": "Газон"}
 
-
-class UnknownOperationError(ValueError):
-    pass
+# asyncpg caps one statement at 32767 bind parameters -- keep IN (...) lists well under that.
+_IN_CLAUSE_CHUNK = 5000
 
 
 class PlantingTypeGeometryMismatchError(ValueError):
@@ -31,16 +37,60 @@ class PlantingTypeGeometryMismatchError(ValueError):
     """
 
 
+class OutOfTerritoryError(ValueError):
+    """A manual edit tried to place an item outside the project's own
+    territory boundary -- physically impossible (you can't plant a tree
+    beyond the edge of the plot), unlike a setback violation, which is a
+    design choice /validate warns about but manual edits are still allowed
+    to make (see validate_plan's docstring).
+    """
+
+
+class ItemsNotFoundError(LookupError):
+    """Some ids in a batch edit no longer exist in the plan -- typically a
+    stale selection or undo entry after the plan changed underneath it.
+    Raised before anything is mutated, so a batch is all-or-nothing."""
+
+
+class ItemsAlreadyExistError(LookupError):
+    """A restore was asked to recreate ids that are already in the plan (e.g.
+    an undo applied twice). Refused instead of hitting a primary-key clash."""
+
+
 def _assert_planting_type_matches_geometry(planting_type: str, geometry: BaseGeometry) -> None:
     geom_type = geometry.geom_type
     if planting_type in _POINT_PLANTING_TYPES and geom_type != "Point":
-        raise PlantingTypeGeometryMismatchError(
-            f"planting_type='{planting_type}' requires Point geometry, got {geom_type}"
-        )
+        label = _PLANTING_TYPE_LABELS[planting_type]
+        raise PlantingTypeGeometryMismatchError(f"Тип «{label}» можно назначить только отдельной посадке, а не площадному объекту.")
     if planting_type in _POLYGON_PLANTING_TYPES and geom_type != "Polygon":
-        raise PlantingTypeGeometryMismatchError(
-            f"planting_type='{planting_type}' requires Polygon geometry, got {geom_type}"
-        )
+        raise PlantingTypeGeometryMismatchError("Газон — площадной объект: его нельзя назначить отдельному дереву или кусту.")
+
+
+def _assert_all_within_territory(geometries: list[BaseGeometry], project: Project) -> None:
+    """One cached territory lookup and one vectorized `within` for a whole
+    batch -- every manual edit calls this, so re-parsing project layers each
+    time (like this used to) is O(edits x layers) over a session; the
+    territory itself never changes after upload, so exclusion_cache keeps it
+    built once per project (see its module docstring)."""
+    if not geometries:
+        return
+    within = exclusion_cache.with_territory(project, lambda territory: bool(np.all(shapely.within(geometries, territory))))
+    if not within:
+        raise OutOfTerritoryError("Нельзя разместить посадку за границей участка.")
+
+
+def _items_by_ids(plan: Plan, ids: list[str]) -> list[PlantingItemRow]:
+    by_id = {item.id: item for item in plan.items}
+    unique_ids = list(dict.fromkeys(ids))
+    missing = [item_id for item_id in unique_ids if item_id not in by_id]
+    if missing:
+        raise ItemsNotFoundError(f"Не найдено объектов плана: {len(missing)} — план изменился. Выделите объекты заново.")
+    return [by_id[item_id] for item_id in unique_ids]
+
+
+def _chunks(values: list, size: int = _IN_CLAUSE_CHUNK):
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
 
 
 async def apply_item_patch(
@@ -60,34 +110,25 @@ async def apply_item_patch(
             planting_type if planting_type is not None else item.planting_type,
             new_geometry if new_geometry is not None else db_to_shape(item.geometry),
         )
+    if new_geometry is not None:
+        _assert_all_within_territory([new_geometry], item.plan.project)
 
-    diff: dict = {}
     if geometry is not None:
-        diff["geometry"] = geometry
         item.geometry = shape_to_db(new_geometry)
     if planting_type is not None:
-        diff["planting_type"] = planting_type
         item.planting_type = planting_type
     if species is not None:
-        diff["species"] = species
         item.species = species
 
     item.is_manual_edit = True
     item.plan.has_manual_edits = True  # a hand-edited plan is no longer just a recipe -- see Plan's docstring, never pruned by _prune_stale_plans
-    session.add(EditHistory(planting_item_id=item.id, diff=diff))
     await session.commit()
     await session.refresh(item)
     return item
 
 
 async def delete_item(session: AsyncSession, item: PlantingItemRow) -> None:
-    """Remove a single planting item by id -- the point-and-click counterpart
-    to the area-based `remove_within_radius`/`exclude_polygon` structured
-    edits, for deleting exactly one tree/shrub a designer clicked on. No
-    EditHistory row for this one (same as the other two delete operations,
-    above) -- it would reference a planting_item_id that no longer exists the
-    moment this commits, which is a contradiction, not an audit trail.
-    """
+    """Remove a single planting item by id."""
     plan = item.plan
     await session.delete(item)
     plan.item_count -= 1
@@ -95,85 +136,208 @@ async def delete_item(session: AsyncSession, item: PlantingItemRow) -> None:
     await session.commit()
 
 
-async def apply_structured_edit(session: AsyncSession, plan: Plan, operation: str, params: dict, source_crs: str | None) -> None:
-    """`params`' coordinates (x/y, polygon) arrive in WGS84 — same reasoning
-    as apply_item_patch's geometry reprojection, since these come from
-    clicks/drawing on the Leaflet map, not from the project's own CRS."""
-    if operation == "remove_within_radius":
-        center = from_wgs84(Point(params["x"], params["y"]), source_crs)
-        radius = float(params["radius_m"])
-        for item in list(plan.items):
-            if db_to_shape(item.geometry).distance(center) <= radius:
-                await session.delete(item)
-                plan.item_count -= 1
+async def delete_items(session: AsyncSession, plan: Plan, ids: list[str], source_crs: str | None) -> list[dict]:
+    """Batch delete by id (the selection tool's Del, the redo of a delete).
+    Returns each item's pre-delete GeoJSON snapshot -- exactly what
+    restore_items needs to undo it. Core DELETEs rather than per-object ORM
+    deletes: the ORM's own flush would emit one DELETE statement per row,
+    which a large selection can't afford.
+    """
+    items = _items_by_ids(plan, ids)
+    snapshots = planting_items_to_geojson_dicts(items, source_crs)
+    for chunk in _chunks([item.id for item in items]):
+        await session.execute(delete(PlantingItemRow).where(PlantingItemRow.id.in_(chunk)).execution_options(synchronize_session=False))
+    plan.item_count -= len(items)
+    plan.has_manual_edits = True
+    await session.commit()
+    return snapshots
 
-    elif operation == "replace_type_in_zone":
-        zone_geom = from_wgs84(shape(params["polygon"]), source_crs)
-        new_type = params["planting_type"]
-        matching_items = [item for item in plan.items if db_to_shape(item.geometry).within(zone_geom)]
-        for item in matching_items:
+
+async def retype_items(
+    session: AsyncSession, plan: Plan, changes: list[tuple[str, str]], source_crs: str | None
+) -> tuple[list[dict], list[str]]:
+    """Batch planting_type change, one target type per item -- so the same
+    call serves the selection tool ("make all of these trees") and an undo
+    restoring each item's own previous type.
+
+    Items whose geometry can't take the requested type (a lawn polygon asked
+    to become a tree) are skipped and reported, not treated as a failure: for
+    a selection that happens to include the lawn, "retype the points, leave
+    the lawn alone" is what the designer means. Items already of the
+    requested type are left alone and not reported as changed, so their undo
+    won't touch them either. Returns (pre-change snapshots of what actually
+    changed, skipped ids) -- geometry never changes here, so the frontend
+    patches its local copy's `planting_type` directly instead of needing a
+    post-change snapshot back.
+    """
+    items = _items_by_ids(plan, [item_id for item_id, _ in changes])
+    target_by_id = dict(changes)
+
+    changed: list[tuple[PlantingItemRow, str]] = []
+    skipped: list[str] = []
+    for item in items:
+        new_type = target_by_id[item.id]
+        try:
             _assert_planting_type_matches_geometry(new_type, db_to_shape(item.geometry))
-        for item in matching_items:
-            item.planting_type = new_type
-            item.is_manual_edit = True
-            session.add(EditHistory(planting_item_id=item.id, diff={"operation": operation, "params": params}))
+        except PlantingTypeGeometryMismatchError:
+            skipped.append(item.id)
+            continue
+        if item.planting_type != new_type:
+            changed.append((item, new_type))
 
-    elif operation == "exclude_polygon":
-        zone_geom = from_wgs84(shape(params["polygon"]), source_crs)
-        for item in list(plan.items):
-            if db_to_shape(item.geometry).intersects(zone_geom):
-                await session.delete(item)
-                plan.item_count -= 1
+    previous = planting_items_to_geojson_dicts([item for item, _ in changed], source_crs)
+    for item, new_type in changed:
+        item.planting_type = new_type
+        item.is_manual_edit = True
+    if changed:
+        plan.has_manual_edits = True
+    await session.commit()
+    return previous, skipped
 
-    else:
-        raise UnknownOperationError(f"Unknown structured edit operation: {operation}")
 
-    plan.has_manual_edits = True  # see Plan's docstring: this plan now holds real, non-derivable data -- never pruned
+async def move_items(
+    session: AsyncSession,
+    plan: Plan,
+    ids: list[str],
+    from_point: tuple[float, float],
+    to_point: tuple[float, float],
+    source_crs: str | None,
+) -> list[dict]:
+    """Batch translate by id -- the selection tool's drag, a single marker's
+    drag, and both directions of their undo/redo. `from_point`/`to_point` are
+    the drag's start and end (WGS84, like every other edit); the vector is
+    their difference once reprojected into source_crs, applied to each item's
+    own geometry, so a point and a lawn polygon move the same way. Id-based
+    rather than zone-based on purpose: re-selecting "whatever is in this
+    rectangle now" at undo time picked up the wrong items once they'd moved.
+    All-or-nothing -- if any moved item would leave the territory, nothing
+    moves. Returns the moved items' post-move GeoJSON snapshots: the exact
+    stored position depends on a WGS84 round trip through source_crs, which
+    the frontend's own optimistic drag preview (plain WGS84 math) doesn't
+    replicate exactly, so it takes these back rather than assuming its
+    preview already matches what got stored.
+    """
+    items = _items_by_ids(plan, ids)
+    start = from_wgs84(Point(*from_point), source_crs)
+    end = from_wgs84(Point(*to_point), source_crs)
+    dx, dy = end.x - start.x, end.y - start.y
+
+    moved = [translate(db_to_shape(item.geometry), xoff=dx, yoff=dy) for item in items]
+    _assert_all_within_territory(moved, plan.project)
+    for item, geometry in zip(items, moved):
+        item.geometry = shape_to_db(geometry)
+        item.is_manual_edit = True
+    if items:
+        plan.has_manual_edits = True
+    await session.commit()
+    return planting_items_to_geojson_dicts(items, source_crs)
+
+
+async def restore_items(session: AsyncSession, plan: Plan, features: list[dict], source_crs: str | None) -> None:
+    """Undo's counterpart to a delete -- recreates specific items (same id,
+    geometry, type, species, score, rationale) from their pre-delete GeoJSON
+    snapshots. Validated like a fresh edit (type/geometry match, inside the
+    territory) even though both should hold for something that existed a
+    moment ago -- cheap, and avoids trusting client-supplied data unchecked.
+    Doesn't return anything: the caller already has these exact features (it
+    sent them), so there's nothing new to hand back.
+    """
+    existing_ids = {item.id for item in plan.items}
+    if any(feature["properties"]["id"] in existing_ids for feature in features):
+        raise ItemsAlreadyExistError("Эти объекты уже есть в плане — отменять нечего.")
+
+    geometries = [from_wgs84(shape(feature["geometry"]), source_crs) for feature in features]
+    for feature, geometry in zip(features, geometries):
+        _assert_planting_type_matches_geometry(feature["properties"]["planting_type"], geometry)
+    _assert_all_within_territory(geometries, plan.project)
+
+    rows = [
+        {
+            "id": feature["properties"]["id"],
+            "plan_id": plan.id,
+            "geometry": shape_to_db(geometry),
+            "planting_type": feature["properties"]["planting_type"],
+            "species": feature["properties"].get("species", "default"),
+            "score": feature["properties"].get("score", 0.0),
+            "rationale": feature["properties"].get("rationale", ""),
+            # Undo puts the item back exactly as it was -- a generated item stays "generated".
+            "is_manual_edit": bool(feature["properties"].get("is_manual_edit", False)),
+        }
+        for feature, geometry in zip(features, geometries)
+    ]
+    if rows:
+        await session.execute(insert(PlantingItemRow), rows)
+    plan.item_count += len(rows)
+    plan.has_manual_edits = True
     await session.commit()
 
 
 _VIOLATION_AREA_TOLERANCE_M2 = 1e-6
 
 
-def _violates_setback(geometry, exclusion) -> bool:
-    """A Point (tree/shrub) either is or isn't inside the exclusion buffer,
-    so `intersects` is the right check there. A Polygon (lawn) footprint is
-    carved out as exactly `territory.difference(exclusion_zone)`
-    (buffers.buildable_area) though, so its boundary always touches the
-    exclusion zone's boundary by construction -- `intersects` would flag
-    essentially every lawn item as a false positive. Compare the actual
-    overlapping area instead, which ignores boundary-only contact.
+def violation_mask(geometries: list[BaseGeometry], exclusion: BaseGeometry | None) -> np.ndarray:
+    """Vectorized setback check -- True where an item violates `exclusion`.
+
+    A Point (tree/shrub) violates by being inside the buffer at all
+    (`intersects`). A Polygon (lawn) is carved out as exactly
+    territory.difference(exclusion) by buffers.buildable_area, so its
+    boundary always touches the exclusion boundary by construction; compare
+    the actual overlapping area instead, so boundary-only contact isn't
+    flagged (it used to be -- every generated lawn was a false positive).
     """
-    if geometry.geom_type == "Point":
-        return geometry.intersects(exclusion)
-    return geometry.intersection(exclusion).area > _VIOLATION_AREA_TOLERANCE_M2
+    geoms = np.empty(len(geometries), dtype=object)
+    geoms[:] = geometries
+    mask = np.zeros(len(geoms), dtype=bool)
+    if exclusion is None or exclusion.is_empty or len(geoms) == 0:
+        return mask
+
+    is_point = shapely.get_type_id(geoms) == shapely.GeometryType.POINT
+    if is_point.any():
+        mask[is_point] = shapely.intersects(geoms[is_point], exclusion)
+    if (~is_point).any():
+        mask[~is_point] = shapely.area(shapely.intersection(geoms[~is_point], exclusion)) > _VIOLATION_AREA_TOLERANCE_M2
+    return mask
+
+
+def _check_violations(project: Project, items: list[PlantingItemRow]) -> list[dict]:
+    by_type: dict[str, list[PlantingItemRow]] = {}
+    for item in items:
+        by_type.setdefault(item.planting_type, []).append(item)
+
+    violations: list[dict] = []
+    for planting_type, type_items in by_type.items():
+        geometries = [db_to_shape(item.geometry) for item in type_items]
+        mask = exclusion_cache.with_exclusion_zone(project, planting_type, lambda zone: violation_mask(geometries, zone))
+        label = _PLANTING_TYPE_LABELS.get(planting_type, planting_type)
+        violations.extend(
+            {"item_id": item.id, "message": f"{label}: нарушен норматив отступа от сетей или зданий."}
+            for item, violated in zip(type_items, mask)
+            if violated
+        )
+    return violations
 
 
 def validate_plan(project: Project, plan: Plan) -> list[dict]:
-    """Re-check every item in the plan against the setback rulebook — used
-    after manual edits, which are allowed to violate norms (a designer may
-    have a legitimate reason) but must surface a clear warning when they do.
+    """Re-check every item in the plan against the setback rulebook. Manual
+    edits are allowed to violate norms (a designer may have a legitimate
+    reason) but must surface a clear warning when they do -- the frontend
+    runs this once when a plan opens, and validate_items (below) after each
+    edit. Zones come from exclusion_cache, so repeated calls don't rebuild
+    them.
     """
-    norms = load_norms(settings.planting_norms_path)
-    utilities, zones = layers_to_domain(project.layers)
+    return _check_violations(project, plan.items)
 
-    violations: list[dict] = []
-    planting_types = {item.planting_type for item in plan.items}
 
-    for planting_type in planting_types:
-        exclusion = build_exclusion_zone(utilities, zones, planting_type, norms)
-        if exclusion is None or exclusion.is_empty:
-            continue
-        for item in plan.items:
-            if item.planting_type != planting_type:
-                continue
-            geometry = db_to_shape(item.geometry)
-            if _violates_setback(geometry, exclusion):
-                violations.append(
-                    {
-                        "item_id": item.id,
-                        "message": f"Нарушен норматив отступа для типа посадки '{planting_type}'.",
-                    }
-                )
-
-    return violations
+def validate_items(project: Project, plan: Plan, ids: list[str]) -> list[dict]:
+    """Same check as validate_plan, restricted to specific items -- the
+    setback check is per-item and independent of every other planting (it
+    only compares against the fixed exclusion zone, never against other
+    items), so an edit can only ever change violation status for the items
+    it actually touched. The frontend calls this instead of a full
+    validate_plan after every move/retype/restore, merging the result into
+    its own violation set by id -- avoids a full plan's worth of checks
+    (cheap per item thanks to exclusion_cache, but still linear in plan size)
+    on every single edit.
+    """
+    wanted = set(ids)
+    return _check_violations(project, [item for item in plan.items if item.id in wanted])

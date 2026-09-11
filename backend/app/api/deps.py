@@ -25,7 +25,7 @@ async def get_project_or_404(project_id: str, session: SessionDep) -> Project:
     )
     project = result.scalar_one_or_none()
     if project is None:
-        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+        raise HTTPException(status_code=404, detail="Проект не найден — возможно, он был удалён.")
     return project
 
 
@@ -40,7 +40,7 @@ async def get_plan_or_404(project_id: str, plan_id: str, session: SessionDep) ->
     )
     plan = result.scalar_one_or_none()
     if plan is None or plan.project_id != project_id:
-        raise HTTPException(status_code=404, detail=f"Plan {plan_id} not found for project {project_id}")
+        raise HTTPException(status_code=404, detail="План не найден в этом проекте.")
     if not plan.materialized:
         # A plan not currently open and never hand-edited has its
         # planting_items rows pruned (see pipeline_service.Plan docstring) --
@@ -59,4 +59,4 @@ def get_item_or_404(plan: Plan, item_id: str) -> PlantingItemRow:
     for item in plan.items:
         if item.id == item_id:
             return item
-    raise HTTPException(status_code=404, detail=f"Planting item {item_id} not found in plan {plan.id}")
+    raise HTTPException(status_code=404, detail="Объект плана не найден — возможно, он уже удалён.")
