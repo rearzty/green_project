@@ -16,10 +16,9 @@ node_modules/
 frontend/.next/
 frontend/out/
 frontend/tsconfig.tsbuildinfo
+frontend/next-env.d.ts
 
 .env
 .env.local
 
-.idea/workspace.xml
-.idea/usage.statistics.xml
-.idea/shelf/
+.idea/
