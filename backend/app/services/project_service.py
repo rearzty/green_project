@@ -33,7 +33,7 @@ def parse_territory_file(path: Path) -> tuple[list[Utility], list[Zone]]:
     if suffix in (".geojson", ".json", ".shp"):
         return read_vector_file(path, type_field="object_type")
     raise UnsupportedFileTypeError(
-        f"Unsupported file type '{suffix}'. Supported: {', '.join(sorted(SUPPORTED_SUFFIXES))}"
+        f"Неподдерживаемый формат файла «{suffix or 'без расширения'}». Поддерживаются: {', '.join(sorted(SUPPORTED_SUFFIXES))}."
     )
 
 

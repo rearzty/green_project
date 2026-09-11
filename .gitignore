@@ -10,9 +10,12 @@ data/synthetic/*.geojson
 data/synthetic/*.dxf
 !data/synthetic/.gitkeep
 
+data/samples/*.geojson
+
 node_modules/
 frontend/.next/
 frontend/out/
+frontend/tsconfig.tsbuildinfo
 
 .env
 .env.local
