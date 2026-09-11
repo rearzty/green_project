@@ -5,6 +5,7 @@ structured "text" edits, and post-edit normative validation.
 from __future__ import annotations
 
 from shapely.geometry import Point, shape
+from shapely.geometry.base import BaseGeometry
 from sqlalchemy.orm import Session
 
 from backend.app.core.config import settings
@@ -13,12 +14,43 @@ from backend.app.services.geo_io import db_to_shape, layers_to_domain, shape_to_
 from geo_engine.buffers import build_exclusion_zone
 from geo_engine.norms import load_norms
 
+_POINT_PLANTING_TYPES = {"tree", "shrub"}
+_POLYGON_PLANTING_TYPES = {"lawn"}
+
 
 class UnknownOperationError(ValueError):
     pass
 
 
+class PlantingTypeGeometryMismatchError(ValueError):
+    """A planting_type change would pair the type with a geometry kind
+    nothing downstream produces for it: geo_engine.candidates only ever makes
+    lawn a whole sub-polygon (generate_area_candidates) and tree/shrub a
+    point (generate_point_candidates), and ml_scoring/the DXF export assume
+    that pairing holds.
+    """
+
+
+def _assert_planting_type_matches_geometry(planting_type: str, geometry: BaseGeometry) -> None:
+    geom_type = geometry.geom_type
+    if planting_type in _POINT_PLANTING_TYPES and geom_type != "Point":
+        raise PlantingTypeGeometryMismatchError(
+            f"planting_type='{planting_type}' requires Point geometry, got {geom_type}"
+        )
+    if planting_type in _POLYGON_PLANTING_TYPES and geom_type != "Polygon":
+        raise PlantingTypeGeometryMismatchError(
+            f"planting_type='{planting_type}' requires Polygon geometry, got {geom_type}"
+        )
+
+
 def apply_item_patch(session: Session, item: PlantingItemRow, geometry: dict | None, planting_type: str | None, species: str | None) -> PlantingItemRow:
+    new_geometry = shape(geometry) if geometry is not None else None
+    if geometry is not None or planting_type is not None:
+        _assert_planting_type_matches_geometry(
+            planting_type if planting_type is not None else item.planting_type,
+            new_geometry if new_geometry is not None else db_to_shape(item.geometry),
+        )
+
     diff: dict = {}
     if geometry is not None:
         # TODO(post-15.09): the frontend drags markers in WGS84 (Leaflet's
@@ -28,7 +60,7 @@ def apply_item_patch(session: Session, item: PlantingItemRow, geometry: dict | N
         # or graphical edits will silently drift off the other geometries.
         # A no-op today since no project has source_crs set yet.
         diff["geometry"] = geometry
-        item.geometry = shape_to_db(shape(geometry))
+        item.geometry = shape_to_db(new_geometry)
     if planting_type is not None:
         diff["planting_type"] = planting_type
         item.planting_type = planting_type
@@ -54,11 +86,13 @@ def apply_structured_edit(session: Session, plan: Plan, operation: str, params: 
     elif operation == "replace_type_in_zone":
         zone_geom = shape(params["polygon"])
         new_type = params["planting_type"]
-        for item in plan.items:
-            if db_to_shape(item.geometry).within(zone_geom):
-                item.planting_type = new_type
-                item.is_manual_edit = True
-                session.add(EditHistory(planting_item_id=item.id, diff={"operation": operation, "params": params}))
+        matching_items = [item for item in plan.items if db_to_shape(item.geometry).within(zone_geom)]
+        for item in matching_items:
+            _assert_planting_type_matches_geometry(new_type, db_to_shape(item.geometry))
+        for item in matching_items:
+            item.planting_type = new_type
+            item.is_manual_edit = True
+            session.add(EditHistory(planting_item_id=item.id, diff={"operation": operation, "params": params}))
 
     elif operation == "exclude_polygon":
         zone_geom = shape(params["polygon"])
