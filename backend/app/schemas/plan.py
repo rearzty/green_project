@@ -33,6 +33,24 @@ class GenerateJobStatus(BaseModel):
     error: str | None = None
 
 
+class ExportJobOut(BaseModel):
+    """POST /export-dxf starts a background job instead of blocking the
+    request -- writing a real-scale plan (hundreds of thousands of items)
+    measured up to ~3 minutes (see CLAUDE.md's export benchmark), the same
+    class of problem /generate already solves this way. See
+    backend/app/services/export_jobs.py."""
+
+    job_id: str
+
+
+ExportJobState = Literal["pending", "done", "error"]
+
+
+class ExportJobStatus(BaseModel):
+    status: ExportJobState
+    error: str | None = None
+
+
 class PlanOut(BaseModel):
     plan_id: str
     scoring_mode: ScoringMode

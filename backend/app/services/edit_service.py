@@ -66,15 +66,41 @@ def _assert_planting_type_matches_geometry(planting_type: str, geometry: BaseGeo
         raise PlantingTypeGeometryMismatchError("Газон — площадной объект: его нельзя назначить отдельному дереву или кусту.")
 
 
+_TERRITORY_TOLERANCE_M = 1e-3  # 1mm -- see _assert_all_within_territory
+
+
 def _assert_all_within_territory(geometries: list[BaseGeometry], project: Project) -> None:
     """One cached territory lookup and one vectorized `within` for a whole
     batch -- every manual edit calls this, so re-parsing project layers each
     time (like this used to) is O(edits x layers) over a session; the
     territory itself never changes after upload, so exclusion_cache keeps it
-    built once per project (see its module docstring)."""
+    built once per project (see its module docstring).
+
+    Checked against the territory buffered outward by _TERRITORY_TOLERANCE_M,
+    not the exact boundary -- restoring a deleted item reprojects its
+    delete-snapshot geometry source_crs -> WGS84 -> source_crs (see
+    delete_items/restore_items), a real forward+inverse pyproj round trip
+    whenever source_crs is set, not a no-op. Measured noise from that round
+    trip: ~1e-9 m per coordinate. A lawn polygon carved out by
+    buffers.buildable_area() as exactly territory.difference(exclusion)
+    always has some edge touching the territory boundary by construction, and
+    plain shapely.within has zero tolerance for a vertex nudged even a
+    billionth of a meter past it -- restoring an item that never actually
+    moved could still be rejected as "outside the territory". Same class of
+    problem violation_mask already tolerates for the exclusion-zone check
+    (area-based there since it also has to ignore genuine boundary contact,
+    not just noise); a 1mm buffer here is simpler and works for both Point
+    and Polygon geometries uniformly, while staying far below any real edit
+    distance (canopy radii/min_distance are metre-scale) so a genuinely
+    out-of-territory placement is still rejected.
+    """
     if not geometries:
         return
-    within = exclusion_cache.with_territory(project, lambda territory: bool(np.all(shapely.within(geometries, territory))))
+
+    def _all_within_tolerant(territory: BaseGeometry) -> bool:
+        return bool(np.all(shapely.within(geometries, territory.buffer(_TERRITORY_TOLERANCE_M))))
+
+    within = exclusion_cache.with_territory(project, _all_within_tolerant)
     if not within:
         raise OutOfTerritoryError("Нельзя разместить посадку за границей участка.")
 

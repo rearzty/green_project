@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
-  exportDxfUrl,
+  exportDxf,
   generatePlan,
   getPlan,
   getProject,
@@ -16,6 +16,7 @@ import {
   type ProjectOut,
   type ScoringMode,
 } from "@/lib/api";
+import { buildPlanIndex, patchPlanIndex, type PlanIndex } from "@/lib/planIndex";
 import { clearAllUndoHistory } from "@/lib/undoStack";
 
 // Remembers which project/plan was open so a page refresh doesn't lose it --
@@ -96,14 +97,25 @@ export function useProjectSession() {
   const [plans, setPlans] = useState<PlanSummary[]>([]);
   const [planRevision, setPlanRevision] = useState(0);
   const [generating, setGenerating] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [restoring, setRestoring] = useState(true);
 
+  // Not React state on purpose: a full rebuild on every edit (the natural
+  // useMemo-on-plan approach) measured at up to ~1.6s on a real-scale plan
+  // (see CLAUDE.md), almost all of it useless work re-deriving entries that
+  // didn't change. Mutated in place by patchPlanIndex and read fresh on
+  // every render instead -- consumers already re-render on planRevision, so
+  // no separate change-signal is needed for this ref.
+  const planIndexRef = useRef<PlanIndex | undefined>(undefined);
+
   function applyPlan(next: PlanOut | null) {
+    planIndexRef.current = next ? buildPlanIndex(next.features) : undefined;
     setPlan(next);
     setPlanRevision((r) => r + 1);
   }
 
   function applyLocalEdit(effect: LocalEditEffect) {
+    if (planIndexRef.current) patchPlanIndex(planIndexRef.current, effect);
     setPlan((prev) => (prev ? { ...prev, features: { ...prev.features, features: applyEffectToFeatures(prev.features.features, effect) } } : prev));
     setPlanRevision((r) => r + 1);
   }
@@ -172,6 +184,27 @@ export function useProjectSession() {
     }
   }
 
+  /** Exports the current plan to DXF -- runs as a background job
+   * server-side (see lib/api.ts::exportDxf), so this just waits for the
+   * download URL and then triggers a plain browser download from it. Not a
+   * simple <a href> anymore (the previous design): writing a real-scale
+   * plan can take minutes, too long for a link the browser might time out
+   * waiting on. */
+  async function handleExportDxf() {
+    if (!project || !plan) return;
+    setExporting(true);
+    try {
+      const downloadUrl = await exportDxf(project.id, plan.plan_id);
+      const link = document.createElement("a");
+      link.href = downloadUrl;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    } finally {
+      setExporting(false);
+    }
+  }
+
   async function handleSelectPlan(nextPlanId: string) {
     if (!project) return;
     applyPlan(await getPlan(project.id, nextPlanId));
@@ -191,7 +224,12 @@ export function useProjectSession() {
     plan,
     plans,
     planRevision,
+    // Read fresh every render, not memoized -- planIndexRef.current is
+    // already updated (by applyPlan/applyLocalEdit) before the setState
+    // calls that cause this render, so there's nothing to recompute here.
+    planIndex: planIndexRef.current,
     generating,
+    exporting,
     restoring,
     applyPlan,
     applyLocalEdit,
@@ -200,8 +238,8 @@ export function useProjectSession() {
     refreshPlans,
     handleUpload,
     handleGenerate,
+    handleExportDxf,
     handleSelectPlan,
     handleClearAll,
-    exportHref: project && plan ? exportDxfUrl(project.id, plan.plan_id) : undefined,
   };
 }

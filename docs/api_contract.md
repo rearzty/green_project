@@ -4,7 +4,7 @@
 
 | Метод | Путь | Описание |
 |---|---|---|
-| `POST` | `/api/projects` | Загрузка территории (`multipart/form-data`: `name`, `file` — DXF/GeoJSON/SHP, опц. `source_crs`) → `{project_id}` |
+| `POST` | `/api/projects` | Загрузка территории (`multipart/form-data`: `name`, `file` — DXF/GeoJSON/SHP, опц. `source_crs`) → `{project_id}`. `source_crs` можно не указывать для GeoJSON/SHP в градусах (WGS84) — определяется автоматически и перепроецируется в UTM (см. CLAUDE.md); для DXF и любой другой метрической CRS `source_crs` по-прежнему обязателен |
 | `GET` | `/api/projects/{project_id}` | Метаданные проекта + все слои (коммуникации, здания, зонирование, территория) в виде `FeatureCollection` |
 | `POST` | `/api/projects/{project_id}/generate` | Запускает генерацию как **фоновую задачу** (не ждёт её здесь — на реальном масштабе может занять десятки секунд) → `202 {job_id}` |
 | `GET` | `/api/projects/{project_id}/generate/{job_id}` | Статус фоновой задачи генерации → `{status: "pending"\|"done"\|"error", plan_id, error}`. Фронт опрашивает это, затем забирает план обычным `GET .../plans/{plan_id}` — создаёт **новый** `Plan` (не перезаписывает предыдущий), помечает его `is_current` |
@@ -17,7 +17,9 @@
 | `POST` | `/api/projects/{project_id}/plans/{plan_id}/items/restore` | Восстановить удалённые объекты из снэпшотов (`{items: [Feature]}`, тот же id/геометрия/тип/оценка/`is_manual_edit`) → `{item_count}`. Если объект с таким id уже есть — 409 |
 | `POST` | `/api/projects/{project_id}/plans/{plan_id}/validate` | Полная перепроверка плана на нормативы → `{violations: [{item_id, message}]}` — только при открытии плана |
 | `POST` | `/api/projects/{project_id}/plans/{plan_id}/validate/items` | То же самое, но только для указанных id (`{ids}`) — сеттбек проверяется независимо для каждого объекта, так что правка не может изменить статус нарушения ни у чего, кроме того, что она сама задела; фронт зовёт это после каждой правки вместо полной проверки, объединяя результат по id |
-| `GET` | `/api/projects/{project_id}/plans/{plan_id}/export.dxf` | Скачать итоговый план в DXF |
+| `POST` | `/api/projects/{project_id}/plans/{plan_id}/export-dxf` | Запускает экспорт в DXF как **фоновую задачу** (на реальном масштабе — до ~3 минут, см. CLAUDE.md) → `202 {job_id}` |
+| `GET` | `/api/projects/{project_id}/plans/{plan_id}/export-dxf/{job_id}` | Статус фоновой задачи экспорта → `{status: "pending"\|"done"\|"error", error}` |
+| `GET` | `/api/projects/{project_id}/plans/{plan_id}/export-dxf/{job_id}/download` | Скачать готовый файл (`Content-Disposition: attachment`) — доступен один раз, после отдачи задача и временный файл удаляются |
 | `GET` | `/api/config/planting-norms` | Текущий справочник нормативов (для легенды и клиентской валидации) |
 | `GET` | `/health` | Liveness-проверка |
 

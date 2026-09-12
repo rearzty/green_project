@@ -8,6 +8,7 @@ import { Kbd } from "@/components/ui/kbd";
 import type { PlanSummary, PlantingType, ScoringMode, ValidationViolation } from "@/lib/api";
 import { countLabel, OBJECT_FORMS, PLANTING_TYPE_FORMS, PLANTING_TYPE_LABELS } from "@/lib/format";
 import type { SelectionSummary } from "@/lib/hooks/useSelection";
+import type { LayerLegendEntry } from "@/lib/mapStyle";
 import { errorMessage, toast } from "@/lib/toast";
 
 export type { SelectionSummary };
@@ -35,16 +36,25 @@ export interface ControlPanelProps {
    * generation now runs as a background job the frontend polls, see
    * lib/api.ts::generatePlan. */
   generating?: boolean;
+  /** True while a DXF export job is running server-side -- writing a
+   * real-scale plan can take minutes, so this also runs as a background job
+   * the frontend polls, see lib/api.ts::exportDxf. */
+  exporting?: boolean;
   onUpload: (file: File, name: string, sourceCrs: string) => Promise<void>;
   onGenerate: (plantingTypes: PlantingType[], scoringMode: ScoringMode) => Promise<void>;
+  onExportDxf: () => Promise<void>;
   /** Forgets the locally-remembered project/plan (see app/page.tsx) and
    * resets the UI to its empty state. Local-only — does not delete anything
    * from the backend. */
   onClearAll: () => void;
-  exportHref?: string;
-  showLayers: boolean;
+  /** What's actually in the loaded layers right now (see
+   * lib/mapStyle.ts::buildLayerLegend) -- one row per type actually
+   * present, not a fixed list, so a project with no roads/utilities
+   * doesn't show empty toggles for them. */
+  layerLegend: LayerLegendEntry[];
+  hiddenLayerTypes: ReadonlySet<string>;
+  onToggleLayerType: (key: string) => void;
   showPlan: boolean;
-  onToggleShowLayers: (show: boolean) => void;
   onToggleShowPlan: (show: boolean) => void;
   /** Every plan generated so far for the current project. */
   plans: PlanSummary[];
@@ -89,13 +99,15 @@ export function ControlPanel({
   hasPlan,
   restoring = false,
   generating = false,
+  exporting = false,
   onUpload,
   onGenerate,
+  onExportDxf,
   onClearAll,
-  exportHref,
-  showLayers,
+  layerLegend,
+  hiddenLayerTypes,
+  onToggleLayerType,
   showPlan,
-  onToggleShowLayers,
   onToggleShowPlan,
   plans,
   currentPlanId,
@@ -284,7 +296,7 @@ export function ControlPanel({
         <Button
           variant={selectMode ? "default" : "outline"}
           size="sm"
-          disabled={!hasPlan || !showPlan}
+          disabled={!selectMode && (!hasPlan || !showPlan)}
           onClick={onToggleSelectMode}
           aria-pressed={selectMode}
           title="Левой кнопкой по карте — рамка выделения вместо перемещения карты"
@@ -357,10 +369,28 @@ export function ControlPanel({
 
       <section className="flex flex-col gap-2 border-t border-stone-200 pt-3">
         <h2 className="text-sm font-medium">Отображение на карте</h2>
-        <label className="flex items-center gap-2 text-sm">
-          <input type="checkbox" checked={showLayers} onChange={(e) => onToggleShowLayers(e.target.checked)} />
-          Исходные слои (сети, здания, зонирование)
-        </label>
+        {layerLegend.length > 0 && (
+          <ul className="flex flex-col gap-1.5">
+            {layerLegend.map((entry) => (
+              <li key={entry.key}>
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={!hiddenLayerTypes.has(entry.key)}
+                    onChange={() => onToggleLayerType(entry.key)}
+                  />
+                  <span
+                    className="h-3 w-3 flex-none rounded-sm border border-black/10"
+                    style={{ backgroundColor: entry.color }}
+                    aria-hidden
+                  />
+                  {entry.label}
+                  <span className="text-xs text-stone-400">{entry.count}</span>
+                </label>
+              </li>
+            ))}
+          </ul>
+        )}
         <label className="flex items-center gap-2 text-sm">
           <input type="checkbox" checked={showPlan} onChange={(e) => onToggleShowPlan(e.target.checked)} />
           Сгенерированный план
@@ -410,11 +440,15 @@ export function ControlPanel({
             </ul>
           </div>
         )}
-        <a href={exportHref} aria-disabled={!hasPlan}>
-          <Button variant="outline" disabled={!hasPlan} className="w-full">
-            Экспорт в DXF
-          </Button>
-        </a>
+        <Button
+          variant="outline"
+          disabled={!hasPlan || busy || exporting}
+          className="w-full"
+          onClick={() => guarded(() => onExportDxf())}
+        >
+          {exporting && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" aria-hidden />}
+          {exporting ? "Экспортируем…" : "Экспорт в DXF"}
+        </Button>
       </section>
     </aside>
   );
