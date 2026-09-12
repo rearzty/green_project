@@ -3,7 +3,8 @@
  * rectangle", "how big is the selection", "what types are selected" from
  * here instead of re-walking GeoJSON coordinates on every gesture. */
 
-import type { GeoJSONFeatureCollection, PlantingType } from "@/lib/api";
+import type { GeoJSONFeature, GeoJSONFeatureCollection, PlantingType } from "@/lib/api";
+import type { LocalEditEffect } from "@/lib/hooks/useProjectSession";
 
 export interface PlanItemInfo {
   id: string;
@@ -39,20 +40,55 @@ function extendWithCoordinates(box: LatLngBox, coordinates: unknown) {
   for (const nested of coordinates) extendWithCoordinates(box, nested);
 }
 
+function planItemInfo(feature: GeoJSONFeature): PlanItemInfo | undefined {
+  const id = String(feature.properties.id);
+  const box: LatLngBox = { minLat: Infinity, minLng: Infinity, maxLat: -Infinity, maxLng: -Infinity };
+  extendWithCoordinates(box, feature.geometry.coordinates);
+  if (!Number.isFinite(box.minLat)) return undefined;
+  return {
+    id,
+    type: feature.properties.planting_type as PlantingType,
+    isPoint: feature.geometry.type === "Point",
+    score: Number(feature.properties.score),
+    ...box,
+  };
+}
+
 export function buildPlanIndex(collection: GeoJSONFeatureCollection): PlanIndex {
   const index: PlanIndex = new Map();
   for (const feature of collection.features) {
-    const id = String(feature.properties.id);
-    const box: LatLngBox = { minLat: Infinity, minLng: Infinity, maxLat: -Infinity, maxLng: -Infinity };
-    extendWithCoordinates(box, feature.geometry.coordinates);
-    if (!Number.isFinite(box.minLat)) continue;
-    index.set(id, {
-      id,
-      type: feature.properties.planting_type as PlantingType,
-      isPoint: feature.geometry.type === "Point",
-      score: Number(feature.properties.score),
-      ...box,
-    });
+    const info = planItemInfo(feature);
+    if (info) index.set(info.id, info);
+  }
+  return index;
+}
+
+/** Updates only the ids an edit actually touched, in place, instead of
+ * rebuilding the whole index -- on a real-scale plan (hundreds of thousands
+ * of items) a full rebuild on every single move/retype/delete measured at
+ * up to ~1.6s (see CLAUDE.md's edit-cost benchmark), almost all of it this
+ * function; patched, the same edit costs about as much as the edit itself.
+ * Mutates and returns the same Map -- callers that need to know an index
+ * *changed* watch planRevision instead of this reference (see
+ * useProjectSession.ts::applyLocalEdit). */
+export function patchPlanIndex(index: PlanIndex, effect: LocalEditEffect): PlanIndex {
+  switch (effect.kind) {
+    case "move":
+    case "restore":
+      for (const feature of effect.items) {
+        const info = planItemInfo(feature);
+        if (info) index.set(info.id, info);
+      }
+      break;
+    case "retype":
+      for (const { id, type } of effect.changes) {
+        const existing = index.get(id);
+        if (existing) index.set(id, { ...existing, type });
+      }
+      break;
+    case "delete":
+      for (const id of effect.ids) index.delete(id);
+      break;
   }
   return index;
 }

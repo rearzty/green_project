@@ -251,8 +251,39 @@ export async function validateItems(projectId: string, planId: string, ids: stri
   return postJson(`/api/projects/${projectId}/plans/${planId}/validate/items`, { ids });
 }
 
-export function exportDxfUrl(projectId: string, planId: string): string {
-  return `${API_URL}/api/projects/${projectId}/plans/${planId}/export.dxf`;
+interface ExportJobStatus {
+  status: "pending" | "done" | "error";
+  error: string | null;
+}
+
+function startDxfExport(projectId: string, planId: string): Promise<{ job_id: string }> {
+  return request(`/api/projects/${projectId}/plans/${planId}/export-dxf`, { method: "POST" });
+}
+
+function getDxfExportStatus(projectId: string, planId: string, jobId: string): Promise<ExportJobStatus> {
+  return request(`/api/projects/${projectId}/plans/${planId}/export-dxf/${jobId}`);
+}
+
+const EXPORT_POLL_INTERVAL_MS = 700;
+
+/** DXF export runs as a background job server-side -- writing a real-scale
+ * plan (hundreds of thousands of items) measured up to ~3 minutes (see
+ * CLAUDE.md's export benchmark), too long to hold one HTTP request open
+ * for. This starts the job and polls status until it finishes, then
+ * resolves to the download URL. Deliberately doesn't fetch() the file
+ * itself into JS memory -- the caller triggers a plain browser download
+ * from the URL (see useProjectSession.ts::handleExportDxf) so a
+ * multi-hundred-MB file streams straight to disk instead of through a JS
+ * blob. */
+export async function exportDxf(projectId: string, planId: string, options?: { signal?: AbortSignal }): Promise<string> {
+  const { job_id } = await startDxfExport(projectId, planId);
+  for (;;) {
+    if (options?.signal?.aborted) throw new ApiError("Экспорт отменён.", 0);
+    const status = await getDxfExportStatus(projectId, planId, job_id);
+    if (status.status === "error") throw new ApiError(status.error ?? "Не удалось экспортировать DXF.", 0);
+    if (status.status === "done") return `${API_URL}/api/projects/${projectId}/plans/${planId}/export-dxf/${job_id}/download`;
+    await new Promise((resolve) => setTimeout(resolve, EXPORT_POLL_INTERVAL_MS));
+  }
 }
 
 export async function getPlantingNorms(): Promise<Record<string, unknown>> {

@@ -11,8 +11,8 @@ import { useKeyboardShortcuts } from "@/lib/hooks/useKeyboardShortcuts";
 import { usePlanEdits } from "@/lib/hooks/usePlanEdits";
 import { useProjectSession } from "@/lib/hooks/useProjectSession";
 import { useSelection } from "@/lib/hooks/useSelection";
-import { buildPlanIndex } from "@/lib/planIndex";
 import { countLabel, OBJECT_FORMS } from "@/lib/format";
+import { buildLayerLegend } from "@/lib/mapStyle";
 import { toast } from "@/lib/toast";
 
 // Leaflet touches `window` on import, so the map must never render on the server.
@@ -20,13 +20,22 @@ const MapView = dynamic(() => import("@/components/MapView"), { ssr: false });
 
 export default function Home() {
   const session = useProjectSession();
-  const { project, plan, plans, planRevision } = session;
+  const { project, plan, plans, planRevision, planIndex } = session;
 
-  const [showLayers, setShowLayers] = useState(true);
+  const [hiddenLayerTypes, setHiddenLayerTypes] = useState<Set<string>>(new Set());
   const [showPlan, setShowPlan] = useState(true);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
 
-  const planIndex = useMemo(() => (plan ? buildPlanIndex(plan.features) : undefined), [plan]);
+  const layerLegend = useMemo(() => buildLayerLegend(project?.layers), [project]);
+
+  function handleToggleLayerType(key: string) {
+    setHiddenLayerTypes((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
 
   // editing needs selection.setSelection (to clear/restore selection around
   // an edit), selection needs editing.violationIds (to show a selected
@@ -37,7 +46,7 @@ export default function Home() {
   const editing = usePlanEdits(project, plan, session.applyLocalEdit, session.bumpPlanRevision, session.patchPlanItemCount, (ids) =>
     selection.setSelection(ids)
   );
-  const selection = useSelection(planIndex, editing.violationIds);
+  const selection = useSelection(planIndex, planRevision, editing.violationIds);
 
   function handleToggleShowPlan(show: boolean) {
     setShowPlan(show);
@@ -48,12 +57,21 @@ export default function Home() {
   }
 
   function toggleSelectMode() {
+    // Turning it off is always allowed -- only turning it on needs a
+    // visible plan. Otherwise a plan disappearing (Clear All, switching
+    // projects) while select mode was on could leave it stuck with no way
+    // to switch it back off.
+    if (selection.selectMode) {
+      selection.setSelectMode(false);
+      setContextMenu(null);
+      return;
+    }
     if (!plan) return;
     if (!showPlan) {
       toast.info("Включите отображение плана, чтобы выделять объекты.");
       return;
     }
-    selection.setSelectMode((m) => !m);
+    selection.setSelectMode(true);
     setContextMenu(null);
   }
 
@@ -125,13 +143,15 @@ export default function Home() {
         hasPlan={plan !== null}
         restoring={session.restoring}
         generating={session.generating}
+        exporting={session.exporting}
         onUpload={session.handleUpload}
         onGenerate={session.handleGenerate}
+        onExportDxf={session.handleExportDxf}
         onClearAll={session.handleClearAll}
-        exportHref={session.exportHref}
-        showLayers={showLayers}
+        layerLegend={layerLegend}
+        hiddenLayerTypes={hiddenLayerTypes}
+        onToggleLayerType={handleToggleLayerType}
         showPlan={showPlan}
-        onToggleShowLayers={setShowLayers}
         onToggleShowPlan={handleToggleShowPlan}
         plans={plans}
         currentPlanId={plan?.plan_id}
@@ -160,7 +180,7 @@ export default function Home() {
           layersKey={project?.id}
           planId={plan?.plan_id}
           planRevision={planRevision}
-          showLayers={showLayers}
+          hiddenLayerTypes={hiddenLayerTypes}
           showPlan={showPlan}
           selectMode={selection.selectMode}
           selectedIds={selection.selectedIds}

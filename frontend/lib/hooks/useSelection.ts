@@ -20,16 +20,23 @@ export interface SelectionSummary {
  * ids this hook hands back themselves (see usePlanEdits) and report the
  * outcome back in via `setSelection`/`clear`.
  */
-export function useSelection(planIndex: PlanIndex | undefined, violationIds: ReadonlySet<string>) {
+export function useSelection(planIndex: PlanIndex | undefined, planRevision: number, violationIds: ReadonlySet<string>) {
   const [selectMode, setSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(NO_SELECTION);
   const [focusRequest, setFocusRequest] = useState<{ id: string; seq: number } | null>(null);
 
-  // Forget selected ids that no longer exist -- after a delete, or a plan
-  // switch (planIndex itself becomes a different object either way).
+  // Forget selected ids that no longer exist after a plan switch (a brand
+  // new planIndex object -- see useProjectSession.ts::applyPlan). A local
+  // edit's deletions don't retrigger this: planIndex is patched in place
+  // for those (same reference), and usePlanEdits.ts already sets selection
+  // explicitly at every call site that can make an id disappear. Also drop
+  // select mode itself once there's no plan to select from -- otherwise it
+  // got stuck on with no plan around to turn it off against (e.g. Clear All
+  // while select mode was active).
   useEffect(() => {
     if (!planIndex) {
       setSelectedIds((prev) => (prev.size === 0 ? prev : NO_SELECTION));
+      setSelectMode(false);
       return;
     }
     setSelectedIds((prev) => {
@@ -67,7 +74,12 @@ export function useSelection(planIndex: PlanIndex | undefined, violationIds: Rea
     const onlyId = total === 1 ? [...selectedIds].find((id) => planIndex.has(id)) : undefined;
     const only = onlyId ? planIndex.get(onlyId) : undefined;
     return { total, counts, single: only && onlyId ? { type: only.type, score: only.score, violation: violationIds.has(onlyId) } : undefined };
-  }, [planIndex, selectedIds, violationIds]);
+    // planRevision: planIndex is patched in place on a local edit (see
+    // useProjectSession.ts), so a retype changes an entry's `type` without
+    // changing planIndex's own reference -- this needs the extra signal to
+    // notice.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [planIndex, planRevision, selectedIds, violationIds]);
 
   return { selectMode, setSelectMode, selectedIds, setSelection, selectAll, clear, focusItem, focusRequest, summary };
 }

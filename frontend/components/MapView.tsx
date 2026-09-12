@@ -6,17 +6,10 @@ import { MapContainer, Rectangle, TileLayer, GeoJSON, useMap, useMapEvents } fro
 import L, { type Layer, type PathOptions } from "leaflet";
 import type { Feature } from "geojson";
 
-import type { GeoJSONFeatureCollection, LngLat } from "@/lib/api";
+import type { GeoJSONFeature, GeoJSONFeatureCollection, LngLat } from "@/lib/api";
+import { isZoningFeature, layerGroupColor, layerGroupKey } from "@/lib/mapStyle";
 import { boundsOfItems, itemsInBox, type LatLngBox, type PlanIndex } from "@/lib/planIndex";
 
-const UTILITY_COLOR = "#b91c1c"; // red — exclusion-driving constraints
-const ZONE_COLORS: Record<string, string> = {
-  building: "#78716c",
-  road: "#57534e",
-  territory: "#0ea5e9",
-  zoning: "#a78bfa",
-  existing_greenery: "#16a34a",
-};
 const PLANTING_COLORS: Record<string, string> = {
   tree: "#15803d",
   shrub: "#65a30d",
@@ -45,12 +38,13 @@ const LIVE_MOVE_PREVIEW_LIMIT = 2000;
 const SELECTION_PANE = "selectionOverlay";
 
 function layerStyle(feature?: Feature): PathOptions {
-  const props = (feature?.properties ?? {}) as Record<string, unknown>;
-  if (props.kind === "utility") {
-    return { color: UTILITY_COLOR, weight: 2 };
-  }
-  const zoneType = String(props.zone_type ?? props.object_type ?? "");
-  return { color: ZONE_COLORS[zoneType] ?? "#9ca3af", weight: 1, fillOpacity: 0.15 };
+  const key = layerGroupKey((feature ?? { type: "Feature", properties: {} }) as unknown as GeoJSONFeature);
+  const color = layerGroupColor(key);
+  if (key === "utility") return { color, weight: 2 };
+  // fillOpacity used to be 0.15 -- barely visible against the basemap,
+  // which is exactly why the legend (ControlPanel.tsx) exists now: colors
+  // have to actually read as distinct fills, not just a faint tint.
+  return { color, weight: 1, fillOpacity: 0.45 };
 }
 
 function plantingColor(type: string): string {
@@ -171,6 +165,10 @@ interface SelectionControllerProps {
   editsLocked: boolean;
   showPlan: boolean;
   planIndex?: PlanIndex;
+  /** Not read directly -- planIndex is now patched in place rather than
+   * rebuilt per edit (see useProjectSession.ts), so its reference alone no
+   * longer signals "positions may have changed"; this does. */
+  planRevision?: number;
   selectedIds: ReadonlySet<string>;
   registryRef: MutableRefObject<Map<string, RegistryEntry>>;
   onSelectionChange: (ids: string[]) => void;
@@ -199,7 +197,7 @@ interface SelectionControllerProps {
  * selects (Shift/Ctrl/Cmd adds or removes), a click on empty space clears.
  */
 function SelectionController(props: SelectionControllerProps) {
-  const { selectMode, showPlan, planIndex, selectedIds, focusRequest } = props;
+  const { selectMode, showPlan, planIndex, planRevision, selectedIds, focusRequest } = props;
   const map = useMap();
   const latest = useRef(props);
   latest.current = props;
@@ -508,7 +506,7 @@ function SelectionController(props: SelectionControllerProps) {
 
   const selectionBox = useMemo(
     () => (planIndex && showPlan && selectedIds.size >= 2 ? boundsOfItems(planIndex, selectedIds) : null),
-    [planIndex, showPlan, selectedIds]
+    [planIndex, planRevision, showPlan, selectedIds]
   );
 
   return (
@@ -655,8 +653,12 @@ function VirtualizedMarkers({
   useEffect(() => {
     recompute();
     // planRevision isn't read directly by recompute -- it's the signal that
-    // plan content (positions/types) changed under the same ids, which the
-    // resync loop above picks up via planIndex (rebuilt whenever plan changes).
+    // plan content (positions/types) changed under the same ids. planIndex
+    // is now patched in place rather than rebuilt per edit (see
+    // useProjectSession.ts), so its *reference* no longer changes on every
+    // edit either -- planRevision is what actually makes this effect re-run;
+    // recompute() itself still reads planIndex's current (mutated) contents
+    // live, since Maps are mutable regardless of when this closure was made.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [planIndex, planRevision, recompute]);
 
@@ -691,7 +693,10 @@ export interface MapViewProps {
   layersKey?: string;
   planId?: string;
   planRevision?: number;
-  showLayers?: boolean;
+  /** Source-layer types (see lib/mapStyle.ts::layerGroupKey) currently
+   * hidden via the panel's per-type toggles -- replaces a single blanket
+   * "show layers" flag so buildings/greenery/etc. can be shown independently. */
+  hiddenLayerTypes?: ReadonlySet<string>;
   showPlan?: boolean;
   center?: [number, number];
   zoom?: number;
@@ -717,7 +722,7 @@ export default function MapView({
   layersKey,
   planId,
   planRevision = 0,
-  showLayers = true,
+  hiddenLayerTypes,
   showPlan = true,
   center = [55.751244, 37.618423],
   zoom = 12,
@@ -784,6 +789,44 @@ export default function MapView({
     [plan]
   );
 
+  // Only the currently-toggled-on source layer types (see ControlPanel.tsx's
+  // per-type legend) -- filtered client-side rather than asking the backend
+  // for less, since these are the same few dozen/hundred zone features
+  // either way, not something worth a network round trip over.
+  const visibleLayers = useMemo(() => {
+    if (!layers) return undefined;
+    if (!hiddenLayerTypes || hiddenLayerTypes.size === 0) return layers;
+    return { ...layers, features: layers.features.filter((f) => !hiddenLayerTypes.has(layerGroupKey(f))) };
+  }, [layers, hiddenLayerTypes]);
+  // <GeoJSON> doesn't reactively re-diff `data` (see layersKey's own
+  // docstring) -- toggling a layer type needs the same key-bump remount
+  // trick, keyed on which types are hidden right now.
+  const hiddenLayersSignature = hiddenLayerTypes ? [...hiddenLayerTypes].sort().join(",") : "";
+
+  // The overall extent of everything loaded (not just the currently-visible
+  // subset) -- a stable reference rectangle so a user toggling individual
+  // layers on/off (or looking at an irregular real territory instead of a
+  // synthetic square) can still see "this is the whole working area".
+  // Excludes zoning features on purpose (any zoning_category): unlike every
+  // other layer, a real zoning polygon's authentic shape can span a whole
+  // neighborhood (its own boundary follows real streets/blocks, so it isn't
+  // clipped down to the project's own scale the way roads/buildings are --
+  // see data/README.md's real_moscow_courtyard.geojson notes) -- including
+  // it here would balloon this rectangle out to that same neighborhood
+  // instead of framing the actual site.
+  const extentBounds = useMemo(() => {
+    if (!layers) return null;
+    const boundedFeatures = layers.features.filter((f) => !isZoningFeature(f));
+    if (boundedFeatures.length === 0) return null;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const bounds = L.geoJSON({ type: "FeatureCollection", features: boundedFeatures } as any).getBounds();
+      return bounds.isValid() ? bounds : null;
+    } catch {
+      return null;
+    }
+  }, [layers]);
+
   useEffect(() => {
     const previous = appliedRef.current;
     const changed = new Set<string>();
@@ -810,11 +853,18 @@ export default function MapView({
         url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
       />
       <FitBounds fitKey={`${layersKey ?? ""}:${planId ?? ""}`} layers={layers} plan={plan} />
-      {layers && showLayers && (
+      {extentBounds && (
+        <Rectangle
+          bounds={extentBounds}
+          pathOptions={{ color: "#1e293b", weight: 1.5, dashArray: "6 4", fill: false }}
+          interactive={false}
+        />
+      )}
+      {visibleLayers && visibleLayers.features.length > 0 && (
         <GeoJSON
-          key={layersKey ?? "layers"}
+          key={`${layersKey ?? "layers"}:${hiddenLayersSignature}`}
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          data={layers as any}
+          data={visibleLayers as any}
           style={layerStyle}
           onEachFeature={bindPopup}
         />
@@ -834,6 +884,7 @@ export default function MapView({
         editsLocked={editsLocked}
         showPlan={showPlan}
         planIndex={planIndex}
+        planRevision={planRevision}
         selectedIds={selectedIds}
         registryRef={registryRef}
         onSelectionChange={onSelectionChange}

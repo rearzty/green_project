@@ -314,6 +314,42 @@ class TestRestoreItems:
         with pytest.raises(OutOfTerritoryError):
             asyncio.run(restore_items(session=_FakeAsyncSession(), plan=plan, features=[snapshot], source_crs=None))
 
+    def test_restoring_a_lawn_touching_the_territory_boundary_survives_a_real_crs_round_trip(self):
+        """Reproduces a live bug: delete_items snapshots an item's geometry
+        reprojected source_crs -> WGS84 (geo_io.planting_items_to_geojson_dicts),
+        and restore_items reprojects it straight back -- every other test in
+        this class uses source_crs=None, which skips that reprojection
+        entirely and never exercises the round trip it does in production.
+        With a real source_crs the round trip reintroduces a tiny bit of
+        floating-point noise (see _assert_all_within_territory's docstring),
+        and a lawn polygon carved out by buffers.buildable_area() always
+        touches the territory boundary somewhere by construction --
+        restoring it unmoved must not be rejected as OutOfTerritoryError.
+        """
+        territory = box(414000.0, 6180000.0, 414100.0, 6180100.0)  # real EPSG:32637-scale coords
+        lawn = box(414000.0, 6180000.0, 414050.0, 6180050.0)  # shares two edges with the territory boundary
+        plan = _plan_with_items(territory, [], project_id="restore-crs-roundtrip-project")
+        item = _row("lawn-1", lawn, "lawn")
+        snapshot = planting_item_to_geojson_feature(item, "EPSG:32637").model_dump()
+
+        asyncio.run(restore_items(session=_FakeAsyncSession(), plan=plan, features=[snapshot], source_crs="EPSG:32637"))
+
+        assert plan.item_count == 1
+
+    def test_restore_still_rejects_a_genuinely_out_of_territory_item_with_a_real_crs(self):
+        """Same real-CRS round trip as above, but the item actually is
+        outside the territory (not just nudged by reprojection noise) -- the
+        tolerance _assert_all_within_territory now applies must not swallow
+        real violations."""
+        territory = box(414000.0, 6180000.0, 414100.0, 6180100.0)
+        far_outside = box(415000.0, 6181000.0, 415050.0, 6181050.0)
+        plan = _plan_with_items(territory, [], project_id="restore-crs-roundtrip-rejects-project")
+        item = _row("lawn-2", far_outside, "lawn")
+        snapshot = planting_item_to_geojson_feature(item, "EPSG:32637").model_dump()
+
+        with pytest.raises(OutOfTerritoryError):
+            asyncio.run(restore_items(session=_FakeAsyncSession(), plan=plan, features=[snapshot], source_crs="EPSG:32637"))
+
 
 def _plan_with_items(territory: Polygon, items: list[PlantingItemRow], project_id: str = "project-1") -> Plan:
     plan = _plan_with_territory(territory)

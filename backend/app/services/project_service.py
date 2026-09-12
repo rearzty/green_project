@@ -26,10 +26,15 @@ class UnsupportedFileTypeError(ValueError):
     pass
 
 
-def parse_territory_file(path: Path) -> tuple[list[Utility], list[Zone]]:
+def parse_territory_file(path: Path) -> tuple[list[Utility], list[Zone], str | None]:
+    """The third return value is a CRS `read_vector_file` auto-detected from
+    the file itself (geographic coordinates only -- see its docstring) --
+    None for DXF, which never carries CRS metadata at all, and for a vector
+    file that was already metric or had no CRS declared."""
     suffix = path.suffix.lower()
     if suffix == ".dxf":
-        return read_dxf(path)
+        utilities, zones = read_dxf(path)
+        return utilities, zones, None
     if suffix in (".geojson", ".json", ".shp"):
         return read_vector_file(path, type_field="object_type")
     raise UnsupportedFileTypeError(
@@ -46,9 +51,13 @@ async def create_project_from_file(
     # Parsing (ezdxf/geopandas) is blocking file I/O + CPU work with no
     # async path of its own -- run it off the event loop rather than
     # stalling every other request for however long a large file takes.
-    utilities, zones = await run_in_threadpool(parse_territory_file, upload_path)
+    utilities, zones, detected_crs = await run_in_threadpool(parse_territory_file, upload_path)
 
-    project = Project(name=name, source_crs=source_crs)
+    # An explicit source_crs from the caller always wins; otherwise fall
+    # back to what parse_territory_file auto-detected (geographic files
+    # only -- see its docstring). Leaves DXF/already-metric/CRS-less
+    # uploads exactly as before.
+    project = Project(name=name, source_crs=source_crs or detected_crs)
     session.add(project)
     await session.flush()  # assigns project.id
 

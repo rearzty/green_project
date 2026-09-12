@@ -80,7 +80,8 @@ export function useKeyboardShortcuts(actions: KeyboardActions) {
       if (mod || e.altKey) return;
       switch (code) {
         case "KeyS":
-          if (!a.hasPlan) return;
+          // No hasPlan guard here: toggleSelectMode() itself decides whether
+          // turning on is allowed, but always allows turning back off.
           e.preventDefault();
           a.toggleSelectMode();
           break;
