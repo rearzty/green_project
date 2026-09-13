@@ -65,11 +65,11 @@ export function ContextMenu({
       role="menu"
       style={position}
       onContextMenu={(e) => e.preventDefault()}
-      className="gp-menu fixed z-[1200] min-w-[16rem] rounded-lg border border-stone-200 bg-white/95 py-1 text-sm shadow-xl backdrop-blur"
+      className="gp-menu fixed z-[1200] min-w-[16rem] rounded-lg border border-stone-700 bg-stone-900/95 py-1 text-sm shadow-xl backdrop-blur"
     >
-      {title && <div className="px-3 pb-1 pt-1.5 text-xs font-medium text-stone-500">{title}</div>}
+      {title && <div className="px-3 pb-1 pt-1.5 text-xs font-medium text-stone-400">{title}</div>}
       {entries.map((entry, i) => {
-        if (entry === "separator") return <div key={`sep-${i}`} className="my-1 border-t border-stone-100" />;
+        if (entry === "separator") return <div key={`sep-${i}`} className="my-1 border-t border-stone-800" />;
         const Icon = entry.icon;
         return (
           <button
@@ -81,7 +81,7 @@ export function ContextMenu({
               entry.onSelect();
             }}
             className={`flex w-full items-center gap-2.5 px-3 py-1.5 text-left transition-colors disabled:cursor-default disabled:opacity-40 ${
-              entry.danger ? "text-red-700 enabled:hover:bg-red-50" : "text-stone-800 enabled:hover:bg-greenery-50"
+              entry.danger ? "text-red-400 enabled:hover:bg-red-950/60" : "text-stone-100 enabled:hover:bg-stone-800"
             }`}
           >
             {Icon ? <Icon className="h-4 w-4 flex-none opacity-80" aria-hidden /> : <span className="w-4 flex-none" />}

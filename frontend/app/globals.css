@@ -10,6 +10,9 @@ body {
 .leaflet-container {
   height: 100%;
   width: 100%;
+  /* Only visible in the brief pre-tile-load gap or the out-of-world-bounds
+     gutter -- the tiles themselves stay their normal light OSM colors. */
+  background: #0c0a09;
 }
 
 /* Plan items (tree/shrub points) -- a 16px hit area around a 10px dot, so a
