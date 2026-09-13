@@ -25,6 +25,30 @@ export function plantingColor(type: string): string {
   return PLANTING_COLORS[type] ?? "#22c55e";
 }
 
+/** 3D-only (ThreeDView.tsx) seasonal palettes -- purely cosmetic, swaps
+ * material colors on a full scene rebuild (see ThreeDView.tsx's comment on
+ * why season is a rebuild dependency, not a separate live-update path).
+ * `summer` intentionally reuses PLANTING_COLORS so the 3D "default" season
+ * still matches the 2D map's tree/shrub/lawn colors exactly. */
+export type Season = "spring" | "summer" | "autumn" | "winter";
+
+export const SEASON_LABELS: Record<Season, string> = { spring: "Весна", summer: "Лето", autumn: "Осень", winter: "Зима" };
+
+export interface SeasonPalette {
+  tree: string;
+  shrub: string;
+  lawn: string;
+  skyTop: string;
+  skyBottom: string;
+}
+
+export const SEASON_PALETTES: Record<Season, SeasonPalette> = {
+  spring: { tree: "#4ade80", shrub: "#84cc16", lawn: "#bbf7d0", skyTop: "#7dd3fc", skyBottom: "#e0f2fe" },
+  summer: { tree: PLANTING_COLORS.tree, shrub: PLANTING_COLORS.shrub, lawn: PLANTING_COLORS.lawn, skyTop: "#38bdf8", skyBottom: "#cbd5e1" },
+  autumn: { tree: "#c2410c", shrub: "#a16207", lawn: "#d6d3a3", skyTop: "#94a3b8", skyBottom: "#fde68a" },
+  winter: { tree: "#e5e7eb", shrub: "#d1d5db", lawn: "#f8fafc", skyTop: "#64748b", skyBottom: "#e2e8f0" },
+};
+
 export const LAYER_TYPE_LABELS: Record<string, string> = {
   territory: "Территория",
   building: "Здания",

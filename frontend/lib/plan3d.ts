@@ -66,6 +66,10 @@ export interface Polygon3D {
 
 export interface Building3D extends Polygon3D {
   height: number;
+  /** Same deterministic centroid hash `height` derives from, in [0, 1) --
+   * exposed separately so ThreeDView.tsx's window-texture tint can reuse it
+   * instead of hashing the footprint a second time with a different seed. */
+  hash01: number;
 }
 
 export interface PlantingPoint3D {
@@ -163,8 +167,8 @@ function hashToUnit(seed: number): number {
   return x - Math.floor(x);
 }
 
-function placeholderBuildingHeight(footprintOuter: [number, number][]): number {
-  if (footprintOuter.length === 0) return BUILDING_MIN_HEIGHT_M;
+function buildingHash01(footprintOuter: [number, number][]): number {
+  if (footprintOuter.length === 0) return 0;
   let sumX = 0;
   let sumY = 0;
   for (const [x, y] of footprintOuter) {
@@ -172,7 +176,11 @@ function placeholderBuildingHeight(footprintOuter: [number, number][]): number {
     sumY += y;
   }
   const seed = (sumX / footprintOuter.length) * 0.1013 + (sumY / footprintOuter.length) * 0.0721;
-  return BUILDING_MIN_HEIGHT_M + hashToUnit(seed) * (BUILDING_MAX_HEIGHT_M - BUILDING_MIN_HEIGHT_M);
+  return hashToUnit(seed);
+}
+
+function placeholderBuildingHeight(hash01: number): number {
+  return BUILDING_MIN_HEIGHT_M + hash01 * (BUILDING_MAX_HEIGHT_M - BUILDING_MIN_HEIGHT_M);
 }
 
 function extendBounds(bounds: Scene3DBounds, points: [number, number][]): void {
@@ -210,7 +218,13 @@ export function buildScene3DData(
     if (props.kind === "utility" || props.object_type === "zoning") continue;
     const polygons = polygonRingsLonLat(feature.geometry).map((rings) => projectPolygon(rings, projector));
     if (props.object_type === "territory") territory.push(...polygons);
-    else if (props.object_type === "building") buildings.push(...polygons.map((p) => ({ ...p, height: placeholderBuildingHeight(p.outer) })));
+    else if (props.object_type === "building")
+      buildings.push(
+        ...polygons.map((p) => {
+          const hash01 = buildingHash01(p.outer);
+          return { ...p, hash01, height: placeholderBuildingHeight(hash01) };
+        })
+      );
     else if (props.object_type === "road") roads.push(...polygons);
     else if (props.object_type === "existing_greenery") existingGreenery.push(...polygons);
   }

@@ -111,6 +111,20 @@ function FitBounds({ fitKey, layers, plan }: { fitKey: string; layers?: GeoJSONF
   return null;
 }
 
+/** Leaflet only recalculates its container size on the window `resize`
+ * event -- it has no way to know the sidebar's CSS width transition
+ * (app/page.tsx) just resized *this* container instead. Without this, the
+ * map stays cropped/offset to its old size after the panel is
+ * collapsed/expanded. 220ms is just past the panel's own 200ms transition. */
+function InvalidateSizeOnChange({ trigger }: { trigger: unknown }) {
+  const map = useMap();
+  useEffect(() => {
+    const t = setTimeout(() => map.invalidateSize(), 220);
+    return () => clearTimeout(t);
+  }, [trigger, map]);
+  return null;
+}
+
 type RegistryEntry = { layer: Layer; type: string };
 type LatLngTree = L.LatLng | LatLngTree[];
 
@@ -704,6 +718,10 @@ export interface MapViewProps {
   onViewChange?: () => void;
   /** Pan/zoom to this item; `seq` makes a repeat request for the same id re-fire. */
   focusRequest?: { id: string; seq: number } | null;
+  /** Whether the control panel is currently shown -- purely to know when its
+   * CSS width transition finishes, so the map's container size can be
+   * recomputed (see InvalidateSizeOnChange below). Not otherwise used. */
+  sidebarOpen?: boolean;
 }
 
 export default function MapView({
@@ -726,6 +744,7 @@ export default function MapView({
   onContextMenu,
   onViewChange,
   focusRequest,
+  sidebarOpen,
 }: MapViewProps) {
   // item id -> its Leaflet layer while on the map, so selection/violation
   // highlighting can restyle just the items whose state changed instead of
@@ -849,6 +868,7 @@ export default function MapView({
         url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
       />
       <FitBounds fitKey={`${layersKey ?? ""}:${planId ?? ""}`} layers={layers} plan={plan} />
+      <InvalidateSizeOnChange trigger={sidebarOpen} />
       {extentBounds && (
         <Rectangle
           bounds={extentBounds}

@@ -2,10 +2,22 @@
 
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { CheckCheck, Redo2, Shrub, SquareDashedMousePointer, Trash2, TreeDeciduous, Undo2, X } from "lucide-react";
+import {
+  CheckCheck,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Redo2,
+  Shrub,
+  SquareDashedMousePointer,
+  Trash2,
+  TreeDeciduous,
+  Undo2,
+  X,
+} from "lucide-react";
 
 import { ContextMenu, type ContextMenuEntry } from "@/components/ContextMenu";
 import { ControlPanel } from "@/components/ControlPanel";
+import { QualityBadge } from "@/components/QualityBadge";
 import { Toaster } from "@/components/Toaster";
 import { useKeyboardShortcuts } from "@/lib/hooks/useKeyboardShortcuts";
 import { usePlanEdits } from "@/lib/hooks/usePlanEdits";
@@ -13,8 +25,9 @@ import { useProjectSession } from "@/lib/hooks/useProjectSession";
 import { useSelection } from "@/lib/hooks/useSelection";
 import { getPlantingNorms, type PlantingNorms } from "@/lib/api";
 import { countLabel, OBJECT_FORMS } from "@/lib/format";
-import { buildLayerLegend } from "@/lib/mapStyle";
+import { buildLayerLegend, type Season } from "@/lib/mapStyle";
 import { toast } from "@/lib/toast";
+import { cn } from "@/lib/utils";
 
 // Leaflet touches `window` on import, so the map must never render on the server.
 const MapView = dynamic(() => import("@/components/MapView"), { ssr: false });
@@ -28,7 +41,16 @@ export default function Home() {
   const [hiddenLayerTypes, setHiddenLayerTypes] = useState<Set<string>>(new Set());
   const [showPlan, setShowPlan] = useState(true);
   const [view3d, setView3d] = useState(false);
+  const [season, setSeason] = useState<Season>("summer");
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  // Defaults open (matches the always-visible panel this replaces) and is
+  // corrected once on mount for phones -- SSR has no window to check, so a
+  // static default that's occasionally wrong for one frame beats guessing.
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+
+  useEffect(() => {
+    if (!window.matchMedia("(min-width: 768px)").matches) setSidebarOpen(false);
+  }, []);
   // Global config, not per-project -- fetched once so ControlPanel can show
   // the interval inputs' real current default instead of a hardcoded guess.
   const [plantingNorms, setPlantingNorms] = useState<PlantingNorms | undefined>(undefined);
@@ -130,6 +152,21 @@ export default function Home() {
 
   const hasSelection = selection.selectedIds.size > 0;
 
+  // Score already travels on every feature's properties (geo_io.py) and
+  // useProjectSession keeps plan.features in sync through every edit path
+  // (move/retype/delete/restore) -- so this is always derived fresh from
+  // whatever's actually loaded, never a separately-stored, separately-stale
+  // number. Clamped only for display -- HeuristicScorer's weighted sum isn't
+  // hard-clamped to [0,1] the way MLScorer's predict_proba is.
+  const qualityIndex = useMemo(() => {
+    const features = plan?.features.features;
+    if (!features?.length) return null;
+    const scores = features.map((f) => Number((f.properties as Record<string, unknown>).score)).filter(Number.isFinite);
+    if (!scores.length) return null;
+    const avg = scores.reduce((s, v) => s + v, 0) / scores.length;
+    return Math.min(100, Math.max(0, Math.round(avg * 100)));
+  }, [plan]);
+
   const contextMenuEntries: ContextMenuEntry[] = [
     {
       label: "Сделать деревом",
@@ -170,46 +207,74 @@ export default function Home() {
 
   return (
     <main className="flex h-full w-full">
-      <ControlPanel
-        hasProject={project !== null}
-        hasPlan={plan !== null}
-        restoring={session.restoring}
-        generating={session.generating}
-        exporting={session.exporting}
-        onUpload={session.handleUpload}
-        onGenerate={session.handleGenerate}
-        plantingNorms={plantingNorms}
-        onExportDxf={session.handleExportDxf}
-        onClearAll={session.handleClearAll}
-        layerLegend={layerLegend}
-        hiddenLayerTypes={hiddenLayerTypes}
-        onToggleLayerType={handleToggleLayerType}
-        showPlan={showPlan}
-        onToggleShowPlan={handleToggleShowPlan}
-        view3d={view3d}
-        onToggleView3d={toggleView3d}
-        plans={plans}
-        currentPlanId={plan?.plan_id}
-        onSelectPlan={session.handleSelectPlan}
-        editBusy={editing.editBusy}
-        canUndo={editing.canUndo}
-        canRedo={editing.canRedo}
-        onUndo={() => editing.undo()}
-        onRedo={editing.redo}
-        selectMode={selection.selectMode}
-        onToggleSelectMode={toggleSelectMode}
-        selection={selection.summary}
-        onRetypeSelection={(type) => editing.handleRetypeSelection(selection.selectedIds, planIndex, type)}
-        onDeleteSelection={() => editing.handleDeleteSelection(selection.selectedIds)}
-        onClearSelection={selection.clear}
-        onSelectAll={selection.selectAll}
-        validating={editing.validating}
-        violations={editing.violations}
-        onFocusItem={selection.focusItem}
-      />
+      <div
+        className={cn(
+          "h-full flex-none overflow-hidden transition-all duration-200 ease-in-out",
+          "fixed inset-y-0 left-0 z-40 md:static md:z-auto",
+          sidebarOpen ? "w-80 translate-x-0" : "-translate-x-full md:w-0 md:translate-x-0"
+        )}
+      >
+        <ControlPanel
+          hasProject={project !== null}
+          hasPlan={plan !== null}
+          restoring={session.restoring}
+          generating={session.generating}
+          exporting={session.exporting}
+          onUpload={session.handleUpload}
+          onGenerate={session.handleGenerate}
+          plantingNorms={plantingNorms}
+          onExportDxf={session.handleExportDxf}
+          onClearAll={session.handleClearAll}
+          layerLegend={layerLegend}
+          hiddenLayerTypes={hiddenLayerTypes}
+          onToggleLayerType={handleToggleLayerType}
+          showPlan={showPlan}
+          onToggleShowPlan={handleToggleShowPlan}
+          view3d={view3d}
+          onToggleView3d={toggleView3d}
+          season={season}
+          onSeasonChange={setSeason}
+          plans={plans}
+          currentPlanId={plan?.plan_id}
+          onSelectPlan={session.handleSelectPlan}
+          editBusy={editing.editBusy}
+          canUndo={editing.canUndo}
+          canRedo={editing.canRedo}
+          onUndo={() => editing.undo()}
+          onRedo={editing.redo}
+          selectMode={selection.selectMode}
+          onToggleSelectMode={toggleSelectMode}
+          selection={selection.summary}
+          onRetypeSelection={(type) => editing.handleRetypeSelection(selection.selectedIds, planIndex, type)}
+          onDeleteSelection={() => editing.handleDeleteSelection(selection.selectedIds)}
+          onClearSelection={selection.clear}
+          onSelectAll={selection.selectAll}
+          validating={editing.validating}
+          violations={editing.violations}
+          onFocusItem={selection.focusItem}
+        />
+      </div>
+      {sidebarOpen && (
+        <div className="fixed inset-0 z-30 bg-black/40 md:hidden" onClick={() => setSidebarOpen(false)} aria-hidden />
+      )}
+      <button
+        onClick={() => setSidebarOpen((v) => !v)}
+        title={sidebarOpen ? "Скрыть панель" : "Показать панель"}
+        aria-pressed={sidebarOpen}
+        className={cn(
+          // top-24, not top-4 -- Leaflet's own zoom control sits at the
+          // map's top-left corner (~10-74px from the top, confirmed live)
+          // and renders above this button (leaflet's z-index 1000 > our
+          // 500), silently eating clicks at a naive top-4 position.
+          "fixed top-24 z-[500] rounded-md border border-stone-700 bg-stone-900 p-1.5 text-stone-300 shadow transition-[left] duration-200 ease-in-out hover:bg-stone-800",
+          sidebarOpen ? "left-[336px]" : "left-4"
+        )}
+      >
+        {sidebarOpen ? <PanelLeftClose className="h-4 w-4" aria-hidden /> : <PanelLeftOpen className="h-4 w-4" aria-hidden />}
+      </button>
       <div className="relative min-w-0 flex-1">
         {view3d ? (
-          <ThreeDView layers={project?.layers} plan={plan?.features} />
+          <ThreeDView layers={project?.layers} plan={plan?.features} season={season} />
         ) : (
           <MapView
             layers={project?.layers}
@@ -229,8 +294,10 @@ export default function Home() {
             onContextMenu={handleContextMenu}
             onViewChange={closeContextMenu}
             focusRequest={selection.focusRequest}
+            sidebarOpen={sidebarOpen}
           />
         )}
+        <QualityBadge value={qualityIndex} />
       </div>
       {contextMenu && (
         <ContextMenu

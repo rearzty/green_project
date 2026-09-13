@@ -5,12 +5,17 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
 import { getPlantingNorms, type GeoJSONFeatureCollection, type PlantingNorms } from "@/lib/api";
-import { buildScene3DData, MAX_3D_ITEMS, type Polygon3D } from "@/lib/plan3d";
-import { PLANTING_COLORS, ZONE_COLORS } from "@/lib/mapStyle";
+import { buildScene3DData, MAX_3D_ITEMS, type Building3D, type Polygon3D } from "@/lib/plan3d";
+import { SEASON_PALETTES, ZONE_COLORS, type Season } from "@/lib/mapStyle";
 
 export interface ThreeDViewProps {
   layers?: GeoJSONFeatureCollection;
   plan?: GeoJSONFeatureCollection;
+  /** Cosmetic tree/shrub/lawn/sky tint -- see SEASON_PALETTES (mapStyle.ts).
+   * A full scene rebuild is cheap enough (~130ms at 33,789 items, measured
+   * this session's stress test) that season is just another dependency of
+   * the main build effect below, not a separate live-material-update path. */
+  season?: Season;
 }
 
 // Ground stacked in thin slabs (territory, then road/greenery/lawn on top)
@@ -28,8 +33,34 @@ const EXISTING_GREENERY_Y = TERRITORY_DEPTH_M + 0.14;
 const LAWN_Y = TERRITORY_DEPTH_M + 0.2;
 const PLANTING_BASE_Y = TERRITORY_DEPTH_M + 0.2;
 
-const SKY_COLOR = "#cbd5e1";
 const TRUNK_COLOR = "#7c5a3a";
+
+// One shared canvas texture for every building's walls -- Texture.clone()
+// (used per-building below) copies only repeat/wrapping settings, not
+// pixels, so this stays a single small GPU upload regardless of how many
+// buildings a site has (~25+ on this session's stress-test site).
+let sharedWindowTexture: THREE.CanvasTexture | null = null;
+function getWindowTexture(): THREE.CanvasTexture {
+  if (sharedWindowTexture) return sharedWindowTexture;
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 64;
+  const ctx = canvas.getContext("2d")!;
+  // Higher contrast than a first attempt (light grey wall / near-white
+  // windows) turned out to need -- at real building scale the pattern
+  // tiled so finely it washed out to a flat grey blur from any normal
+  // viewing distance. Darker "glass" squares against a lighter wall read
+  // as windows even at a glance.
+  ctx.fillStyle = "#d6d3d1";
+  ctx.fillRect(0, 0, 64, 64);
+  ctx.fillStyle = "#475569";
+  for (let y = 6; y < 64; y += 16) {
+    for (let x = 6; x < 64; x += 16) ctx.fillRect(x, y, 10, 10);
+  }
+  sharedWindowTexture = new THREE.CanvasTexture(canvas);
+  sharedWindowTexture.wrapS = sharedWindowTexture.wrapT = THREE.RepeatWrapping;
+  sharedWindowTexture.colorSpace = THREE.SRGBColorSpace;
+  return sharedWindowTexture;
+}
 
 /** Not a real THREE.Shape by itself -- a polygon can come back with too few
  * points from degenerate source geometry (a hole equal to its own outer
@@ -74,9 +105,57 @@ function extrudedMesh(polygon: Polygon3D, color: string, height: number, baseY: 
   return mesh;
 }
 
+/** Buildings only (territory/roads/etc. keep using extrudedMesh/flatMesh
+ * above with one material) -- ExtrudeGeometry groups faces by material index
+ * 0 = lid (top + bottom caps, from buildLidFaces) and 1 = extruded side
+ * walls (from buildSideFaces), confirmed against the installed three@0.186.0
+ * source rather than assumed, so a flat roof color and a textured wall are
+ * two separate materials passed as an array, not one material with a
+ * texture that would also smear across the roof. */
+function buildingMesh(building: Building3D, capColor: string, baseY: number, disposables: Disposable[]): THREE.Mesh | null {
+  const shape = shapeFromPolygon(building);
+  if (!shape) return null;
+  const geometry = new THREE.ExtrudeGeometry(shape, { depth: building.height, bevelEnabled: false });
+  const capMaterial = new THREE.MeshStandardMaterial({ color: capColor });
+
+  const wallTexture = getWindowTexture().clone();
+  wallTexture.needsUpdate = true;
+  // ExtrudeGeometry's default side-wall UV generator (verified by reading
+  // three's own source, not assumed) does NOT normalize U/V to [0,1] per
+  // face -- it uses the vertex's raw LOCAL METER coordinate directly (the
+  // along-wall axis for U, extrusion depth for V). A repeat count meant for
+  // "N tiles across the whole wall" was actually being read as "N tiles per
+  // metre", tiling a real building's wall so finely (sub-centimetre) that it
+  // averaged out to a flat grey blur -- found live, close-up screenshots
+  // showed no visible pattern at all despite the material/texture/UVs all
+  // checking out individually. Fixed by treating repeat as "tiles per
+  // metre" directly: 1 tile roughly every 3m reads as a believable
+  // window-bay rhythm at both real (tens of metres) and demo (~20m) scale.
+  const TILE_METRES = 3;
+  wallTexture.repeat.set(1 / TILE_METRES, 1 / TILE_METRES);
+  const wallMaterial = new THREE.MeshStandardMaterial({
+    map: wallTexture,
+    // Same centroid hash `height` derives from -- a subtle per-building tint
+    // so a row of buildings doesn't look like identical clones, without a
+    // second, unrelated source of randomness.
+    color: new THREE.Color().setHSL(building.hash01, 0.12, 0.55),
+  });
+
+  const mesh = new THREE.Mesh(geometry, [capMaterial, wallMaterial]);
+  mesh.rotation.x = -Math.PI / 2;
+  mesh.position.y = baseY;
+  disposables.push({ geometry, material: capMaterial });
+  disposables.push({ geometry, material: wallMaterial, texture: wallTexture });
+  return mesh;
+}
+
 interface Disposable {
   geometry: THREE.BufferGeometry;
   material: THREE.Material;
+  // Material.dispose() does not cascade-dispose a `map` texture -- a cloned
+  // per-building window texture (see buildingMesh below) needs its own
+  // explicit disposal or it leaks on every remount/season rebuild.
+  texture?: THREE.Texture;
 }
 
 /** One InstancedMesh pair (trunk + conical canopy) for every tree, or one
@@ -87,7 +166,11 @@ interface Disposable {
  * built as a unit primitive (radius/height 1) and scaled per-instance via
  * the matrix, so the same two buffers serve every tree regardless of its
  * own canopy radius. */
-function buildTrees(points: { x: number; y: number; canopyRadius: number }[], disposables: Disposable[]): THREE.Object3D[] {
+function buildTrees(
+  points: { x: number; y: number; canopyRadius: number }[],
+  canopyColor: string,
+  disposables: Disposable[]
+): THREE.Object3D[] {
   if (points.length === 0) return [];
 
   const trunkGeometry = new THREE.CylinderGeometry(1, 1, 1, 8);
@@ -96,7 +179,7 @@ function buildTrees(points: { x: number; y: number; canopyRadius: number }[], di
   disposables.push({ geometry: trunkGeometry, material: trunkMaterial });
 
   const canopyGeometry = new THREE.ConeGeometry(1, 1, 10);
-  const canopyMaterial = new THREE.MeshStandardMaterial({ color: PLANTING_COLORS.tree });
+  const canopyMaterial = new THREE.MeshStandardMaterial({ color: canopyColor });
   const canopyMesh = new THREE.InstancedMesh(canopyGeometry, canopyMaterial, points.length);
   disposables.push({ geometry: canopyGeometry, material: canopyMaterial });
 
@@ -127,11 +210,15 @@ function buildTrees(points: { x: number; y: number; canopyRadius: number }[], di
   return [trunkMesh, canopyMesh];
 }
 
-function buildShrubs(points: { x: number; y: number; canopyRadius: number }[], disposables: Disposable[]): THREE.Object3D[] {
+function buildShrubs(
+  points: { x: number; y: number; canopyRadius: number }[],
+  shrubColor: string,
+  disposables: Disposable[]
+): THREE.Object3D[] {
   if (points.length === 0) return [];
 
   const geometry = new THREE.SphereGeometry(1, 8, 6);
-  const material = new THREE.MeshStandardMaterial({ color: PLANTING_COLORS.shrub });
+  const material = new THREE.MeshStandardMaterial({ color: shrubColor });
   const mesh = new THREE.InstancedMesh(geometry, material, points.length);
   disposables.push({ geometry, material });
 
@@ -156,7 +243,7 @@ function buildShrubs(points: { x: number; y: number; canopyRadius: number }[], d
  * lib/plan3d.ts for how the GeoJSON is turned into local-meter geometry
  * (including what's deliberately left out -- zoning, utilities, real
  * building heights we don't have). */
-export default function ThreeDView({ layers, plan }: ThreeDViewProps) {
+export default function ThreeDView({ layers, plan, season = "summer" }: ThreeDViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [norms, setNorms] = useState<PlantingNorms | undefined>(undefined);
   // Distinct from `norms` itself being set -- without this, the very first
@@ -198,9 +285,19 @@ export default function ThreeDView({ layers, plan }: ThreeDViewProps) {
     if (!container || !data || overItemLimit) return;
 
     const disposables: Disposable[] = [];
+    const palette = SEASON_PALETTES[season];
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(SKY_COLOR);
+    // A flat per-season sky color, not a gradient sphere: a custom
+    // ShaderMaterial sky sphere was tried and found live to render as a
+    // solid black low-poly blob instead of a smooth backdrop under this
+    // renderer's logarithmicDepthBuffer setup (adding the standard
+    // <logdepthbuf_*> chunks didn't fix it, and the remaining behavior
+    // wasn't worth further custom-shader debugging for a purely cosmetic
+    // gradient) -- see docs/decision_log.md. This is the same
+    // scene.background mechanism the view used before season support, just
+    // keyed off the season palette now.
+    scene.background = new THREE.Color(palette.skyTop);
 
     // near=0.5 (not the more typical 0.1) and a far plane sized to the actual
     // scene (not a fixed huge fallback) both matter for a non-logarithmic
@@ -235,6 +332,13 @@ export default function ThreeDView({ layers, plan }: ThreeDViewProps) {
     camera.position.set(centerX + cameraDistance, cameraDistance * 0.7 + (bounds?.maxBuildingHeight ?? 0), -centerY + cameraDistance);
     controls.target.set(centerX, 0, -centerY);
     camera.far = diagonal * 3 + 100;
+    // OrbitControls has no distance limit by default -- mouse-wheel dolly
+    // could move the camera farther from target than camera.far allows,
+    // silently clipping the entire scene at once (found live: objects
+    // vanished when zoomed out far enough). Bounding maxDistance well under
+    // camera.far means that can't happen regardless of territory size.
+    controls.minDistance = Math.max(diagonal * 0.01, camera.near);
+    controls.maxDistance = diagonal * 2.5;
     camera.updateProjectionMatrix();
     controls.update();
 
@@ -270,17 +374,15 @@ export default function ThreeDView({ layers, plan }: ThreeDViewProps) {
     }
     addFlat(data.roads, ZONE_COLORS.road, ROAD_Y);
     addFlat(data.existingGreenery, ZONE_COLORS.existing_greenery, EXISTING_GREENERY_Y);
-    addFlat(data.lawns, PLANTING_COLORS.lawn, LAWN_Y);
+    addFlat(data.lawns, palette.lawn, LAWN_Y);
 
     for (const building of data.buildings) {
-      const mesh = extrudedMesh(building, ZONE_COLORS.building, building.height, TERRITORY_DEPTH_M);
-      if (!mesh) continue;
-      scene.add(mesh);
-      disposables.push({ geometry: mesh.geometry, material: mesh.material as THREE.Material });
+      const mesh = buildingMesh(building, ZONE_COLORS.building, TERRITORY_DEPTH_M, disposables);
+      if (mesh) scene.add(mesh);
     }
 
-    for (const object of buildTrees(data.trees, disposables)) scene.add(object);
-    for (const object of buildShrubs(data.shrubs, disposables)) scene.add(object);
+    for (const object of buildTrees(data.trees, palette.tree, disposables)) scene.add(object);
+    for (const object of buildShrubs(data.shrubs, palette.shrub, disposables)) scene.add(object);
 
     // A function expression, not `function resize() {}` -- a hoisted
     // declaration would fall outside TypeScript's narrowing of `container`
@@ -309,15 +411,16 @@ export default function ThreeDView({ layers, plan }: ThreeDViewProps) {
       cancelAnimationFrame(frameId);
       resizeObserver.disconnect();
       controls.dispose();
-      for (const { geometry, material } of disposables) {
+      for (const { geometry, material, texture } of disposables) {
         geometry.dispose();
         material.dispose();
+        texture?.dispose();
       }
       renderer.dispose();
       if (renderer.domElement.parentNode === container) container.removeChild(renderer.domElement);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- overItemLimit is derived from `data`, not an independent input
-  }, [data, overItemLimit]);
+  }, [data, overItemLimit, season]);
 
   if (!plan) {
     return <div className="flex h-full w-full items-center justify-center text-sm text-stone-500">Нет плана для 3D-просмотра.</div>;

@@ -5,6 +5,7 @@ independent packages together — neither of them imports the other.
 
 from __future__ import annotations
 
+import random
 import zlib
 
 from fastapi.concurrency import run_in_threadpool
@@ -19,6 +20,7 @@ from geo_engine.buffers import build_exclusion_zone, buildable_area
 from geo_engine.candidates import generate_candidates
 from geo_engine.norms import PlantingNorms, load_norms
 from geo_engine.placement import greedy_select
+from geo_engine.species import load_species
 from ml_scoring.heuristic_scorer import HeuristicScorer
 from ml_scoring.ml_scorer import MLScorer
 from ml_scoring.scoring_strategy import ScoringStrategy
@@ -98,6 +100,7 @@ def _compute_planting_rows(
     """
     rows: list[dict] = []
     score_fn = scorer.as_score_fn()
+    species = load_species()
     for planting_type in planting_types:
         exclusion = build_exclusion_zone(utilities, zones, planting_type, norms)
         margin = norms.territory_margin_for(planting_type)
@@ -105,6 +108,18 @@ def _compute_planting_rows(
         seed = zlib.crc32(f"{plan_id}:{planting_type}".encode())
         candidates = generate_candidates(buildable, exclusion, planting_type, norms, zoning_zones=zones, seed=seed)
         items = greedy_select(candidates, score_fn, norms)
+
+        species_pool = species.get(planting_type)
+        if species_pool:
+            # A seed distinct from the candidate-scatter one above -- species
+            # assignment shouldn't be even conceptually tied to placement
+            # randomness. Same reproducibility requirement either way:
+            # ensure_materialized() must re-assign the same species to the
+            # same items, not a fresh random pick.
+            species_rng = random.Random(zlib.crc32(f"{plan_id}:{planting_type}:species".encode()))
+            for item in items:
+                item.species = species_rng.choice(species_pool)
+
         rows.extend(domain_item_to_row_values(plan_id, item) for item in items)
     return rows
 

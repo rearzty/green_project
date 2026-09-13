@@ -28,19 +28,19 @@ export function Toaster() {
             role={t.kind === "error" ? "alert" : "status"}
             onMouseEnter={() => holdToast(t.id)}
             onMouseLeave={() => releaseToast(t.id)}
-            className={`gp-toast pointer-events-auto flex items-start gap-3 rounded-lg border border-l-4 border-stone-200 bg-white/95 p-3 shadow-lg backdrop-blur ${style.accent}`}
+            className={`gp-toast pointer-events-auto flex items-start gap-3 rounded-lg border border-l-4 border-stone-700 bg-stone-900/95 p-3 shadow-lg backdrop-blur ${style.accent}`}
           >
             <Icon className={`mt-0.5 h-5 w-5 flex-none ${style.iconClass}`} aria-hidden />
             <div className="min-w-0 flex-1">
-              <p className="text-sm font-medium text-stone-900">{style.title}</p>
-              <p className="mt-0.5 break-words text-sm text-stone-600">{t.message}</p>
+              <p className="text-sm font-medium text-stone-50">{style.title}</p>
+              <p className="mt-0.5 break-words text-sm text-stone-300">{t.message}</p>
               {t.action && (
                 <button
                   onClick={() => {
                     t.action?.onClick();
                     dismissToast(t.id);
                   }}
-                  className="mt-2 rounded-md border border-greenery-300 px-2 py-1 text-xs font-medium text-greenery-700 hover:bg-greenery-50"
+                  className="mt-2 rounded-md border border-greenery-600 px-2 py-1 text-xs font-medium text-greenery-300 hover:bg-stone-800"
                 >
                   {t.action.label}
                 </button>
@@ -48,7 +48,7 @@ export function Toaster() {
             </div>
             <button
               onClick={() => dismissToast(t.id)}
-              className="flex-none rounded p-0.5 text-stone-400 hover:bg-stone-100 hover:text-stone-600"
+              className="flex-none rounded p-0.5 text-stone-500 hover:bg-stone-800 hover:text-stone-300"
               aria-label="Закрыть уведомление"
             >
               <X className="h-4 w-4" />
