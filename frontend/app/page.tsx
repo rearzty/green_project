@@ -23,10 +23,11 @@ import { useKeyboardShortcuts } from "@/lib/hooks/useKeyboardShortcuts";
 import { usePlanEdits } from "@/lib/hooks/usePlanEdits";
 import { useProjectSession } from "@/lib/hooks/useProjectSession";
 import { useSelection } from "@/lib/hooks/useSelection";
-import { getPlantingNorms, type PlantingNorms } from "@/lib/api";
+import { AssistantChat } from "@/components/AssistantChat";
+import { getPlantingNorms, type PlantingNorms, type PlantingType, type ScoringMode } from "@/lib/api";
 import { countLabel, OBJECT_FORMS } from "@/lib/format";
 import { buildLayerLegend, type Season } from "@/lib/mapStyle";
-import { toast } from "@/lib/toast";
+import { errorMessage, toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
 // Leaflet touches `window` on import, so the map must never render on the server.
@@ -42,6 +43,15 @@ export default function Home() {
   const [showPlan, setShowPlan] = useState(true);
   const [view3d, setView3d] = useState(false);
   const [season, setSeason] = useState<Season>("summer");
+  // Lifted out of ControlPanel (used to be its own local state) so
+  // AssistantChat can read and change the same generation recipe Юна talks
+  // about -- see ControlPanel.tsx's own comment on why this moved.
+  const [plantingTypes, setPlantingTypes] = useState<PlantingType[]>(["tree", "shrub", "lawn"]);
+  const [scoringMode, setScoringMode] = useState<ScoringMode>("heuristic");
+  // undefined = not overridden -- generate omits the field and the backend
+  // falls back to planting_norms.yaml's own tree_default/shrub_default.
+  const [treeSpacingM, setTreeSpacingM] = useState<number | undefined>(undefined);
+  const [shrubSpacingM, setShrubSpacingM] = useState<number | undefined>(undefined);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   // Defaults open (matches the always-visible panel this replaces) and is
   // corrected once on mount for phones -- SSR has no window to check, so a
@@ -127,6 +137,26 @@ export default function Home() {
     }
     selection.setSelectMode(true);
     setContextMenu(null);
+  }
+
+  /** Юна decided the chat message asked for a settings change -- applies it
+   * through the exact same generate path the panel's own button uses (so the
+   * plan-history refresh, session persistence, and the shared `generating`
+   * indicator all just work), after first updating the lifted state so the
+   * panel's own inputs immediately reflect what Юна just set. */
+  async function handleAssistantAction(action: { planting_types: PlantingType[]; tree_spacing_m?: number; shrub_spacing_m?: number }) {
+    setPlantingTypes(action.planting_types);
+    setTreeSpacingM(action.tree_spacing_m);
+    setShrubSpacingM(action.shrub_spacing_m);
+    try {
+      await session.handleGenerate(action.planting_types, scoringMode, {
+        treeSpacingM: action.tree_spacing_m,
+        shrubSpacingM: action.shrub_spacing_m,
+      });
+    } catch (e) {
+      toast.error(errorMessage(e));
+      throw e; // lets AssistantChat show the failure in the chat log too, not just a toast
+    }
   }
 
   function handleEscape() {
@@ -222,6 +252,14 @@ export default function Home() {
           exporting={session.exporting}
           onUpload={session.handleUpload}
           onGenerate={session.handleGenerate}
+          plantingTypes={plantingTypes}
+          onPlantingTypesChange={setPlantingTypes}
+          scoringMode={scoringMode}
+          onScoringModeChange={setScoringMode}
+          treeSpacingM={treeSpacingM}
+          onTreeSpacingMChange={setTreeSpacingM}
+          shrubSpacingM={shrubSpacingM}
+          onShrubSpacingMChange={setShrubSpacingM}
           plantingNorms={plantingNorms}
           onExportDxf={session.handleExportDxf}
           onClearAll={session.handleClearAll}
@@ -237,6 +275,7 @@ export default function Home() {
           plans={plans}
           currentPlanId={plan?.plan_id}
           onSelectPlan={session.handleSelectPlan}
+          onDeletePlan={session.handleDeletePlan}
           editBusy={editing.editBusy}
           canUndo={editing.canUndo}
           canRedo={editing.canRedo}
@@ -274,7 +313,7 @@ export default function Home() {
       </button>
       <div className="relative min-w-0 flex-1">
         {view3d ? (
-          <ThreeDView layers={project?.layers} plan={plan?.features} season={season} />
+          <ThreeDView layers={project?.layers} plan={plan?.features} season={season} storageKey={project?.id} />
         ) : (
           <MapView
             layers={project?.layers}
@@ -309,6 +348,12 @@ export default function Home() {
         />
       )}
       <Toaster />
+      <AssistantChat
+        projectId={project?.id}
+        generating={session.generating}
+        settings={{ planting_types: plantingTypes, tree_spacing_m: treeSpacingM, shrub_spacing_m: shrubSpacingM }}
+        onApplyAction={handleAssistantAction}
+      />
     </main>
   );
 }

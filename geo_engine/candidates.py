@@ -36,6 +36,29 @@ def _clearance(geom: BaseGeometry, exclusion_zone: BaseGeometry | None) -> float
     return geom.distance(exclusion_zone)
 
 
+class TooManyCandidatesError(ValueError):
+    """Raised before the expensive scatter/select work starts, when a
+    spacing/territory-size combination would sample an unsafe number of raw
+    candidate points. `min_distance_m` is user-controllable down to a small
+    floor (0.5 m tree / 0.3 m shrub, see backend/app/schemas/plan.py's
+    GenerateRequest) -- on anything but a small territory, the floor drives
+    the oversampled raw point count (see _OVERSAMPLE_FACTOR below) into the
+    tens of millions, since it scales with 1/min_distance_m². Measured live
+    in this session: a 300x300m territory at shrub's 0.3 m floor alone
+    produced ~3.9M raw samples and was still running past 10 minutes and 5GB
+    RAM when killed -- this didn't exist yet at the time. Message is shown to
+    the user as-is."""
+
+
+# Calibrated against that live measurement (see TooManyCandidatesError), not
+# a precisely-derived performance ceiling -- same "predohranitel against
+# pathological input" spirit as MAX_3D_ITEMS/MAX_VISIBLE_MARKERS on the
+# frontend (plan3d.ts/MapView.tsx), not a claim about what's realistic.
+# Comfortably above default-settings usage on a real ~1.5x1.5km territory
+# (measured ~362K tree / ~1.0M shrub raw samples -- see CLAUDE.md's
+# real-scale benchmarks), comfortably below the failing case above.
+_MAX_RAW_SAMPLES_PER_POLYGON = 2_000_000
+
 # Dart-throwing oversample: how many random raw points to draw per polygon,
 # relative to what a regular grid at `spacing` would have produced over the
 # same bounding box (see generate_point_candidates). Pure rejection sampling
@@ -98,6 +121,11 @@ def generate_point_candidates(
         n_samples = n_x * n_y * _OVERSAMPLE_FACTOR
         if n_samples <= 0:
             continue
+        if n_samples > _MAX_RAW_SAMPLES_PER_POLYGON:
+            raise TooManyCandidatesError(
+                f"Интервал {spacing} м слишком мал для территории такого размера — потребовалось бы "
+                "непомерно много кандидатов на посадку. Увеличьте интервал или уменьшите площадь генерации."
+            )
 
         xs = rng.uniform(minx, maxx, size=n_samples)
         ys = rng.uniform(miny, maxy, size=n_samples)

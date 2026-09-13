@@ -31,6 +31,13 @@ class MissingTerritoryError(ValueError):
     planned or placed without one. Message is shown to the user as-is."""
 
 
+class CurrentPlanDeletionError(ValueError):
+    """Deleting `is_current` would leave the project with no current plan --
+    every other code path here (list_plans's ordering, _find_reusable_plan,
+    the frontend's "текущий" badge) assumes exactly one always exists.
+    Message is shown to the user as-is."""
+
+
 def territory_polygon(zones):
     """Not private (despite the rest of this module's helpers) -- edit_service
     also needs it, to reject manual edits that would place a point outside
@@ -141,6 +148,25 @@ async def _prune_stale_plans(session: AsyncSession, project: Project, keep_plan_
             continue
         await session.execute(delete(PlantingItemRow).where(PlantingItemRow.plan_id == plan.id))
         plan.materialized = False
+
+
+async def delete_plan(session: AsyncSession, plan: Plan) -> None:
+    """Permanently removes one plan from history (the panel's own delete
+    button, not an edit/undo path -- no restore). Pure Core `delete()`
+    statements for both tables, not `await session.delete(plan)` -- an ORM
+    delete would cascade through the `Plan.items` relationship
+    (cascade="all, delete-orphan" in models.py), which needs that collection
+    loaded first; on a plan whose `items` were never eager-loaded, that's a
+    lazy-load outside an active greenlet context -- exactly the
+    `MissingGreenlet` trap documented at length elsewhere in this file (see
+    CLAUDE.md). Two plain `DELETE ... WHERE` statements sidestep it entirely,
+    the same reasoning `_prune_stale_plans` above already follows.
+    """
+    if plan.is_current:
+        raise CurrentPlanDeletionError("Нельзя удалить текущий план — переключитесь на другой или сгенерируйте новый.")
+    await session.execute(delete(PlantingItemRow).where(PlantingItemRow.plan_id == plan.id))
+    await session.execute(delete(Plan).where(Plan.id == plan.id))
+    await session.commit()
 
 
 async def _reload_with_items(session: AsyncSession, plan_id: str) -> Plan:

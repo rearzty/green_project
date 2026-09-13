@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import {
+  deletePlan,
   exportDxf,
   generatePlan,
   getPlan,
@@ -215,6 +216,23 @@ export function useProjectSession() {
     saveStoredSession({ projectId: project.id, planId: nextPlanId });
   }
 
+  /** Permanently removes a plan from history (no undo, unlike item-level
+   * edits) -- the backend itself refuses to delete the project's current
+   * plan (409), so this never has to reason about "what becomes current
+   * instead". If the plan being deleted is the one currently open (a past,
+   * non-current plan the user had clicked into from history), clears the
+   * view rather than leaving stale state pointing at a plan that no longer
+   * exists. */
+  async function handleDeletePlan(planId: string) {
+    if (!project) return;
+    await deletePlan(project.id, planId);
+    setPlans((prev) => prev.filter((p) => p.plan_id !== planId));
+    if (plan?.plan_id === planId) {
+      applyPlan(null);
+      saveStoredSession({ projectId: project.id, planId: null });
+    }
+  }
+
   function handleClearAll() {
     saveStoredSession(null);
     clearAllUndoHistory();
@@ -244,6 +262,7 @@ export function useProjectSession() {
     handleGenerate,
     handleExportDxf,
     handleSelectPlan,
+    handleDeletePlan,
     handleClearAll,
   };
 }

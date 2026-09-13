@@ -23,6 +23,13 @@ services:
     environment:
       GREENPROJECT_DATABASE_URL: postgresql+asyncpg://greenproject:greenproject@db:5432/greenproject
       GREENPROJECT_CORS_ORIGINS: '["http://localhost:3000", "http://127.0.0.1:3000"]'
+      # Юна (assistant_service.py) -- read from the host's own environment
+      # (docker compose substitutes ${VAR} from the shell/.env next to this
+      # file), not hardcoded, so the key never lives in version control.
+      # Unset on the host -> empty string here -> settings.groq_api_key is
+      # falsy -> the assistant endpoint returns a clear "not configured"
+      # error instead of the feature silently misbehaving.
+      GREENPROJECT_GROQ_API_KEY: ${GREENPROJECT_GROQ_API_KEY:-}
     ports:
       - "8000:8000"
     depends_on:

@@ -179,6 +179,14 @@ export async function getPlan(projectId: string, planId: string): Promise<PlanOu
   return request(`/api/projects/${projectId}/plans/${planId}`);
 }
 
+/** Permanently removes one plan from history -- no undo (unlike the
+ * item-level edits, which all have a restore path). The backend refuses
+ * (409) to delete the project's current plan -- see
+ * pipeline_service.py::CurrentPlanDeletionError. */
+export async function deletePlan(projectId: string, planId: string): Promise<void> {
+  return request(`/api/projects/${projectId}/plans/${planId}`, { method: "DELETE" });
+}
+
 /** Every plan ever generated for this project (heuristic and ml alike) —
  * lets the UI show which plan is actually on screen instead of only ever
  * tracking the most recently generated one. */
@@ -320,4 +328,42 @@ export interface PlantingNorms {
 
 export async function getPlantingNorms(): Promise<PlantingNorms> {
   return request("/api/config/planting-norms");
+}
+
+// Юна -- the in-app chat assistant (components/AssistantChat.tsx). The
+// backend is a stateless proxy to an LLM (see assistant_service.py): it
+// holds no conversation of its own, so the full chat log travels on every
+// message, same as `settings` (the panel's current generation recipe) --
+// Юна reasons about new absolute values relative to what's actually set,
+// not blind deltas.
+
+export type AssistantChatMessage = { role: "user" | "assistant"; content: string };
+
+export interface AssistantGenerationSettings {
+  planting_types: PlantingType[];
+  tree_spacing_m?: number;
+  shrub_spacing_m?: number;
+}
+
+/** Present only when Юна decided the message asked for a settings change --
+ * the caller applies it via the same generatePlan() flow the control panel's
+ * own "Сгенерировать план" button already uses. */
+export interface AssistantAction {
+  planting_types: PlantingType[];
+  tree_spacing_m?: number;
+  shrub_spacing_m?: number;
+}
+
+export interface AssistantMessageResult {
+  reply: string;
+  action: AssistantAction | null;
+}
+
+export async function askAssistant(
+  projectId: string,
+  message: string,
+  history: AssistantChatMessage[],
+  currentSettings: AssistantGenerationSettings
+): Promise<AssistantMessageResult> {
+  return postJson(`/api/projects/${projectId}/assistant/message`, { message, history, settings: currentSettings });
 }

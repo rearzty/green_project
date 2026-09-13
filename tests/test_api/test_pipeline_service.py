@@ -5,8 +5,12 @@ per-generation spacing override.
 
 from __future__ import annotations
 
+import asyncio
+
+import pytest
+
 from backend.app.db.models import Plan, Project
-from backend.app.services.pipeline_service import _effective_norms, _find_reusable_plan
+from backend.app.services.pipeline_service import CurrentPlanDeletionError, _effective_norms, _find_reusable_plan, delete_plan
 from geo_engine.norms import load_norms
 
 NORMS = load_norms()
@@ -67,6 +71,18 @@ class TestFindReusablePlanWithSpacing:
         project = _project_with(_plan(tree_spacing_m=6.0))
         result = _find_reusable_plan(project, "heuristic", ["tree", "shrub"], None, None)
         assert result is None
+
+
+class TestDeletePlan:
+    """Only the is_current guard is unit-testable without a real DB session --
+    it's checked before delete_plan ever touches `session`, so this test
+    never opens one. The actual DELETE statements are exercised end-to-end
+    against a live Postgres in manual/browser verification, not here."""
+
+    def test_refuses_to_delete_the_current_plan(self):
+        plan = _plan(is_current=True)
+        with pytest.raises(CurrentPlanDeletionError):
+            asyncio.run(delete_plan(session=None, plan=plan))  # type: ignore[arg-type]
 
 
 class TestEffectiveNorms:
