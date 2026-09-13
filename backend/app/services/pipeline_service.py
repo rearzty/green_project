@@ -5,6 +5,8 @@ independent packages together — neither of them imports the other.
 
 from __future__ import annotations
 
+import zlib
+
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import delete, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,7 +17,7 @@ from backend.app.db.models import Plan, PlantingItemRow, Project
 from backend.app.services.geo_io import domain_item_to_row_values, layers_to_domain
 from geo_engine.buffers import build_exclusion_zone, buildable_area
 from geo_engine.candidates import generate_candidates
-from geo_engine.norms import load_norms
+from geo_engine.norms import PlantingNorms, load_norms
 from geo_engine.placement import greedy_select
 from ml_scoring.heuristic_scorer import HeuristicScorer
 from ml_scoring.ml_scorer import MLScorer
@@ -47,6 +49,21 @@ def build_scorer(scoring_mode: str, norms, existing_greenery) -> ScoringStrategy
     return HeuristicScorer(norms, existing_greenery=existing_greenery)
 
 
+def _effective_norms(norms: PlantingNorms, tree_spacing_m: float | None, shrub_spacing_m: float | None) -> PlantingNorms:
+    """Applies a per-generation spacing override on top of the loaded YAML
+    norms, if the caller asked for one -- used identically at generation time
+    (generate_plan) and at re-materialization time (ensure_materialized) so a
+    collapsed-then-reopened plan recomputes with the same spacing it was
+    first generated with, instead of silently falling back to the YAML
+    default (the exact "forgot the second call site" bug this session's own
+    territory-tolerance fix hit once already, see CLAUDE.md)."""
+    if tree_spacing_m is not None:
+        norms = norms.with_spacing_override("tree", tree_spacing_m)
+    if shrub_spacing_m is not None:
+        norms = norms.with_spacing_override("shrub", shrub_spacing_m)
+    return norms
+
+
 def _compute_planting_rows(
     plan_id: str,
     utilities,
@@ -62,13 +79,31 @@ def _compute_planting_rows(
     every other request for however long a big territory takes (see
     CLAUDE.md's placement.py/candidates.py performance notes). Returns plain
     dicts (Core bulk-insert values), not ORM objects -- see generate_plan.
+
+    Each planting_type is generated independently from the same
+    buildable_area, with no cross-type exclusion -- a tree/shrub candidate
+    landing on a lawn candidate's area is expected, not a bug: a tree
+    standing in grass is the normal case (a cutout in pavement around a
+    trunk is the rare exception, not something this models). Trimming the
+    lawn's shape around what actually got planted, if wanted, is a separate,
+    later, user-driven editing feature, not something generation itself
+    should enforce.
+
+    Point-candidate placement (tree/shrub) is randomized, not gridded (see
+    candidates.py) -- seeded from `plan_id`+`planting_type` via zlib.crc32
+    (stable across processes/runs, unlike Python's own str hash) so this
+    stays a pure function of the plan's recipe: ensure_materialized() calls
+    this with the same plan_id and must get back the exact same layout, not
+    a fresh random one, when it recomputes a collapsed plan's rows.
     """
     rows: list[dict] = []
     score_fn = scorer.as_score_fn()
     for planting_type in planting_types:
         exclusion = build_exclusion_zone(utilities, zones, planting_type, norms)
-        buildable = buildable_area(territory, exclusion, zones)
-        candidates = generate_candidates(buildable, exclusion, planting_type, norms, zoning_zones=zones)
+        margin = norms.territory_margin_for(planting_type)
+        buildable = buildable_area(territory, exclusion, zones, territory_margin_m=margin)
+        seed = zlib.crc32(f"{plan_id}:{planting_type}".encode())
+        candidates = generate_candidates(buildable, exclusion, planting_type, norms, zoning_zones=zones, seed=seed)
         items = greedy_select(candidates, score_fn, norms)
         rows.extend(domain_item_to_row_values(plan_id, item) for item in items)
     return rows
@@ -121,7 +156,7 @@ async def ensure_materialized(session: AsyncSession, plan: Plan) -> Plan:
     if plan.materialized:
         return plan
 
-    norms = load_norms(settings.planting_norms_path)
+    norms = _effective_norms(load_norms(settings.planting_norms_path), plan.tree_spacing_m, plan.shrub_spacing_m)
     utilities, zones = layers_to_domain(plan.project.layers)
     territory = territory_polygon(zones)
     existing_greenery = _existing_greenery(zones)
@@ -137,32 +172,48 @@ async def ensure_materialized(session: AsyncSession, plan: Plan) -> Plan:
     return await _reload_with_items(session, plan.id)
 
 
-def _find_reusable_plan(project: Project, scoring_mode: str, planting_types: list[str]) -> Plan | None:
+def _find_reusable_plan(
+    project: Project,
+    scoring_mode: str,
+    planting_types: list[str],
+    tree_spacing_m: float | None,
+    shrub_spacing_m: float | None,
+) -> Plan | None:
     """If the project's *current* plan already is exactly this recipe
-    (same scoring_mode + same set of planting_types) and nobody has hand-
-    edited it, generating "again" would just create a visible duplicate in
-    plan history with identical content -- nothing new to show, just clutter
-    from re-clicking the same button. Deliberately scoped to the current
-    plan only (not any matching plan anywhere in history): reusing older
-    history would risk resurrecting a plan generated under a since-changed
-    planting_norms.yaml/ML model as if it were fresh, which the recipe-replay
-    mechanism (see Plan's docstring) doesn't version against.
+    (same scoring_mode + same set of planting_types + same spacing overrides)
+    and nobody has hand-edited it, generating "again" would just create a
+    visible duplicate in plan history with identical content -- nothing new
+    to show, just clutter from re-clicking the same button. Deliberately
+    scoped to the current plan only (not any matching plan anywhere in
+    history): reusing older history would risk resurrecting a plan generated
+    under a since-changed planting_norms.yaml/ML model as if it were fresh,
+    which the recipe-replay mechanism (see Plan's docstring) doesn't version
+    against.
     """
     current = next((p for p in project.plans if p.is_current), None)
     if current is None or current.has_manual_edits or current.scoring_mode != scoring_mode:
         return None
     if set(current.planting_types) != set(planting_types):
         return None
+    if current.tree_spacing_m != tree_spacing_m or current.shrub_spacing_m != shrub_spacing_m:
+        return None
     return current
 
 
-async def generate_plan(session: AsyncSession, project: Project, planting_types: list[str], scoring_mode: str) -> Plan:
-    reusable = _find_reusable_plan(project, scoring_mode, planting_types)
+async def generate_plan(
+    session: AsyncSession,
+    project: Project,
+    planting_types: list[str],
+    scoring_mode: str,
+    tree_spacing_m: float | None = None,
+    shrub_spacing_m: float | None = None,
+) -> Plan:
+    reusable = _find_reusable_plan(project, scoring_mode, planting_types, tree_spacing_m, shrub_spacing_m)
     if reusable is not None:
         reusable = await ensure_materialized(session, reusable)
         return await _reload_with_items(session, reusable.id)
 
-    norms = load_norms(settings.planting_norms_path)
+    norms = _effective_norms(load_norms(settings.planting_norms_path), tree_spacing_m, shrub_spacing_m)
     utilities, zones = layers_to_domain(project.layers)
     territory = territory_polygon(zones)
     existing_greenery = _existing_greenery(zones)
@@ -171,7 +222,14 @@ async def generate_plan(session: AsyncSession, project: Project, planting_types:
     for existing_plan in project.plans:
         existing_plan.is_current = False
 
-    plan = Plan(project_id=project.id, scoring_mode=scoring_mode, planting_types=planting_types, is_current=True)
+    plan = Plan(
+        project_id=project.id,
+        scoring_mode=scoring_mode,
+        planting_types=planting_types,
+        tree_spacing_m=tree_spacing_m,
+        shrub_spacing_m=shrub_spacing_m,
+        is_current=True,
+    )
     session.add(plan)
     await session.flush()  # assigns plan.id (client-side default, no DB round trip needed), needed by _compute_planting_rows below
 

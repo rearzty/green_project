@@ -60,7 +60,9 @@ def build_exclusion_zone(
 HARD_OBSTACLE_ZONE_TYPES = ("building", "road", "existing_greenery")
 
 
-def buildable_area(territory: BaseGeometry, exclusion_zone: BaseGeometry, other_zones: list[Zone]) -> BaseGeometry:
+def buildable_area(
+    territory: BaseGeometry, exclusion_zone: BaseGeometry, other_zones: list[Zone], territory_margin_m: float = 0.0
+) -> BaseGeometry:
     """Territory minus the exclusion zone minus any hard obstacles (buildings,
     existing pavement/roads, already-planted greenery) that are never
     plantable regardless of setback — unlike the setback buffers, these are
@@ -68,7 +70,18 @@ def buildable_area(territory: BaseGeometry, exclusion_zone: BaseGeometry, other_
     a candidate could land directly inside e.g. an existing tree/shrub bed;
     `ml_scoring` layering `existing_greenery_gap_score` on top only ranks
     candidates that are already legal, it doesn't make them legal.
+
+    `territory_margin_m` (planting_norms.yaml's territory_margin_m, per
+    planting_type) erodes the territory's own outer boundary inward before
+    anything else is subtracted — a genuinely different operation from every
+    other setback here: those grow an *obstacle* outward and subtract the
+    result, which can't express "keep back from the property line" (there's
+    no obstacle geometry to grow, the boundary itself is the constraint).
+    Without this, a candidate could land right at the edge of the plot --
+    found live on real data, see CLAUDE.md.
     """
+    if territory_margin_m > 0:
+        territory = territory.buffer(-territory_margin_m)
     hard_obstacles = [z.geometry for z in other_zones if z.zone_type in HARD_OBSTACLE_ZONE_TYPES]
     if exclusion_zone is not None and not exclusion_zone.is_empty:
         result = territory.difference(exclusion_zone)
