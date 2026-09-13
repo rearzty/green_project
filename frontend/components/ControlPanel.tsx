@@ -55,6 +55,18 @@ export interface ControlPanelProps {
     scoringMode: ScoringMode,
     spacing?: { treeSpacingM?: number; shrubSpacingM?: number }
   ) => Promise<void>;
+  /** Lifted to app/page.tsx (not local state here anymore) so AssistantChat.tsx
+   * can read/change the same recipe Юна talks about -- both this panel and
+   * the chat now control one shared value instead of each holding their own
+   * copy that could silently disagree with what the other last generated. */
+  plantingTypes: PlantingType[];
+  onPlantingTypesChange: (types: PlantingType[]) => void;
+  scoringMode: ScoringMode;
+  onScoringModeChange: (mode: ScoringMode) => void;
+  treeSpacingM?: number;
+  onTreeSpacingMChange: (value: number | undefined) => void;
+  shrubSpacingM?: number;
+  onShrubSpacingMChange: (value: number | undefined) => void;
   /** Current planting-norms defaults (GET /api/config/planting-norms),
    * fetched once in app/page.tsx -- shown as the interval inputs'
    * placeholder so the panel never hardcodes a number that could drift from
@@ -88,6 +100,10 @@ export interface ControlPanelProps {
   plans: PlanSummary[];
   currentPlanId?: string;
   onSelectPlan: (planId: string) => Promise<void>;
+  /** Permanently removes a plan from history -- no undo. The backend
+   * refuses to delete the project's `is_current` plan (409); the panel
+   * disables that row's delete button rather than surfacing the error. */
+  onDeletePlan: (planId: string) => Promise<void>;
 
   /** An edit is being saved — edit actions and plan switching wait for it. */
   editBusy: boolean;
@@ -130,6 +146,14 @@ export function ControlPanel({
   exporting = false,
   onUpload,
   onGenerate,
+  plantingTypes,
+  onPlantingTypesChange,
+  scoringMode,
+  onScoringModeChange,
+  treeSpacingM,
+  onTreeSpacingMChange,
+  shrubSpacingM,
+  onShrubSpacingMChange,
   plantingNorms,
   onExportDxf,
   onClearAll,
@@ -145,6 +169,7 @@ export function ControlPanel({
   plans,
   currentPlanId,
   onSelectPlan,
+  onDeletePlan,
   editBusy,
   canUndo,
   canRedo,
@@ -169,15 +194,14 @@ export function ControlPanel({
   // CRS until 15.09) is being uploaded instead.
   const [sourceCrs, setSourceCrs] = useState("EPSG:32637");
   const [crsPreset, setCrsPreset] = useState<string>("EPSG:32637");
-  const [plantingTypes, setPlantingTypes] = useState<PlantingType[]>(["tree", "shrub", "lawn"]);
-  const [scoringMode, setScoringMode] = useState<ScoringMode>("heuristic");
-  // undefined = not overridden -- generate omits the field and the backend
-  // falls back to planting_norms.yaml's own tree_default/shrub_default.
-  const [treeSpacingM, setTreeSpacingM] = useState<number | undefined>(undefined);
-  const [shrubSpacingM, setShrubSpacingM] = useState<number | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   // Per violation group: how many times "show on map" was clicked, to step through its items.
   const [violationCursor, setViolationCursor] = useState<Record<string, number>>({});
+  // Plan-history delete is permanent (no undo, unlike item edits) -- a
+  // second click within the same row confirms it, rather than a native
+  // window.confirm() popup (this app avoids native dialogs elsewhere too,
+  // see toast.ts). Blurring the button (click elsewhere) resets it.
+  const [confirmDeletePlanId, setConfirmDeletePlanId] = useState<string | null>(null);
 
   async function guarded(action: () => Promise<void>) {
     setBusy(true);
@@ -191,7 +215,7 @@ export function ControlPanel({
   }
 
   function toggleType(type: PlantingType) {
-    setPlantingTypes((prev) => (prev.includes(type) ? prev.filter((t) => t !== type) : [...prev, type]));
+    onPlantingTypesChange(plantingTypes.includes(type) ? plantingTypes.filter((t) => t !== type) : [...plantingTypes, type]);
   }
 
   // Every violation of one kind carries the same message -- one row per
@@ -261,7 +285,12 @@ export function ControlPanel({
             className="rounded border border-stone-600 bg-stone-900 px-2 py-1 text-sm"
           />
         )}
-        <input type="file" accept=".dxf,.geojson,.json,.shp" onChange={(e) => setFile(e.target.files?.[0] ?? null)} className="text-sm" />
+        <input
+          type="file"
+          accept=".dxf,.geojson,.json,.shp"
+          onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+          className="text-sm text-stone-300 file:mr-3 file:cursor-pointer file:rounded-md file:border-0 file:bg-greenery-600 file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-white hover:file:bg-greenery-700"
+        />
         <Button disabled={!file || busy} onClick={() => file && guarded(() => onUpload(file, name, sourceCrs))}>
           Загрузить
         </Button>
@@ -280,7 +309,12 @@ export function ControlPanel({
         <div className="flex flex-col gap-1 text-sm">
           {(Object.keys(GENERATE_TYPE_LABELS) as PlantingType[]).map((type) => (
             <label key={type} className="flex items-center gap-2">
-              <input type="checkbox" checked={plantingTypes.includes(type)} onChange={() => toggleType(type)} />
+              <input
+                type="checkbox"
+                checked={plantingTypes.includes(type)}
+                onChange={() => toggleType(type)}
+                className="h-4 w-4 accent-greenery-600"
+              />
               {GENERATE_TYPE_LABELS[type]}
             </label>
           ))}
@@ -294,7 +328,7 @@ export function ControlPanel({
               min={0.5}
               max={15}
               value={treeSpacingM ?? ""}
-              onChange={(e) => setTreeSpacingM(e.target.value === "" ? undefined : Number(e.target.value))}
+              onChange={(e) => onTreeSpacingMChange(e.target.value === "" ? undefined : Number(e.target.value))}
               disabled={!plantingTypes.includes("tree")}
               placeholder={String(plantingNorms?.species_spacing.tree_default?.min_distance_m ?? 5)}
               className="w-20 rounded border border-stone-600 bg-stone-900 px-2 py-0.5 disabled:opacity-50"
@@ -308,7 +342,7 @@ export function ControlPanel({
               min={0.3}
               max={10}
               value={shrubSpacingM ?? ""}
-              onChange={(e) => setShrubSpacingM(e.target.value === "" ? undefined : Number(e.target.value))}
+              onChange={(e) => onShrubSpacingMChange(e.target.value === "" ? undefined : Number(e.target.value))}
               disabled={!plantingTypes.includes("shrub")}
               placeholder={String(plantingNorms?.species_spacing.shrub_default?.min_distance_m ?? 3)}
               className="w-20 rounded border border-stone-600 bg-stone-900 px-2 py-0.5 disabled:opacity-50"
@@ -317,11 +351,11 @@ export function ControlPanel({
         </div>
         <div className="flex gap-3 text-sm">
           <label className="flex items-center gap-1">
-            <input type="radio" checked={scoringMode === "heuristic"} onChange={() => setScoringMode("heuristic")} />
+            <input type="radio" checked={scoringMode === "heuristic"} onChange={() => onScoringModeChange("heuristic")} className="h-4 w-4 accent-greenery-600" />
             Эвристика
           </label>
           <label className="flex items-center gap-1">
-            <input type="radio" checked={scoringMode === "ml"} onChange={() => setScoringMode("ml")} />
+            <input type="radio" checked={scoringMode === "ml"} onChange={() => onScoringModeChange("ml")} className="h-4 w-4 accent-greenery-600" />
             ML
           </label>
         </div>
@@ -338,15 +372,33 @@ export function ControlPanel({
           <h2 className="text-sm font-medium">История планов</h2>
           <ul className="flex max-h-32 flex-col gap-1 overflow-y-auto text-xs">
             {plans.map((p) => (
-              <li key={p.plan_id}>
+              <li key={p.plan_id} className="flex items-center gap-1">
                 <button
                   disabled={busy || editBusy}
                   onClick={() => guarded(() => onSelectPlan(p.plan_id))}
-                  className={`w-full rounded border px-2 py-1 text-left ${
+                  className={`w-full min-w-0 rounded border px-2 py-1 text-left ${
                     p.plan_id === currentPlanId ? "border-greenery-500 bg-stone-800" : "border-stone-700"
                   }`}
                 >
                   {formatPlanLabel(p)}
+                </button>
+                <button
+                  disabled={busy || editBusy || p.is_current}
+                  onClick={() => {
+                    if (confirmDeletePlanId === p.plan_id) {
+                      setConfirmDeletePlanId(null);
+                      guarded(() => onDeletePlan(p.plan_id));
+                    } else {
+                      setConfirmDeletePlanId(p.plan_id);
+                    }
+                  }}
+                  onBlur={() => setConfirmDeletePlanId((id) => (id === p.plan_id ? null : id))}
+                  title={p.is_current ? "Нельзя удалить текущий план" : confirmDeletePlanId === p.plan_id ? "Точно удалить?" : "Удалить план"}
+                  className={`flex-none rounded p-1 disabled:opacity-30 ${
+                    confirmDeletePlanId === p.plan_id ? "bg-red-900 text-red-200" : "text-stone-400 hover:bg-red-950/60 hover:text-red-300"
+                  }`}
+                >
+                  <Trash2 className="h-3.5 w-3.5" aria-hidden />
                 </button>
               </li>
             ))}
@@ -463,6 +515,7 @@ export function ControlPanel({
                     type="checkbox"
                     checked={!hiddenLayerTypes.has(entry.key)}
                     onChange={() => onToggleLayerType(entry.key)}
+                    className="h-4 w-4 accent-greenery-600"
                   />
                   <span
                     className="h-3 w-3 flex-none rounded-sm border border-white/10"
@@ -477,7 +530,7 @@ export function ControlPanel({
           </ul>
         )}
         <label className="flex items-center gap-2 text-sm">
-          <input type="checkbox" checked={showPlan} onChange={(e) => onToggleShowPlan(e.target.checked)} />
+          <input type="checkbox" checked={showPlan} onChange={(e) => onToggleShowPlan(e.target.checked)} className="h-4 w-4 accent-greenery-600" />
           Сгенерированный план
         </label>
         <Button

@@ -22,12 +22,14 @@ dependencies = [
     "numpy>=1.26",
     "pyyaml>=6.0",
     "python-multipart>=0.0.9",
+    # Outbound call to Groq's API from assistant_service.py (Юна) -- not just
+    # a test dependency anymore, so it moved out of [dev] below.
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.3",
-    "httpx>=0.27",
 ]
 
 [tool.setuptools.packages.find]

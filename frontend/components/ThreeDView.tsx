@@ -5,7 +5,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
 import { getPlantingNorms, type GeoJSONFeatureCollection, type PlantingNorms } from "@/lib/api";
-import { buildScene3DData, MAX_3D_ITEMS, type Building3D, type Polygon3D } from "@/lib/plan3d";
+import { buildScene3DData, hashToUnit, MAX_3D_ITEMS, type Building3D, type PlantingPoint3D, type Polygon3D } from "@/lib/plan3d";
 import { SEASON_PALETTES, ZONE_COLORS, type Season } from "@/lib/mapStyle";
 
 export interface ThreeDViewProps {
@@ -16,6 +16,13 @@ export interface ThreeDViewProps {
    * this session's stress test) that season is just another dependency of
    * the main build effect below, not a separate live-material-update path. */
   season?: Season;
+  /** Scopes camera-position persistence (see loadStoredCamera/saveStoredCamera
+   * below) to one project -- the project id, not the plan id, since switching
+   * between plans of the same project (edits, re-generates) shouldn't reset a
+   * framing the user already set up, but a genuinely different project (a
+   * different, differently-scaled territory) shouldn't inherit one either.
+   * Persistence is simply skipped when this is undefined (no project open yet). */
+  storageKey?: string;
 }
 
 // Ground stacked in thin slabs (territory, then road/greenery/lawn on top)
@@ -60,6 +67,59 @@ function getWindowTexture(): THREE.CanvasTexture {
   sharedWindowTexture.wrapS = sharedWindowTexture.wrapT = THREE.RepeatWrapping;
   sharedWindowTexture.colorSpace = THREE.SRGBColorSpace;
   return sharedWindowTexture;
+}
+
+// Same shared-canvas-texture trick as the window texture above, but drawn in
+// neutral white/grey (not pre-colored green) -- MeshStandardMaterial
+// multiplies a diffuse map by `material.color`, so painting it grayscale lets
+// SEASON_PALETTES' actual lawn color (spring pale green through winter
+// near-white) tint the same texture correctly every season, rather than
+// needing one texture per season.
+let sharedGrassTexture: THREE.CanvasTexture | null = null;
+function getGrassTexture(): THREE.CanvasTexture {
+  if (sharedGrassTexture) return sharedGrassTexture;
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 64;
+  const ctx = canvas.getContext("2d")!;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, 64, 64);
+  ctx.fillStyle = "#d4d4d4";
+  // A fixed linear-congruential sequence, not Math.random() -- this canvas is
+  // built once per page load regardless, so determinism buys nothing
+  // functional here, but it costs nothing either and matches this file's
+  // existing preference for reproducible-looking output.
+  let seed = 1;
+  const nextRand = () => {
+    seed = (seed * 16807) % 2147483647;
+    return (seed - 1) / 2147483646;
+  };
+  for (let i = 0; i < 110; i++) ctx.fillRect(nextRand() * 64, nextRand() * 64, 1.5, 1.5);
+  sharedGrassTexture = new THREE.CanvasTexture(canvas);
+  sharedGrassTexture.wrapS = sharedGrassTexture.wrapT = THREE.RepeatWrapping;
+  sharedGrassTexture.colorSpace = THREE.SRGBColorSpace;
+  return sharedGrassTexture;
+}
+
+/** Lawn only (addFlat above still handles roads/existing_greenery with one
+ * flat color, unchanged) -- same "tiles per metre" fix as buildingMesh's
+ * wallTexture.repeat, since ShapeGeometry's default UV generator is the flat
+ * (non-extruded) sibling of the ExtrudeGeometry side-wall UV bug already
+ * found and fixed in this file: local meter coordinates, not normalized
+ * [0,1]. Confirmed live rather than re-assumed from that unrelated fix. */
+const GRASS_TILE_METRES = 1.5;
+function lawnMesh(polygon: Polygon3D, color: string, y: number, disposables: Disposable[]): THREE.Mesh | null {
+  const shape = shapeFromPolygon(polygon);
+  if (!shape) return null;
+  const geometry = new THREE.ShapeGeometry(shape);
+  const texture = getGrassTexture().clone();
+  texture.needsUpdate = true;
+  texture.repeat.set(1 / GRASS_TILE_METRES, 1 / GRASS_TILE_METRES);
+  const material = new THREE.MeshStandardMaterial({ color, map: texture, side: THREE.DoubleSide });
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.rotation.x = -Math.PI / 2;
+  mesh.position.y = y;
+  disposables.push({ geometry, material, texture });
+  return mesh;
 }
 
 /** Not a real THREE.Shape by itself -- a polygon can come back with too few
@@ -158,19 +218,40 @@ interface Disposable {
   texture?: THREE.Texture;
 }
 
-/** One InstancedMesh pair (trunk + conical canopy) for every tree, or one
- * InstancedMesh (a squashed sphere) for every shrub -- not a THREE.Mesh per
- * plant. A real-scale plan can hold hundreds of thousands of these (see
- * CLAUDE.md); GPU instancing draws all of them in one draw call each,
- * versus one drawcall (and one JS object) per plant naively. Geometry is
- * built as a unit primitive (radius/height 1) and scaled per-instance via
- * the matrix, so the same two buffers serve every tree regardless of its
- * own canopy radius. */
-function buildTrees(
-  points: { x: number; y: number; canopyRadius: number }[],
-  canopyColor: string,
-  disposables: Disposable[]
-): THREE.Object3D[] {
+/** Per-plant look derived once from its own (x, y) via hashToUnit
+ * (plan3d.ts) -- same plant always renders the same way across a full scene
+ * rebuild (season change, ensure_materialized re-fetch), no separate
+ * randomness source to keep in sync with anything. Three independent-looking
+ * values come from one hash function by offsetting the seed (58.2/finding
+ * three unrelated-looking outputs from one sine hash needs seeds spread
+ * further apart than the hash's own short period of visible correlation --
+ * these offsets were picked empirically, same spirit as buildingHash01's own
+ * 0.1013/0.0721 weights). */
+interface PlantInstanceStyle {
+  /** ~0.82-1.18 -- scales trunk height/radius and canopy size together, so a
+   * "taller" tree's canopy doesn't detach from a not-equally-taller trunk. */
+  sizeJitter: number;
+  rotationY: number;
+}
+
+function plantStyle(point: PlantingPoint3D, variantSalt: number): PlantInstanceStyle {
+  const seed = point.x * 0.1013 + point.y * 0.0721 + variantSalt;
+  return {
+    sizeJitter: 0.82 + hashToUnit(seed + 31.7) * 0.36,
+    rotationY: hashToUnit(seed + 58.2) * Math.PI * 2,
+  };
+}
+
+/** One InstancedMesh trunk plus one of two canopy silhouettes (conical --
+ * evergreen-ish, or rounded -- deciduous-ish) per tree, picked per-plant by
+ * `plantStyle`'s hash so the same site always renders the same mix across
+ * rebuilds. Still exactly 3 draw calls total for however many trees a plan
+ * holds (trunk + 2 canopy buckets), not 3 per tree -- GPU instancing is what
+ * makes hundreds of thousands of these (see CLAUDE.md) cheap in the first
+ * place, splitting into 2 canopy shapes doesn't change that order of
+ * magnitude. Geometry is a unit primitive (radius/height 1), scaled
+ * per-instance via the matrix. */
+function buildTrees(points: PlantingPoint3D[], canopyColor: string, disposables: Disposable[]): THREE.Object3D[] {
   if (points.length === 0) return [];
 
   const trunkGeometry = new THREE.CylinderGeometry(1, 1, 1, 8);
@@ -178,43 +259,59 @@ function buildTrees(
   const trunkMesh = new THREE.InstancedMesh(trunkGeometry, trunkMaterial, points.length);
   disposables.push({ geometry: trunkGeometry, material: trunkMaterial });
 
-  const canopyGeometry = new THREE.ConeGeometry(1, 1, 10);
+  const conicalGeometry = new THREE.ConeGeometry(1, 1, 10);
+  const roundedGeometry = new THREE.SphereGeometry(1, 8, 6);
   const canopyMaterial = new THREE.MeshStandardMaterial({ color: canopyColor });
-  const canopyMesh = new THREE.InstancedMesh(canopyGeometry, canopyMaterial, points.length);
-  disposables.push({ geometry: canopyGeometry, material: canopyMaterial });
+  disposables.push({ geometry: conicalGeometry, material: canopyMaterial });
+  disposables.push({ geometry: roundedGeometry, material: canopyMaterial });
+
+  const conicalCount = points.filter((p) => hashToUnit(p.x * 0.1013 + p.y * 0.0721) < 0.5).length;
+  const conicalMesh = new THREE.InstancedMesh(conicalGeometry, canopyMaterial, conicalCount);
+  const roundedMesh = new THREE.InstancedMesh(roundedGeometry, canopyMaterial, points.length - conicalCount);
 
   const matrix = new THREE.Matrix4();
-  const identityQuaternion = new THREE.Quaternion();
-  points.forEach((point, index) => {
-    const trunkHeight = point.canopyRadius * 1.5;
-    const trunkRadius = point.canopyRadius * 0.15;
-    const canopyHeight = point.canopyRadius * 2;
+  const quaternion = new THREE.Quaternion();
+  const yAxis = new THREE.Vector3(0, 1, 0);
+  let trunkIndex = 0;
+  let conicalIndex = 0;
+  let roundedIndex = 0;
+  for (const point of points) {
+    const isConical = hashToUnit(point.x * 0.1013 + point.y * 0.0721) < 0.5;
+    const { sizeJitter, rotationY } = plantStyle(point, 0);
+
+    const trunkHeight = point.canopyRadius * 1.5 * sizeJitter;
+    const trunkRadius = point.canopyRadius * 0.15 * sizeJitter;
+    const canopyHeight = point.canopyRadius * 2 * sizeJitter;
+    const canopyRadius = point.canopyRadius * sizeJitter;
 
     matrix.compose(
       new THREE.Vector3(point.x, PLANTING_BASE_Y + trunkHeight / 2, -point.y),
-      identityQuaternion,
+      quaternion.identity(),
       new THREE.Vector3(trunkRadius, trunkHeight, trunkRadius)
     );
-    trunkMesh.setMatrixAt(index, matrix);
+    trunkMesh.setMatrixAt(trunkIndex++, matrix);
 
     matrix.compose(
       new THREE.Vector3(point.x, PLANTING_BASE_Y + trunkHeight + canopyHeight / 2, -point.y),
-      identityQuaternion,
-      new THREE.Vector3(point.canopyRadius, canopyHeight, point.canopyRadius)
+      quaternion.setFromAxisAngle(yAxis, rotationY),
+      new THREE.Vector3(canopyRadius, canopyHeight, canopyRadius)
     );
-    canopyMesh.setMatrixAt(index, matrix);
-  });
+    if (isConical) conicalMesh.setMatrixAt(conicalIndex++, matrix);
+    else roundedMesh.setMatrixAt(roundedIndex++, matrix);
+  }
   trunkMesh.instanceMatrix.needsUpdate = true;
-  canopyMesh.instanceMatrix.needsUpdate = true;
+  conicalMesh.instanceMatrix.needsUpdate = true;
+  roundedMesh.instanceMatrix.needsUpdate = true;
 
-  return [trunkMesh, canopyMesh];
+  return [trunkMesh, conicalMesh, roundedMesh];
 }
 
-function buildShrubs(
-  points: { x: number; y: number; canopyRadius: number }[],
-  shrubColor: string,
-  disposables: Disposable[]
-): THREE.Object3D[] {
+/** Shrubs stay a single sphere geometry/InstancedMesh -- unlike trees, their
+ * "shape variety" comes entirely from a non-uniform scale per instance
+ * (rounder vs. flatter bush) rather than a second geometry, since a sphere
+ * squashed on Y already reads as a distinct silhouette without the extra
+ * draw call a real second shape would cost. */
+function buildShrubs(points: PlantingPoint3D[], shrubColor: string, disposables: Disposable[]): THREE.Object3D[] {
   if (points.length === 0) return [];
 
   const geometry = new THREE.SphereGeometry(1, 8, 6);
@@ -223,12 +320,18 @@ function buildShrubs(
   disposables.push({ geometry, material });
 
   const matrix = new THREE.Matrix4();
-  const identityQuaternion = new THREE.Quaternion();
+  const quaternion = new THREE.Quaternion();
   points.forEach((point, index) => {
+    const { sizeJitter, rotationY } = plantStyle(point, 97.4);
+    // A second, independent jitter for the vertical squash -- reusing
+    // sizeJitter here would make "bigger" and "flatter" always move
+    // together, which looks less natural than the two varying separately.
+    const squash = 0.75 + hashToUnit(point.x * 0.1013 + point.y * 0.0721 + 141.0) * 0.5;
+    const radius = point.canopyRadius * sizeJitter;
     matrix.compose(
-      new THREE.Vector3(point.x, PLANTING_BASE_Y + point.canopyRadius, -point.y),
-      identityQuaternion,
-      new THREE.Vector3(point.canopyRadius, point.canopyRadius, point.canopyRadius)
+      new THREE.Vector3(point.x, PLANTING_BASE_Y + radius * squash, -point.y),
+      quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), rotationY),
+      new THREE.Vector3(radius, radius * squash, radius)
     );
     mesh.setMatrixAt(index, matrix);
   });
@@ -237,13 +340,51 @@ function buildShrubs(
   return [mesh];
 }
 
+// Remembers where the camera was left, per project -- without this, every
+// page refresh (or every switch back to 3D after the 2D map) reframed the
+// whole territory from scratch, throwing away whatever angle/zoom the user
+// had just set up. Same localStorage mechanism useProjectSession.ts already
+// uses for session persistence, just keyed differently (per-project here,
+// not a single global key -- see the storageKey prop's own comment).
+const CAMERA_STORAGE_PREFIX = "greenproject:camera3d:";
+
+interface StoredCamera {
+  position: [number, number, number];
+  target: [number, number, number];
+}
+
+function isFiniteTriple(value: unknown): value is [number, number, number] {
+  return Array.isArray(value) && value.length === 3 && value.every((n) => typeof n === "number" && Number.isFinite(n));
+}
+
+function loadStoredCamera(key: string): StoredCamera | null {
+  try {
+    const raw = localStorage.getItem(CAMERA_STORAGE_PREFIX + key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<StoredCamera>;
+    if (!isFiniteTriple(parsed.position) || !isFiniteTriple(parsed.target)) return null;
+    return { position: parsed.position, target: parsed.target };
+  } catch {
+    return null; // corrupted value or a storage-disabled browser -- just re-frame from bounds instead
+  }
+}
+
+function saveStoredCamera(key: string, position: THREE.Vector3, target: THREE.Vector3) {
+  try {
+    const value: StoredCamera = { position: position.toArray(), target: target.toArray() };
+    localStorage.setItem(CAMERA_STORAGE_PREFIX + key, JSON.stringify(value));
+  } catch {
+    // ignore -- losing the remembered angle isn't worth surfacing an error for
+  }
+}
+
 /** Read-only 3D view of the same plan the 2D map shows (project.layers +
  * plan.features) -- a separate additive scene, not a 3D editor: no
  * selection, no drag, nothing here writes back to the plan. See
  * lib/plan3d.ts for how the GeoJSON is turned into local-meter geometry
  * (including what's deliberately left out -- zoning, utilities, real
  * building heights we don't have). */
-export default function ThreeDView({ layers, plan, season = "summer" }: ThreeDViewProps) {
+export default function ThreeDView({ layers, plan, season = "summer", storageKey }: ThreeDViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [norms, setNorms] = useState<PlantingNorms | undefined>(undefined);
   // Distinct from `norms` itself being set -- without this, the very first
@@ -313,7 +454,12 @@ export default function ThreeDView({ layers, plan, season = "summer" }: ThreeDVi
     controls.enableDamping = true;
     controls.dampingFactor = 0.1;
 
-    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+    // A hemisphere light (sky color from above, lawn's own seasonal tone
+    // bouncing from below) instead of a flat AmbientLight -- costs nothing
+    // extra (still a single Light object) but reads as outdoor daylight
+    // rather than a uniform studio fill, and ties naturally into the same
+    // per-season palette everything else here already uses.
+    scene.add(new THREE.HemisphereLight(new THREE.Color(palette.skyTop), new THREE.Color(palette.lawn), 0.75));
     const sun = new THREE.DirectionalLight(0xffffff, 0.9);
     sun.position.set(1, 1.6, 0.6);
     scene.add(sun);
@@ -329,8 +475,21 @@ export default function ThreeDView({ layers, plan, season = "summer" }: ThreeDVi
     const depth = bounds ? bounds.maxY - bounds.minY : 40;
     const diagonal = Math.max(Math.hypot(width, depth), 20);
     const cameraDistance = diagonal * 0.7;
-    camera.position.set(centerX + cameraDistance, cameraDistance * 0.7 + (bounds?.maxBuildingHeight ?? 0), -centerY + cameraDistance);
-    controls.target.set(centerX, 0, -centerY);
+
+    // A camera angle the user already set up (see the OrbitControls "change"
+    // listener below) beats re-framing the whole territory from scratch on
+    // every reload/re-mount -- restored only when it parses as three finite
+    // numbers each; OrbitControls.update() below re-clamps distance-from-target
+    // into [minDistance, maxDistance] regardless, so even a corrupted or
+    // stale value can't leave the camera somewhere nonsensical.
+    const storedCamera = storageKey ? loadStoredCamera(storageKey) : null;
+    if (storedCamera) {
+      camera.position.set(...storedCamera.position);
+      controls.target.set(...storedCamera.target);
+    } else {
+      camera.position.set(centerX + cameraDistance, cameraDistance * 0.7 + (bounds?.maxBuildingHeight ?? 0), -centerY + cameraDistance);
+      controls.target.set(centerX, 0, -centerY);
+    }
     camera.far = diagonal * 3 + 100;
     // OrbitControls has no distance limit by default -- mouse-wheel dolly
     // could move the camera farther from target than camera.far allows,
@@ -341,6 +500,24 @@ export default function ThreeDView({ layers, plan, season = "summer" }: ThreeDVi
     controls.maxDistance = diagonal * 2.5;
     camera.updateProjectionMatrix();
     controls.update();
+
+    // Fog color matches scene.background exactly (the standard three.js
+    // convention for a seamless horizon) -- also usefully hides the ground
+    // pad's own outer edge (see padSize below) and the point where distant
+    // trees/buildings would otherwise pop rather than fade at maxDistance.
+    scene.fog = new THREE.Fog(new THREE.Color(palette.skyTop), diagonal * 0.9, diagonal * 3);
+
+    // Debounced (not on every "change" event, which OrbitControls fires
+    // continuously mid-drag/zoom) -- writing localStorage on every animation
+    // frame of a drag would be pure waste. 400ms after the user stops moving
+    // the camera is early enough to survive an accidental tab close.
+    let saveTimeout: ReturnType<typeof setTimeout> | undefined;
+    const handleControlsChange = () => {
+      if (!storageKey) return;
+      clearTimeout(saveTimeout);
+      saveTimeout = setTimeout(() => saveStoredCamera(storageKey, camera.position, controls.target), 400);
+    };
+    controls.addEventListener("change", handleControlsChange);
 
     // A neutral pad under everything, larger than the territory itself, so
     // there's no visible gap/void around a plot with sparse layers (e.g. no
@@ -374,7 +551,10 @@ export default function ThreeDView({ layers, plan, season = "summer" }: ThreeDVi
     }
     addFlat(data.roads, ZONE_COLORS.road, ROAD_Y);
     addFlat(data.existingGreenery, ZONE_COLORS.existing_greenery, EXISTING_GREENERY_Y);
-    addFlat(data.lawns, palette.lawn, LAWN_Y);
+    for (const polygon of data.lawns) {
+      const mesh = lawnMesh(polygon, palette.lawn, LAWN_Y, disposables);
+      if (mesh) scene.add(mesh);
+    }
 
     for (const building of data.buildings) {
       const mesh = buildingMesh(building, ZONE_COLORS.building, TERRITORY_DEPTH_M, disposables);
@@ -409,6 +589,8 @@ export default function ThreeDView({ layers, plan, season = "summer" }: ThreeDVi
 
     return () => {
       cancelAnimationFrame(frameId);
+      clearTimeout(saveTimeout);
+      controls.removeEventListener("change", handleControlsChange);
       resizeObserver.disconnect();
       controls.dispose();
       for (const { geometry, material, texture } of disposables) {
@@ -420,7 +602,7 @@ export default function ThreeDView({ layers, plan, season = "summer" }: ThreeDVi
       if (renderer.domElement.parentNode === container) container.removeChild(renderer.domElement);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- overItemLimit is derived from `data`, not an independent input
-  }, [data, overItemLimit, season]);
+  }, [data, overItemLimit, season, storageKey]);
 
   if (!plan) {
     return <div className="flex h-full w-full items-center justify-center text-sm text-stone-500">Нет плана для 3D-просмотра.</div>;

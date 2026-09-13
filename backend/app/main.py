@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
-from backend.app.api import routes_config, routes_edit, routes_export, routes_generate, routes_projects
+from backend.app.api import routes_assistant, routes_config, routes_edit, routes_export, routes_generate, routes_projects
 from backend.app.core.config import settings
 from backend.app.db.session import init_db
 
@@ -51,3 +51,4 @@ app.include_router(routes_generate.router)
 app.include_router(routes_edit.router)
 app.include_router(routes_export.router)
 app.include_router(routes_config.router)
+app.include_router(routes_assistant.router)

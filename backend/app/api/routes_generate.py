@@ -13,7 +13,8 @@ from backend.app.db.session import SessionLocal
 from backend.app.schemas.plan import GenerateJobOut, GenerateJobStatus, GenerateRequest, PlanOut, PlanSummary
 from backend.app.services import generation_jobs
 from backend.app.services.geo_io import planting_items_to_feature_collection
-from backend.app.services.pipeline_service import MissingTerritoryError, generate_plan
+from backend.app.services.pipeline_service import CurrentPlanDeletionError, MissingTerritoryError, delete_plan, generate_plan
+from geo_engine.candidates import TooManyCandidatesError
 
 router = APIRouter(prefix="/api/projects/{project_id}", tags=["plans"])
 logger = logging.getLogger(__name__)
@@ -56,7 +57,7 @@ async def _run_generate_job(
                 shrub_spacing_m=shrub_spacing_m,
             )
             generation_jobs.mark_done(job_id, plan.id)
-        except MissingTerritoryError as exc:
+        except (MissingTerritoryError, TooManyCandidatesError) as exc:
             generation_jobs.mark_error(job_id, str(exc))
         except HTTPException as exc:
             generation_jobs.mark_error(job_id, str(exc.detail))
@@ -117,3 +118,21 @@ async def get_plan(plan: PlanDep) -> PlanOut:
     # GeoJSON features (even vectorized -- see planting_items_to_feature_collection)
     # is real CPU work that would otherwise stall every other request meanwhile.
     return await run_in_threadpool(_to_plan_out, plan)
+
+
+@router.delete("/plans/{plan_id}", status_code=204)
+async def delete_plan_route(project_id: str, plan_id: str, session: SessionDep) -> None:
+    """Removes one plan from history permanently -- no undo, unlike the
+    item-level edits in routes_edit.py. Doesn't use PlanDep/get_plan_or_404
+    on purpose: that dependency transparently rematerializes a pruned plan
+    (ensure_materialized) before handing it back, which would mean
+    recomputing potentially hundreds of thousands of rows just to delete them
+    a moment later -- a plain lookup is all a delete needs."""
+    result = await session.execute(select(Plan).where(Plan.id == plan_id, Plan.project_id == project_id))
+    plan = result.scalar_one_or_none()
+    if plan is None:
+        raise HTTPException(status_code=404, detail="План не найден в этом проекте.")
+    try:
+        await delete_plan(session, plan)
+    except CurrentPlanDeletionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc

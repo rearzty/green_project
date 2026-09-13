@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     # private range a given router uses varies.
     cors_origin_regex: str = r"^http://(192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}):3000$"
 
+    # Юна (backend/app/services/assistant_service.py) -- Groq's free tier
+    # (OpenAI-compatible chat completions with tool calling). None means the
+    # feature is simply off: routes_assistant.py returns a clear, actionable
+    # error instead of a bare 500 so the chat UI can say "not connected yet"
+    # rather than silently failing.
+    groq_api_key: str | None = None
+
     model_config = SettingsConfigDict(env_prefix="GREENPROJECT_", env_file=".env", extra="ignore")
 
 

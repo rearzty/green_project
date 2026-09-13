@@ -161,8 +161,12 @@ function pickReferenceLonLat(layers: GeoJSONFeatureCollection | undefined, plan:
 
 /** Cheap deterministic pseudo-random value in [0, 1) from a numeric seed --
  * classic GLSL-style hash. Good enough for "give each building a slightly
- * different, stable placeholder height", not a real RNG. */
-function hashToUnit(seed: number): number {
+ * different, stable placeholder height", not a real RNG. Exported so
+ * ThreeDView.tsx can reuse the same formula for per-tree/shrub canopy
+ * shape/size/rotation variety, keyed off each plant's own (x, y) -- same
+ * "stable across rebuilds" property as buildingHash01 below, no second,
+ * unrelated hash needed. */
+export function hashToUnit(seed: number): number {
   const x = Math.sin(seed * 12.9898) * 43758.5453;
   return x - Math.floor(x);
 }
