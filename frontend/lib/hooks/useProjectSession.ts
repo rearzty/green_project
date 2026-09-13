@@ -171,11 +171,15 @@ export function useProjectSession() {
     saveStoredSession({ projectId: project_id, planId: null });
   }
 
-  async function handleGenerate(plantingTypes: PlantingType[], scoringMode: ScoringMode) {
+  async function handleGenerate(
+    plantingTypes: PlantingType[],
+    scoringMode: ScoringMode,
+    spacing?: { treeSpacingM?: number; shrubSpacingM?: number }
+  ) {
     if (!project) return;
     setGenerating(true);
     try {
-      const generated = await generatePlan(project.id, plantingTypes, scoringMode);
+      const generated = await generatePlan(project.id, plantingTypes, scoringMode, spacing);
       applyPlan(generated);
       await refreshPlans(project.id);
       saveStoredSession({ projectId: project.id, planId: generated.plan_id });

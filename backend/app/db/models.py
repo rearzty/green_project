@@ -77,6 +77,15 @@ class Plan(Base):
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
     scoring_mode: Mapped[str] = mapped_column(String, default="heuristic")
     planting_types: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    # Per-generation tree/shrub spacing override (meters) -- None (not 0 or a
+    # fallback constant) means "use whatever planting_norms.yaml says",
+    # genuinely distinct from "the user chose a value", unlike scoring_mode/
+    # planting_types above which are always meaningfully set. Part of the
+    # recipe for the same reason those are: pipeline_service.ensure_materialized
+    # reads these back to recompute a collapsed plan identically to how it
+    # was first generated, not with today's YAML default.
+    tree_spacing_m: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
+    shrub_spacing_m: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     is_current: Mapped[bool] = mapped_column(Boolean, default=True)
     item_count: Mapped[int] = mapped_column(Integer, default=0)

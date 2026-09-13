@@ -124,8 +124,23 @@ export interface GenerateJobStatus {
   error: string | null;
 }
 
-function startGenerate(projectId: string, plantingTypes: PlantingType[], scoringMode: ScoringMode): Promise<{ job_id: string }> {
-  return postJson(`/api/projects/${projectId}/generate`, { planting_types: plantingTypes, scoring_mode: scoringMode });
+function startGenerate(
+  projectId: string,
+  plantingTypes: PlantingType[],
+  scoringMode: ScoringMode,
+  treeSpacingM?: number,
+  shrubSpacingM?: number
+): Promise<{ job_id: string }> {
+  // tree_spacing_m/shrub_spacing_m left undefined when not overridden --
+  // JSON.stringify drops undefined object properties, so the field is simply
+  // absent from the request body and the backend uses planting_norms.yaml's
+  // own default, same as before this option existed.
+  return postJson(`/api/projects/${projectId}/generate`, {
+    planting_types: plantingTypes,
+    scoring_mode: scoringMode,
+    tree_spacing_m: treeSpacingM,
+    shrub_spacing_m: shrubSpacingM,
+  });
 }
 
 function getGenerateStatus(projectId: string, jobId: string): Promise<GenerateJobStatus> {
@@ -147,9 +162,9 @@ export async function generatePlan(
   projectId: string,
   plantingTypes: PlantingType[],
   scoringMode: ScoringMode,
-  options?: { signal?: AbortSignal; onPoll?: () => void }
+  options?: { signal?: AbortSignal; onPoll?: () => void; treeSpacingM?: number; shrubSpacingM?: number }
 ): Promise<PlanOut> {
-  const { job_id } = await startGenerate(projectId, plantingTypes, scoringMode);
+  const { job_id } = await startGenerate(projectId, plantingTypes, scoringMode, options?.treeSpacingM, options?.shrubSpacingM);
   for (;;) {
     if (options?.signal?.aborted) throw new ApiError("Генерация отменена.", 0);
     const status = await getGenerateStatus(projectId, job_id);
@@ -286,6 +301,23 @@ export async function exportDxf(projectId: string, planId: string, options?: { s
   }
 }
 
-export async function getPlantingNorms(): Promise<Record<string, unknown>> {
+export interface SpeciesSpacing {
+  min_distance_m: number;
+  canopy_radius_m: number;
+}
+
+/** Mirrors geo_engine/norms.py::PlantingNorms — the full config, not a
+ * subset (routes_config.py's `get_planting_norms` returns `model_dump()`
+ * as-is). `species_spacing`'s `tree_default`/`shrub_default` entries are
+ * what the 3D viewer sizes tree/shrub meshes from (lib/plan3d.ts) instead
+ * of guessing canopy sizes independently. */
+export interface PlantingNorms {
+  setbacks_m: Record<string, Partial<Record<PlantingType, number>>>;
+  species_spacing: Record<string, SpeciesSpacing>;
+  min_candidate_area_m2: Record<PlantingType, number>;
+  zoning_suitability: Record<string, number>;
+}
+
+export async function getPlantingNorms(): Promise<PlantingNorms> {
   return request("/api/config/planting-norms");
 }

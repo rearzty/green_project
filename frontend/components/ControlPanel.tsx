@@ -1,11 +1,11 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Loader2, Redo2, Shrub, SquareDashedMousePointer, Trash2, TreeDeciduous, Undo2, X } from "lucide-react";
+import { Box, Loader2, Redo2, Shrub, SquareDashedMousePointer, Trash2, TreeDeciduous, Undo2, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
-import type { PlanSummary, PlantingType, ScoringMode, ValidationViolation } from "@/lib/api";
+import type { PlanSummary, PlantingNorms, PlantingType, ScoringMode, ValidationViolation } from "@/lib/api";
 import { countLabel, OBJECT_FORMS, PLANTING_TYPE_FORMS, PLANTING_TYPE_LABELS } from "@/lib/format";
 import type { SelectionSummary } from "@/lib/hooks/useSelection";
 import type { LayerLegendEntry } from "@/lib/mapStyle";
@@ -41,7 +41,17 @@ export interface ControlPanelProps {
    * the frontend polls, see lib/api.ts::exportDxf. */
   exporting?: boolean;
   onUpload: (file: File, name: string, sourceCrs: string) => Promise<void>;
-  onGenerate: (plantingTypes: PlantingType[], scoringMode: ScoringMode) => Promise<void>;
+  onGenerate: (
+    plantingTypes: PlantingType[],
+    scoringMode: ScoringMode,
+    spacing?: { treeSpacingM?: number; shrubSpacingM?: number }
+  ) => Promise<void>;
+  /** Current planting-norms defaults (GET /api/config/planting-norms),
+   * fetched once in app/page.tsx -- shown as the interval inputs'
+   * placeholder so the panel never hardcodes a number that could drift from
+   * planting_norms.yaml (same reasoning ThreeDView.tsx already follows for
+   * canopy sizing). Undefined until the fetch resolves. */
+  plantingNorms?: PlantingNorms;
   onExportDxf: () => Promise<void>;
   /** Forgets the locally-remembered project/plan (see app/page.tsx) and
    * resets the UI to its empty state. Local-only — does not delete anything
@@ -56,6 +66,10 @@ export interface ControlPanelProps {
   onToggleLayerType: (key: string) => void;
   showPlan: boolean;
   onToggleShowPlan: (show: boolean) => void;
+  /** Read-only 3D view (components/ThreeDView.tsx) instead of the 2D map --
+   * mutually exclusive with it, not an overlay. */
+  view3d: boolean;
+  onToggleView3d: () => void;
   /** Every plan generated so far for the current project. */
   plans: PlanSummary[];
   currentPlanId?: string;
@@ -102,6 +116,7 @@ export function ControlPanel({
   exporting = false,
   onUpload,
   onGenerate,
+  plantingNorms,
   onExportDxf,
   onClearAll,
   layerLegend,
@@ -109,6 +124,8 @@ export function ControlPanel({
   onToggleLayerType,
   showPlan,
   onToggleShowPlan,
+  view3d,
+  onToggleView3d,
   plans,
   currentPlanId,
   onSelectPlan,
@@ -137,6 +154,10 @@ export function ControlPanel({
   const [sourceCrs, setSourceCrs] = useState("EPSG:32637");
   const [plantingTypes, setPlantingTypes] = useState<PlantingType[]>(["tree", "shrub", "lawn"]);
   const [scoringMode, setScoringMode] = useState<ScoringMode>("heuristic");
+  // undefined = not overridden -- generate omits the field and the backend
+  // falls back to planting_norms.yaml's own tree_default/shrub_default.
+  const [treeSpacingM, setTreeSpacingM] = useState<number | undefined>(undefined);
+  const [shrubSpacingM, setShrubSpacingM] = useState<number | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   // Per violation group: how many times "show on map" was clicked, to step through its items.
   const [violationCursor, setViolationCursor] = useState<Record<string, number>>({});
@@ -230,6 +251,36 @@ export function ControlPanel({
             </label>
           ))}
         </div>
+        <div className="flex flex-col gap-1 text-sm">
+          <label className="flex items-center gap-2">
+            <span className="w-32 flex-none text-stone-600">Деревья: интервал, м</span>
+            <input
+              type="number"
+              step={0.5}
+              min={0.5}
+              max={15}
+              value={treeSpacingM ?? ""}
+              onChange={(e) => setTreeSpacingM(e.target.value === "" ? undefined : Number(e.target.value))}
+              disabled={!plantingTypes.includes("tree")}
+              placeholder={String(plantingNorms?.species_spacing.tree_default?.min_distance_m ?? 5)}
+              className="w-20 rounded border border-stone-300 px-2 py-0.5 disabled:opacity-50"
+            />
+          </label>
+          <label className="flex items-center gap-2">
+            <span className="w-32 flex-none text-stone-600">Кусты: интервал, м</span>
+            <input
+              type="number"
+              step={0.5}
+              min={0.3}
+              max={10}
+              value={shrubSpacingM ?? ""}
+              onChange={(e) => setShrubSpacingM(e.target.value === "" ? undefined : Number(e.target.value))}
+              disabled={!plantingTypes.includes("shrub")}
+              placeholder={String(plantingNorms?.species_spacing.shrub_default?.min_distance_m ?? 3)}
+              className="w-20 rounded border border-stone-300 px-2 py-0.5 disabled:opacity-50"
+            />
+          </label>
+        </div>
         <div className="flex gap-3 text-sm">
           <label className="flex items-center gap-1">
             <input type="radio" checked={scoringMode === "heuristic"} onChange={() => setScoringMode("heuristic")} />
@@ -242,7 +293,7 @@ export function ControlPanel({
         </div>
         <Button
           disabled={!hasProject || plantingTypes.length === 0 || busy || editBusy || generating}
-          onClick={() => guarded(() => onGenerate(plantingTypes, scoringMode))}
+          onClick={() => guarded(() => onGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM }))}
         >
           Сгенерировать план
         </Button>
@@ -395,6 +446,17 @@ export function ControlPanel({
           <input type="checkbox" checked={showPlan} onChange={(e) => onToggleShowPlan(e.target.checked)} />
           Сгенерированный план
         </label>
+        <Button
+          variant={view3d ? "default" : "outline"}
+          size="sm"
+          disabled={!view3d && !hasPlan}
+          onClick={onToggleView3d}
+          aria-pressed={view3d}
+          title="Только просмотр — без выделения и правки"
+        >
+          <Box className="mr-1.5 h-4 w-4" aria-hidden />
+          {view3d ? "Вернуться на 2D-карту" : "Показать в 3D"}
+        </Button>
       </section>
 
       <section className="flex flex-col gap-2 border-t border-stone-200 pt-3">

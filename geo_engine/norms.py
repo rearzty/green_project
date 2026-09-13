@@ -22,6 +22,7 @@ class PlantingNorms(BaseModel):
     setbacks_m: dict[str, dict[PlantingType, float]]
     species_spacing: dict[str, SpeciesSpacing]
     min_candidate_area_m2: dict[PlantingType, float]
+    territory_margin_m: dict[PlantingType, float]
     zoning_suitability: dict[str, float]
 
     def setback_for(self, utility_type: str, planting_type: PlantingType) -> float:
@@ -36,6 +37,32 @@ class PlantingNorms(BaseModel):
     def spacing_for(self, planting_type: PlantingType) -> SpeciesSpacing:
         key = f"{planting_type}_default"
         return self.species_spacing.get(key, SpeciesSpacing(min_distance_m=2.0, canopy_radius_m=1.0))
+
+    def with_spacing_override(self, planting_type: PlantingType, interval_m: float) -> "PlantingNorms":
+        """A copy of these norms with `planting_type`'s spacing replaced by a
+        user-chosen interval -- canopy_radius_m is derived as interval_m/2,
+        the same 2:1 ratio the shipped tree_default/shrub_default defaults
+        already use (5.0/2.5, 3.0/1.5). min_distance_m doubles as the
+        candidate grid step in geo_engine.candidates, so it must move
+        together with canopy_radius_m: setting only the crown radius while
+        leaving a smaller/unrelated grid step is exactly the bug that once
+        made shrub density basically uncontrolled (see CLAUDE.md) -- keeping
+        the ratio fixed here is what prevents a repeat of that for
+        user-supplied values too. Doesn't touch load_norms()'s cache (this
+        builds an independent in-memory copy, never re-reads the YAML)."""
+        key = f"{planting_type}_default"
+        updated = dict(self.species_spacing)
+        updated[key] = SpeciesSpacing(min_distance_m=interval_m, canopy_radius_m=interval_m / 2)
+        return self.model_copy(update={"species_spacing": updated})
+
+    def territory_margin_for(self, planting_type: PlantingType) -> float:
+        """Required clearance in meters from the territory's own outer
+        boundary (not from an obstacle inside it -- see buffers.buildable_area,
+        which is the only caller). 0.0 fallback, not setback_for's fail-large
+        behavior: this project's own planting_norms.yaml always defines all
+        three planting types, so a missing key here is a defensive
+        edge case, not a real setback this codebase forgot to configure."""
+        return self.territory_margin_m.get(planting_type, 0.0)
 
     def zoning_score(self, zoning: str | None) -> float:
         return self.zoning_suitability.get(zoning or "unknown", self.zoning_suitability["unknown"])
