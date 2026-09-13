@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { CheckCheck, Redo2, Shrub, SquareDashedMousePointer, Trash2, TreeDeciduous, Undo2, X } from "lucide-react";
 
 import { ContextMenu, type ContextMenuEntry } from "@/components/ContextMenu";
@@ -11,12 +11,15 @@ import { useKeyboardShortcuts } from "@/lib/hooks/useKeyboardShortcuts";
 import { usePlanEdits } from "@/lib/hooks/usePlanEdits";
 import { useProjectSession } from "@/lib/hooks/useProjectSession";
 import { useSelection } from "@/lib/hooks/useSelection";
+import { getPlantingNorms, type PlantingNorms } from "@/lib/api";
 import { countLabel, OBJECT_FORMS } from "@/lib/format";
 import { buildLayerLegend } from "@/lib/mapStyle";
 import { toast } from "@/lib/toast";
 
 // Leaflet touches `window` on import, so the map must never render on the server.
 const MapView = dynamic(() => import("@/components/MapView"), { ssr: false });
+// Same reasoning as MapView -- three.js's WebGLRenderer needs a real DOM/GPU context.
+const ThreeDView = dynamic(() => import("@/components/ThreeDView"), { ssr: false });
 
 export default function Home() {
   const session = useProjectSession();
@@ -24,7 +27,25 @@ export default function Home() {
 
   const [hiddenLayerTypes, setHiddenLayerTypes] = useState<Set<string>>(new Set());
   const [showPlan, setShowPlan] = useState(true);
+  const [view3d, setView3d] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  // Global config, not per-project -- fetched once so ControlPanel can show
+  // the interval inputs' real current default instead of a hardcoded guess.
+  const [plantingNorms, setPlantingNorms] = useState<PlantingNorms | undefined>(undefined);
+
+  useEffect(() => {
+    let cancelled = false;
+    getPlantingNorms()
+      .then((norms) => {
+        if (!cancelled) setPlantingNorms(norms);
+      })
+      .catch(() => {
+        // Placeholder just falls back to a hardcoded number in ControlPanel -- not worth a toast.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const layerLegend = useMemo(() => buildLayerLegend(project?.layers), [project]);
 
@@ -47,6 +68,17 @@ export default function Home() {
     selection.setSelection(ids)
   );
   const selection = useSelection(planIndex, planRevision, editing.violationIds);
+
+  function toggleView3d() {
+    // Turning it off is always allowed, same reasoning as toggleSelectMode
+    // below -- only turning it on needs a plan to actually show.
+    if (view3d) {
+      setView3d(false);
+      return;
+    }
+    if (!plan) return;
+    setView3d(true);
+  }
 
   function handleToggleShowPlan(show: boolean) {
     setShowPlan(show);
@@ -146,6 +178,7 @@ export default function Home() {
         exporting={session.exporting}
         onUpload={session.handleUpload}
         onGenerate={session.handleGenerate}
+        plantingNorms={plantingNorms}
         onExportDxf={session.handleExportDxf}
         onClearAll={session.handleClearAll}
         layerLegend={layerLegend}
@@ -153,6 +186,8 @@ export default function Home() {
         onToggleLayerType={handleToggleLayerType}
         showPlan={showPlan}
         onToggleShowPlan={handleToggleShowPlan}
+        view3d={view3d}
+        onToggleView3d={toggleView3d}
         plans={plans}
         currentPlanId={plan?.plan_id}
         onSelectPlan={session.handleSelectPlan}
@@ -173,25 +208,29 @@ export default function Home() {
         onFocusItem={selection.focusItem}
       />
       <div className="relative min-w-0 flex-1">
-        <MapView
-          layers={project?.layers}
-          plan={plan?.features}
-          planIndex={planIndex}
-          layersKey={project?.id}
-          planId={plan?.plan_id}
-          planRevision={planRevision}
-          hiddenLayerTypes={hiddenLayerTypes}
-          showPlan={showPlan}
-          selectMode={selection.selectMode}
-          selectedIds={selection.selectedIds}
-          violationIds={editing.violationIds}
-          editsLocked={editing.editBusy}
-          onSelectionChange={selection.setSelection}
-          onMoveItems={editing.handleMoveItems}
-          onContextMenu={handleContextMenu}
-          onViewChange={closeContextMenu}
-          focusRequest={selection.focusRequest}
-        />
+        {view3d ? (
+          <ThreeDView layers={project?.layers} plan={plan?.features} />
+        ) : (
+          <MapView
+            layers={project?.layers}
+            plan={plan?.features}
+            planIndex={planIndex}
+            layersKey={project?.id}
+            planId={plan?.plan_id}
+            planRevision={planRevision}
+            hiddenLayerTypes={hiddenLayerTypes}
+            showPlan={showPlan}
+            selectMode={selection.selectMode}
+            selectedIds={selection.selectedIds}
+            violationIds={editing.violationIds}
+            editsLocked={editing.editBusy}
+            onSelectionChange={selection.setSelection}
+            onMoveItems={editing.handleMoveItems}
+            onContextMenu={handleContextMenu}
+            onViewChange={closeContextMenu}
+            focusRequest={selection.focusRequest}
+          />
+        )}
       </div>
       {contextMenu && (
         <ContextMenu

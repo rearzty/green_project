@@ -12,6 +12,19 @@ export const ZONE_COLORS: Record<string, string> = {
   existing_greenery: "#16a34a",
 };
 
+/** Planting-item colors by planting_type -- used by both MapView.tsx's 2D
+ * markers/lawn fills and plan3d.ts's 3D tree/shrub/lawn meshes, so a tree
+ * looks the same color whichever view you're in. */
+export const PLANTING_COLORS: Record<string, string> = {
+  tree: "#15803d",
+  shrub: "#65a30d",
+  lawn: "#a3e635",
+};
+
+export function plantingColor(type: string): string {
+  return PLANTING_COLORS[type] ?? "#22c55e";
+}
+
 export const LAYER_TYPE_LABELS: Record<string, string> = {
   territory: "Территория",
   building: "Здания",

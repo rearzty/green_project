@@ -26,6 +26,21 @@ ScoreFn = Callable[[list[PlantingCandidate]], list[tuple[float, str]]]
 # code path from the many small, uniformly-sized tree/shrub canopy circles.
 _MAX_CELLS_PER_FOOTPRINT = 64
 
+# Same reasoning and same value as buffers._BUFFER_QUAD_SEGS: shapely's
+# default quad_segs=8 approximates a circular buffer with a polygon whose
+# edges are chords slightly *inside* the true circle, not the circle itself.
+# For two canopy circles whose true centers are within a hair of exactly
+# touching, that chordal gap can make the approximated polygons miss each
+# other even though the real circles overlap -- confirmed live: two random
+# candidates 4.9963m apart (canopy_radius_m=2.5, so a true 5.0m tangent
+# distance) came back as non-intersecting at quad_segs=8 and correctly
+# intersecting at quad_segs=32. A regular grid never exposed this: grid
+# neighbors are always either exactly at the tangent distance (fine either
+# way) or a full diagonal step further out, never "juuust under the
+# threshold" the way two independently-random points can land -- switching
+# candidate generation to random scatter (candidates.py) is what surfaced it.
+_CANOPY_BUFFER_QUAD_SEGS = 32
+
 
 def _cell_index(x: float, y: float, cell_size: float) -> tuple[int, int]:
     return int(x // cell_size), int(y // cell_size)
@@ -72,7 +87,11 @@ def greedy_select(
 
     for candidate, score, rationale in scored:
         spacing = norms.spacing_for(candidate.planting_type)
-        footprint = candidate.geometry.buffer(spacing.canopy_radius_m) if candidate.geometry.geom_type == "Point" else candidate.geometry
+        footprint = (
+            candidate.geometry.buffer(spacing.canopy_radius_m, quad_segs=_CANOPY_BUFFER_QUAD_SEGS)
+            if candidate.geometry.geom_type == "Point"
+            else candidate.geometry
+        )
 
         cell_size = max(spacing.canopy_radius_m * 2, 1.0)
         cells = _cells_for_bounds(footprint.bounds, cell_size)

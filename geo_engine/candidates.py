@@ -36,38 +36,72 @@ def _clearance(geom: BaseGeometry, exclusion_zone: BaseGeometry | None) -> float
     return geom.distance(exclusion_zone)
 
 
+# Dart-throwing oversample: how many random raw points to draw per polygon,
+# relative to what a regular grid at `spacing` would have produced over the
+# same bounding box (see generate_point_candidates). Pure rejection sampling
+# needs more raw darts than a grid to reach comparable final density, because
+# some fraction always lands too close to an already-accepted neighbor and
+# gets rejected later by greedy_select -- 4x was enough in practice (see
+# CLAUDE.md) to keep counts in the same ballpark as the old grid at the same
+# spacing; raise it if a real run comes back noticeably sparser than expected.
+_OVERSAMPLE_FACTOR = 4
+
+
 def generate_point_candidates(
     buildable_area: BaseGeometry,
     exclusion_zone: BaseGeometry,
     planting_type: PlantingType,
     norms: PlantingNorms,
     zoning_zones: list[Zone] | None = None,
+    seed: int = 0,
 ) -> list[PlantingCandidate]:
-    """Grid-sample points inside buildable_area, spaced by the species' minimum
-    distance requirement, for point-planted types (tree, shrub).
+    """Randomly scatter candidate points inside buildable_area (dart-throwing),
+    for point-planted types (tree, shrub) -- not a regular grid. The actual
+    minimum-spacing enforcement happens downstream in placement.greedy_select
+    (it already buffers each candidate by canopy_radius_m and rejects
+    anything overlapping an already-accepted one) -- feeding it a random
+    scatter instead of grid points turns that existing rejection logic into a
+    dart-throwing approximation of Poisson-disc/blue-noise sampling for free,
+    without writing a real Bridson's-algorithm implementation: greedy_select
+    was already fast and already tested at real scale, this only changes
+    what candidates it sees. A plain grid looked mathematically regular on
+    real data -- see CLAUDE.md.
+
+    `seed` must be derived deterministically from something stable per plan
+    (pipeline_service._compute_planting_rows uses plan_id) -- generate_plan is
+    otherwise a pure function of its recipe (CLAUDE.md), and
+    ensure_materialized() has to reproduce a collapsed plan's exact layout,
+    not a fresh random one, when it recomputes it later.
 
     The containment/clearance checks run as vectorized shapely calls over the
-    whole coordinate grid at once rather than one `Point(...).contains(...)`
-    per grid cell in a Python loop — a fine species spacing (e.g. shrub's 1m)
-    over a real (not 100x80m synthetic) territory can put the raw grid in the
-    millions of points, where the per-point Python-level loop is the
+    whole batch of points at once rather than one `Point(...).contains(...)`
+    per point in a Python loop — a fine species spacing (e.g. shrub's 1m)
+    over a real (not 100x80m synthetic) territory can put the raw batch in
+    the millions of points, where a per-point Python-level loop is the
     bottleneck (measured: minutes, vs. a couple of seconds vectorized).
     """
     spacing = norms.spacing_for(planting_type).min_distance_m
     zoning_zones = zoning_zones or []
     candidates: list[PlantingCandidate] = []
+    rng = np.random.default_rng(seed)
 
     for polygon in _iter_polygons(buildable_area):
         if polygon.area < norms.min_candidate_area_m2.get(planting_type, 0.0):
             continue
         minx, miny, maxx, maxy = polygon.bounds
-        xs = np.arange(minx, maxx + spacing, spacing)
-        ys = np.arange(miny, maxy + spacing, spacing)
-        if xs.size == 0 or ys.size == 0:
+        # Same raw point count a grid at this spacing would sample over this
+        # bounding box (see the old np.arange-based version), times the
+        # oversample factor -- keeps the cost model directly comparable to
+        # the benchmarks already measured for the grid approach.
+        n_x = int((maxx - minx) / spacing) + 1
+        n_y = int((maxy - miny) / spacing) + 1
+        n_samples = n_x * n_y * _OVERSAMPLE_FACTOR
+        if n_samples <= 0:
             continue
 
-        xx, yy = np.meshgrid(xs, ys)
-        grid_points = shapely.points(xx.ravel(), yy.ravel())
+        xs = rng.uniform(minx, maxx, size=n_samples)
+        ys = rng.uniform(miny, maxy, size=n_samples)
+        grid_points = shapely.points(xs, ys)
         inside_points = grid_points[shapely.contains(polygon, grid_points)]
         if inside_points.size == 0:
             continue
@@ -123,7 +157,10 @@ def generate_candidates(
     planting_type: PlantingType,
     norms: PlantingNorms,
     zoning_zones: list[Zone] | None = None,
+    seed: int = 0,
 ) -> list[PlantingCandidate]:
     if planting_type == "lawn":
+        # Area candidates are whole sub-polygons, not a sampled grid/scatter --
+        # nothing here to randomize, seed is meaningless for this branch.
         return generate_area_candidates(buildable_area, exclusion_zone, planting_type, norms, zoning_zones)
-    return generate_point_candidates(buildable_area, exclusion_zone, planting_type, norms, zoning_zones)
+    return generate_point_candidates(buildable_area, exclusion_zone, planting_type, norms, zoning_zones, seed)

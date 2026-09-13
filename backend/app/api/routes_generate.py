@@ -33,14 +33,28 @@ def _to_plan_out(plan: Plan) -> PlanOut:
     )
 
 
-async def _run_generate_job(job_id: str, project_id: str, planting_types: list[str], scoring_mode: str) -> None:
+async def _run_generate_job(
+    job_id: str,
+    project_id: str,
+    planting_types: list[str],
+    scoring_mode: str,
+    tree_spacing_m: float | None,
+    shrub_spacing_m: float | None,
+) -> None:
     """Runs on the event loop after POST /generate has already returned --
     the request's own DB session is closed by then, so this opens a fresh one
     rather than reusing it."""
     async with SessionLocal() as session:
         try:
             project = await get_project_or_404(project_id, session)
-            plan = await generate_plan(session, project, planting_types=planting_types, scoring_mode=scoring_mode)
+            plan = await generate_plan(
+                session,
+                project,
+                planting_types=planting_types,
+                scoring_mode=scoring_mode,
+                tree_spacing_m=tree_spacing_m,
+                shrub_spacing_m=shrub_spacing_m,
+            )
             generation_jobs.mark_done(job_id, plan.id)
         except MissingTerritoryError as exc:
             generation_jobs.mark_error(job_id, str(exc))
@@ -59,7 +73,11 @@ async def generate(request: GenerateRequest, project: ProjectDep) -> GenerateJob
     GET .../generate/{job_id} for completion, then fetches the plan through
     the existing GET .../plans/{plan_id}."""
     job_id = generation_jobs.create_job()
-    task = asyncio.create_task(_run_generate_job(job_id, project.id, request.planting_types, request.scoring_mode))
+    task = asyncio.create_task(
+        _run_generate_job(
+            job_id, project.id, request.planting_types, request.scoring_mode, request.tree_spacing_m, request.shrub_spacing_m
+        )
+    )
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     return GenerateJobOut(job_id=job_id)

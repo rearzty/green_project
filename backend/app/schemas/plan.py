@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend.app.schemas.geo import GeoJSONFeature, GeoJSONFeatureCollection, GeoJSONGeometry
 
@@ -14,6 +14,13 @@ PlantingType = Literal["tree", "shrub", "lawn"]
 class GenerateRequest(BaseModel):
     planting_types: list[PlantingType] = ["tree", "shrub", "lawn"]
     scoring_mode: ScoringMode = "heuristic"
+    # None -- the far more common case -- means "use planting_norms.yaml's
+    # own tree_default/shrub_default"; bounds are sanity rails (a few
+    # centimeters would flood the plan with candidates the way an
+    # accidentally-tiny canopy_radius_m once did, see CLAUDE.md), not a
+    # claim about what's landscaping-correct.
+    tree_spacing_m: float | None = Field(default=None, ge=0.5, le=15.0)
+    shrub_spacing_m: float | None = Field(default=None, ge=0.3, le=10.0)
 
 
 class GenerateJobOut(BaseModel):
