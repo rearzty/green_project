@@ -2,19 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import "leaflet/dist/leaflet.css";
-import { MapContainer, Rectangle, TileLayer, GeoJSON, useMap, useMapEvents } from "react-leaflet";
+import { AttributionControl, MapContainer, Rectangle, TileLayer, GeoJSON, useMap, useMapEvents } from "react-leaflet";
 import L, { type Layer, type PathOptions } from "leaflet";
 import type { Feature } from "geojson";
 
 import type { GeoJSONFeature, GeoJSONFeatureCollection, LngLat } from "@/lib/api";
-import { isZoningFeature, layerGroupColor, layerGroupKey } from "@/lib/mapStyle";
+import { isZoningFeature, layerGroupColor, layerGroupKey, plantingColor } from "@/lib/mapStyle";
 import { boundsOfItems, itemsInBox, type LatLngBox, type PlanIndex } from "@/lib/planIndex";
 
-const PLANTING_COLORS: Record<string, string> = {
-  tree: "#15803d",
-  shrub: "#65a30d",
-  lawn: "#a3e635",
-};
 // Selection is blue on purpose: red means "violates a setback norm", and an
 // item can be both selected and violating at the same time.
 const SELECTION_COLOR = "#2563eb";
@@ -45,10 +40,6 @@ function layerStyle(feature?: Feature): PathOptions {
   // which is exactly why the legend (ControlPanel.tsx) exists now: colors
   // have to actually read as distinct fills, not just a faint tint.
   return { color, weight: 1, fillOpacity: 0.45 };
-}
-
-function plantingColor(type: string): string {
-  return PLANTING_COLORS[type] ?? "#22c55e";
 }
 
 function areaStyle(type: string, selected: boolean, violation: boolean): PathOptions {
@@ -847,7 +838,12 @@ export default function MapView({
   }, [selectedIds, violationIds]);
 
   return (
-    <MapContainer center={center} zoom={zoom} className="h-full w-full">
+    <MapContainer center={center} zoom={zoom} className="h-full w-full" attributionControl={false}>
+      {/* prefix={false} drops the "Leaflet" credit -- just a courtesy line,
+          not a license requirement (Leaflet is BSD-2-Clause). The OSM
+          copyright below stays: that one *is* required by OpenStreetMap's
+          tile usage policy for using their tiles at all. */}
+      <AttributionControl prefix={false} />
       <TileLayer
         attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
         url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
