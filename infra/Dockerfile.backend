@@ -1,4 +1,36 @@
 # Build context is the repo root (see infra/docker-compose.yml).
+
+# --- LibreDWG: DWG -> DXF, in its own stage so the multi-minute compile is
+# cached independently of anything in this repo. -----------------------------
+# The pilot dataset is 818 DWG files against a single DXF, and ezdxf cannot read
+# DWG at all (closed Autodesk binary), so without this the service can only
+# accept drawings someone converted by hand.
+#
+# 0.14 is pinned, not "whatever is current": 0.13.3 converts the pilot general
+# plan without a word of complaint and writes a malformed DXF — a long MTEXT
+# note breaks across lines and desynchronizes the group-code stream, so ezdxf
+# aborts a 380k-line file. Silent corruption, not an error, which is exactly
+# the reason to pin. Not packaged for Debian (no libredwg-tools, nothing on
+# PyPI), hence the source build; `pkg-config` is required by 0.14 and was not
+# by 0.13, and `--disable-werror` is required because the release compiles with
+# -Werror and Debian's current GCC rejects it on -Walloc-size.
+FROM python:3.11-slim AS libredwg
+
+ARG LIBREDWG_VERSION=0.14
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential wget pkg-config libpcre2-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && wget -q "https://ftp.gnu.org/gnu/libredwg/libredwg-${LIBREDWG_VERSION}.tar.xz" -O /tmp/libredwg.tar.xz \
+    && tar xf /tmp/libredwg.tar.xz -C /tmp \
+    && cd "/tmp/libredwg-${LIBREDWG_VERSION}" \
+    && ./configure --disable-bindings --disable-shared --disable-werror CFLAGS="-O2 -Wno-error" \
+    && make -j"$(nproc)" \
+    && make install \
+    && strip /usr/local/bin/dwg2dxf \
+    && dwg2dxf --version
+
+# --- backend ----------------------------------------------------------------
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -16,6 +48,12 @@ COPY pyproject.toml ./
 # dependencies are already satisfied.
 RUN python -c "import tomllib; print('\n'.join(tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']))" > /tmp/requirements.txt \
     && pip install --no-cache-dir -r /tmp/requirements.txt
+
+# Built statically above (--disable-shared), so it needs nothing at runtime
+# beyond libc/libm and copies in as a single file. Placed after the dependency
+# layer and before the sources: a source edit leaves it cached, and a LibreDWG
+# version bump only invalidates the cheap layers below it.
+COPY --from=libredwg /usr/local/bin/dwg2dxf /usr/local/bin/dwg2dxf
 
 COPY backend ./backend
 COPY geo_engine ./geo_engine
