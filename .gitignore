@@ -11,6 +11,9 @@ data/synthetic/*.dxf
 !data/synthetic/.gitkeep
 
 data/samples/*.geojson
+# Сведённые из датасета демо-чертежи — производные от материалов организаторов
+# и воспроизводятся через scripts/flatten_bundle.py
+data/samples/*.dxf
 
 node_modules/
 frontend/.next/
@@ -22,3 +25,8 @@ frontend/next-env.d.ts
 .env.local
 
 .idea/
+
+# Материалы организаторов (~12G) — в репозиторий не кладутся
+Датасет/
+Датасет.zip
+.DS_Store
