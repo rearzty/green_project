@@ -23,7 +23,13 @@ from pathlib import Path
 
 from geo_engine.compliance import explain_items, report_payload, unverified_sources, write_trace_csv
 from geo_engine.io.dwg_convert import available_backend, convert_dwg_to_dxf
-from geo_engine.io.dxf_reader import COMBINED_LAYER_MAP, dxf_bundle_paths, read_dxf_bundle
+from geo_engine.io.dxf_reader import (
+    COMBINED_LAYER_MAP,
+    _looks_like_xref_dir,
+    dxf_bundle_paths,
+    read_document,
+    read_dxf_bundle,
+)
 from geo_engine.io.dxf_writer import RESULT_LAYER_PREFIX, write_dxf
 from geo_engine.norms import load_norms
 from geo_engine.planner import CROWN_SPACING_TYPES, plan_items
@@ -61,8 +67,12 @@ def resolve_inputs(source: Path, workdir: Path) -> tuple[Path, list[Path]]:
         # вспомогательная врезка; выбор всё равно влияет только на то, в копию
         # какого документа пишется результат.
         main = max(mains, key=lambda p: p.stat().st_size)
-        xref_dir = source / "Xrefs"
-        xrefs = sorted(p for p in xref_dir.iterdir() if p.suffix.lower() in (".dxf", ".dwg")) if xref_dir.is_dir() else []
+        # Папка внешних ссылок называется по-разному у каждого бюро
+        # (`Xrefs`, `00_Ссылки`, `Внешние ссылки`, `xref_ИТП`) — берутся все
+        # подходящие, см. dxf_reader.XREF_DIR_MARKERS.
+        xrefs = []
+        for xref_dir in sorted(p for p in source.iterdir() if p.is_dir() and _looks_like_xref_dir(p.name)):
+            xrefs.extend(sorted(p for p in xref_dir.iterdir() if p.suffix.lower() in (".dxf", ".dwg")))
         converted_main = _convert_if_needed(main, workdir)
         converted = [converted_main]
         for path in xrefs:
@@ -87,6 +97,37 @@ def resolve_inputs(source: Path, workdir: Path) -> tuple[Path, list[Path]]:
                 print(f"  ! пропущен {path.name}: {error}", file=sys.stderr)
         return converted, bundle
     return converted, dxf_bundle_paths(converted)
+
+
+def pick_base_drawing(candidates: list[Path]) -> Path | None:
+    """Самый крупный чертёж, который реально открывается.
+
+    Исходник нужен только как холст: результат пишется в его копию отдельным
+    слоем, чтобы эксперт открыл файл и увидел свою подоснову с включаемым
+    слоем плана. Значит подойдёт любой читаемый файл бандла, и незачем терять
+    весь прогон из-за того, что самый большой повреждён.
+
+    Случай не гипотетический: на Измайловской площади главный чертёж (76 МБ)
+    не открывается ни `readfile`, ни `recover` ни в одном режиме обработки
+    ошибок — внутри испорченная юникод-escape-последовательность вида
+    "backslash-U-plus", на которой падает декодер ezdxf. Остальные файлы бандла при этом читаются, и план по
+    ним строится полностью.
+    """
+    best, best_count = None, -1
+    for path in sorted(set(candidates), key=lambda p: p.stat().st_size, reverse=True):
+        try:
+            doc = read_document(path)
+        except Exception as error:  # noqa: BLE001 — годится любой открывающийся
+            print(f"  ! как основу не использовать {path.name}: {type(error).__name__}", file=sys.stderr)
+            continue
+        # Не первый открывшийся, а самый содержательный: у бандла бывают
+        # файлы-заглушки в пару объектов, и копия такой заглушки со слоем
+        # результата формально проходит, но эксперт открывает её и не видит
+        # своей подосновы — ровно то, ради чего результат и пишется поверх.
+        count = sum(1 for _ in doc.modelspace())
+        if count > best_count:
+            best, best_count = path, count
+    return best
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -258,7 +299,14 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"5/5 Запись результата на слои {args.prefix}$*")
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        write_dxf(items, args.output, base_dxf=main_drawing, records=records, prefix=args.prefix)
+        base = pick_base_drawing([main_drawing, *bundle])
+        if base is None:
+            raise SystemExit(
+                "\nОШИБКА: ни один чертёж бандла не открывается — не в копию чего писать результат."
+            )
+        if base != main_drawing:
+            print(f"     основа: {base.name} (главный чертёж не читается)")
+        write_dxf(items, args.output, base_dxf=base, records=records, prefix=args.prefix)
 
     report_path = args.report or args.output.with_suffix(".report.json")
     unverified = unverified_sources(records)
