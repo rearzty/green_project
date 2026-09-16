@@ -98,3 +98,52 @@ class TestEffectiveNorms:
         effective = _effective_norms(NORMS, 8.0, 4.0)
         assert effective.spacing_for("tree").min_distance_m == 8.0
         assert effective.spacing_for("shrub").min_distance_m == 4.0
+
+
+class TestTerritoryPolygon:
+    """Selecting the site outline out of whatever the drawings labelled
+    "territory". Both cases below are the real pilot data, not hypotheticals:
+    the work area there is two polygons, and the same layer in the main drawing
+    also carries leftover fragments that are not areas at all.
+    """
+
+    def test_multiple_territory_zones_are_unioned_not_picked_from(self):
+        from shapely.geometry import Polygon
+
+        from backend.app.services.pipeline_service import territory_polygon
+        from geo_engine.model import Zone
+
+        north = Polygon([(0, 100), (100, 100), (100, 200), (0, 200)])
+        south = Polygon([(0, 0), (100, 0), (100, 50), (0, 50)])
+        zones = [Zone(geometry=north, zone_type="territory"), Zone(geometry=south, zone_type="territory")]
+
+        territory = territory_polygon(zones)
+
+        assert territory.area == north.area + south.area
+
+    def test_fragment_linestrings_on_the_territory_layer_are_ignored(self):
+        from shapely.geometry import LineString, Polygon
+
+        from backend.app.services.pipeline_service import territory_polygon
+        from geo_engine.model import Zone
+
+        fragment = LineString([(5, 5), (6, 6)])
+        outline = Polygon([(0, 0), (100, 0), (100, 100), (0, 100)])
+        # Fragment first: picking the first match would return the LineString.
+        zones = [Zone(geometry=fragment, zone_type="territory"), Zone(geometry=outline, zone_type="territory")]
+
+        territory = territory_polygon(zones)
+
+        assert territory.geom_type == "Polygon"
+        assert territory.area == outline.area
+
+    def test_only_fragments_still_raises(self):
+        from shapely.geometry import LineString
+
+        from backend.app.services.pipeline_service import MissingTerritoryError, territory_polygon
+        from geo_engine.model import Zone
+
+        zones = [Zone(geometry=LineString([(0, 0), (1, 1)]), zone_type="territory")]
+
+        with pytest.raises(MissingTerritoryError):
+            territory_polygon(zones)
