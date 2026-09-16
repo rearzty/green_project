@@ -80,16 +80,53 @@ class TestSetbackCitations:
         assert norms.setback_for("lighting_pole", "tree") == 4.0
         assert norms.setback_for("sidewalk", "tree") == 0.7
 
-    def test_a_value_taken_from_the_brief_is_not_marked_as_verified(self):
-        """743-ПП's 2 m comes from the brief's own wording, not from the act.
-        Presenting it as verified would be the failure mode this whole
-        mechanism exists to prevent.
+    def test_the_gas_setback_matches_both_acts_after_reading_743_pp(self):
+        """Regression for a wrong value this project shipped.
+
+        The brief says «743-ПП — отступы от трубопроводов, например, не менее
+        2 метров», and 2.0 was written in here on the assumption that the
+        Moscow act was stricter than the federal СП's 1.5. Reading the act
+        showed that sentence refers to its «теплопровод, трубопровод,
+        теплосеть 2,0» row — on gas both acts say 1,5, and the inflation was
+        ours. The citation now points at the actual table.
         """
         from geo_engine.norms import load_norms
 
         norms = load_norms()
-        source, _ = norms.source_for("gas_pipe", "tree")
+        source, row = norms.source_for("gas_pipe", "tree")
 
+        assert norms.setback_for("gas_pipe", "tree") == 1.5
         assert "743-ПП" in source.act
+        assert "3.6.1" in source.clause
+        assert source.verified is True
+        assert "газопровод" in row.lower()
+
+    def test_an_unchecked_citation_is_still_flagged(self):
+        """The verified flag must keep meaning something. Power lines are the
+        remaining honest gap: СП 42.13330.2016's table 9.1 note 2 defers to
+        ПУЭ, and ПУЭ itself has not been read.
+        """
+        from geo_engine.norms import load_norms
+
+        norms = load_norms()
+        source, _ = norms.source_for("power_line_corridor", "tree")
+
+        assert "ПУЭ" in source.act
         assert source.verified is False
         assert "не сверено" in source.citation()
+
+    def test_the_moscow_table_adds_classes_the_federal_one_lacks(self):
+        """743-ПП's table 3.6.1 is wider than СП's 9.1 — it separates schools
+        and kindergartens from ordinary buildings (10 m against 5) and adds
+        the toe of a slope. Both map onto layers the drawings actually carry.
+        """
+        from geo_engine.norms import load_norms
+
+        norms = load_norms()
+
+        assert norms.setback_for("school_kindergarten", "tree") == 10.0
+        assert norms.setback_for("school_kindergarten", "shrub") == 1.5
+        assert norms.setback_for("slope_toe", "tree") == 1.0
+        for object_type in ("school_kindergarten", "slope_toe"):
+            source, _ = norms.source_for(object_type, "tree")
+            assert "743-ПП" in source.act and source.verified
