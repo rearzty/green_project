@@ -5,9 +5,6 @@ independent packages together — neither of them imports the other.
 
 from __future__ import annotations
 
-import random
-import zlib
-
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import delete, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,19 +13,13 @@ from sqlalchemy.orm import selectinload
 from backend.app.core.config import settings
 from backend.app.db.models import Plan, PlantingItemRow, Project
 from backend.app.services.geo_io import domain_item_to_row_values, layers_to_domain
-from geo_engine.buffers import build_exclusion_zone, buildable_area
-from geo_engine.candidates import generate_candidates
+
 from geo_engine.norms import PlantingNorms, load_norms
-from geo_engine.placement import greedy_select
-from geo_engine.species import load_species
+from geo_engine.planner import plan_items
+from geo_engine.territory import MissingTerritoryError, territory_polygon  # noqa: F401  (re-exported by name for existing callers)
 from ml_scoring.heuristic_scorer import HeuristicScorer
 from ml_scoring.ml_scorer import MLScorer
 from ml_scoring.scoring_strategy import ScoringStrategy
-
-
-class MissingTerritoryError(ValueError):
-    """The uploaded file has no territory boundary zone -- nothing can be
-    planned or placed without one. Message is shown to the user as-is."""
 
 
 class CurrentPlanDeletionError(ValueError):
@@ -36,16 +27,6 @@ class CurrentPlanDeletionError(ValueError):
     every other code path here (list_plans's ordering, _find_reusable_plan,
     the frontend's "текущий" badge) assumes exactly one always exists.
     Message is shown to the user as-is."""
-
-
-def territory_polygon(zones):
-    """Not private (despite the rest of this module's helpers) -- edit_service
-    also needs it, to reject manual edits that would place a point outside
-    the project's own territory boundary."""
-    for zone in zones:
-        if zone.zone_type == "territory":
-            return zone.geometry
-    raise MissingTerritoryError("В загруженном файле нет границы участка (слой territory / BOUNDARY) — план построить нельзя.")
 
 
 def _existing_greenery(zones):
@@ -105,30 +86,8 @@ def _compute_planting_rows(
     this with the same plan_id and must get back the exact same layout, not
     a fresh random one, when it recomputes a collapsed plan's rows.
     """
-    rows: list[dict] = []
-    score_fn = scorer.as_score_fn()
-    species = load_species()
-    for planting_type in planting_types:
-        exclusion = build_exclusion_zone(utilities, zones, planting_type, norms)
-        margin = norms.territory_margin_for(planting_type)
-        buildable = buildable_area(territory, exclusion, zones, territory_margin_m=margin)
-        seed = zlib.crc32(f"{plan_id}:{planting_type}".encode())
-        candidates = generate_candidates(buildable, exclusion, planting_type, norms, zoning_zones=zones, seed=seed)
-        items = greedy_select(candidates, score_fn, norms)
-
-        species_pool = species.get(planting_type)
-        if species_pool:
-            # A seed distinct from the candidate-scatter one above -- species
-            # assignment shouldn't be even conceptually tied to placement
-            # randomness. Same reproducibility requirement either way:
-            # ensure_materialized() must re-assign the same species to the
-            # same items, not a fresh random pick.
-            species_rng = random.Random(zlib.crc32(f"{plan_id}:{planting_type}:species".encode()))
-            for item in items:
-                item.species = species_rng.choice(species_pool)
-
-        rows.extend(domain_item_to_row_values(plan_id, item) for item in items)
-    return rows
+    items = plan_items(plan_id, utilities, zones, territory, planting_types, scorer.as_score_fn(), norms)
+    return [domain_item_to_row_values(plan_id, item) for item in items]
 
 
 async def _prune_stale_plans(session: AsyncSession, project: Project, keep_plan_id: str) -> None:
