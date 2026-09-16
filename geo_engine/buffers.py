@@ -9,6 +9,7 @@ from shapely.geometry.base import BaseGeometry
 
 from geo_engine.model import PlantingType, Utility, Zone
 from geo_engine.norms import PlantingNorms
+from geo_engine.species import Species
 
 
 # Shapely approximates a buffer's round caps/corners with a polygon of
@@ -26,17 +27,34 @@ def build_exclusion_zone(
     zones: list[Zone],
     planting_type: PlantingType,
     norms: PlantingNorms,
+    species: Species | None = None,
+    crown_reference_diameter_m: float = 5.0,
 ) -> BaseGeometry:
     """Union of every utility/zone buffered by its required setback for
     `planting_type`. Zone types with a 0.0 setback (e.g. lawn vs. cables)
     still buffer by 0, which is a geometric no-op but keeps the logic uniform.
+
+    `species` matters and must be the same one the plan will actually use.
+    After the Moscow acts were read, the required setback stopped being a
+    single table value: МГСН 1.02-02 п. 4.2.8 sets per-species distances from
+    heat mains, 743-ПП табл. 3.6.1 прим. 3 pushes a wide crown 10 m off a
+    building, and прим. 1 to both tables scales the table values with crown
+    diameter. Leaving those out here while `compliance.explain_items` applies
+    them produces a plan the tool's own checker rejects — measured live on a
+    real street: with a wide-crown species, 80 of 121 placements came back as
+    violations purely because the generator had used the unadjusted table.
     """
     buffered: list[BaseGeometry] = []
+
+    def required(object_type: str) -> float:
+        return norms.resolve_setback(
+            object_type, planting_type, species, crown_reference_diameter_m
+        ).required_m
 
     for utility in utilities:
         # Round join/cap: a utility is a line (possibly bent), and a rounded
         # clearance radius around a pipe/cable is physically the right shape.
-        setback = norms.setback_for(utility.object_type, planting_type)
+        setback = required(utility.object_type)
         buffered.append(utility.geometry.buffer(setback, quad_segs=_BUFFER_QUAD_SEGS))
 
     for zone in zones:
@@ -47,7 +65,7 @@ def build_exclusion_zone(
         # rounds every corner, which for e.g. a building turns a rectangular
         # setback strip into a blob-cornered shape (visibly wrong on the map)
         # and bloats the corner into ~30 extra vertices for no reason.
-        setback = norms.setback_for(zone.zone_type, planting_type)
+        setback = required(zone.zone_type)
         buffered.append(zone.geometry.buffer(setback, quad_segs=_BUFFER_QUAD_SEGS, join_style="mitre"))
 
     if not buffered:
