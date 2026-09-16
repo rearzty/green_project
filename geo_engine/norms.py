@@ -13,6 +13,37 @@ DEFAULT_NORMS_PATH = Path(__file__).parent / "config" / "planting_norms.yaml"
 PlantingType = str  # "tree" | "shrub" | "lawn"
 
 
+class NormSource(BaseModel):
+    """Where a setback value comes from, in a form an expert can check.
+
+    Required by the brief: every planting must be explained with a reference to
+    the act and the specific clause/table, and a result without that traceability
+    is explicitly not accepted. `verified` is the honest part — it says whether
+    the value was checked against the text of the act itself or is still taken
+    from a secondary source, the brief's own wording, or engineering practice.
+    Unverified sources are surfaced, never hidden.
+    """
+
+    act: str
+    act_full: str = ""
+    clause: str
+    title: str
+    verified: bool
+    note: str = ""
+
+    def citation(self) -> str:
+        """One line an expert can look up, e.g. 'СП 42.13330.2016 — п. 9.6, таблица 9.1'."""
+        head = f"{self.act} — {self.clause}" if self.clause and self.clause != "—" else self.act
+        return head if self.verified else f"{head} (не сверено с текстом акта)"
+
+
+class SetbackSource(BaseModel):
+    """Binds one setback value to its NormSource, plus the verbatim table row."""
+
+    source: str
+    row: str = ""
+
+
 class SpeciesSpacing(BaseModel):
     min_distance_m: float
     canopy_radius_m: float
@@ -20,6 +51,8 @@ class SpeciesSpacing(BaseModel):
 
 class PlantingNorms(BaseModel):
     setbacks_m: dict[str, dict[PlantingType, float]]
+    sources: dict[str, NormSource] = {}
+    setback_sources: dict[str, dict[PlantingType, SetbackSource]] = {}
     species_spacing: dict[str, SpeciesSpacing]
     min_candidate_area_m2: dict[PlantingType, float]
     territory_margin_m: dict[PlantingType, float]
@@ -33,6 +66,22 @@ class PlantingNorms(BaseModel):
             return rules[planting_type]
         known = [r[planting_type] for r in self.setbacks_m.values() if planting_type in r]
         return max(known) if known else 2.0
+
+    def source_for(self, utility_type: str, planting_type: PlantingType) -> tuple[NormSource, str] | None:
+        """The act/clause behind `setback_for(utility_type, planting_type)`.
+
+        Returns (source, verbatim table row) or None when this object type has
+        no citation configured -- which happens exactly when `setback_for` falls
+        back to its fail-large default for an unknown object type. The caller
+        must say so rather than present the fallback as if a norm required it.
+        """
+        binding = self.setback_sources.get(utility_type, {}).get(planting_type)
+        if binding is None:
+            return None
+        source = self.sources.get(binding.source)
+        if source is None:
+            return None
+        return source, binding.row
 
     def spacing_for(self, planting_type: PlantingType) -> SpeciesSpacing:
         key = f"{planting_type}_default"
