@@ -147,3 +147,71 @@ class TestTerritoryPolygon:
 
         with pytest.raises(MissingTerritoryError):
             territory_polygon(zones)
+
+
+class TestTerritoryClustering:
+    """Отбрасывание контуров, которые участку не принадлежат.
+
+    Бандл склеивается конкатенацией, и это верно ровно до тех пор, пока все
+    файлы в одной системе координат. В пилотных данных нашёлся файл внешней
+    ссылки в другой: его контур объединялся с настоящим, `territory_polygon`
+    возвращала два куска в трёх километрах друг от друга, и половина посадок
+    уезжала туда, где нет ни одной сети. План при этом считался полностью
+    соответствующим нормативам — ближайшее ограничение было за три километра.
+    Тихий неверный результат, на глаз неотличимый от верного.
+    """
+
+    def test_a_contour_kilometres_away_is_dropped(self):
+        from shapely.geometry import Polygon
+
+        from geo_engine.territory import territory_polygon
+        from geo_engine.model import Zone
+
+        site = Polygon([(17300, 13900), (17960, 13900), (17960, 14280), (17300, 14280)])
+        elsewhere = Polygon([(14345, 11780), (14690, 11780), (14690, 11990), (14345, 11990)])
+        zones = [
+            Zone(geometry=site, zone_type="territory"),
+            Zone(geometry=elsewhere, zone_type="territory"),
+        ]
+
+        territory = territory_polygon(zones)
+
+        assert territory.geom_type == "Polygon"
+        assert territory.area == pytest.approx(site.area)
+
+    def test_adjacent_parts_of_one_site_are_kept(self):
+        """Участок эталонной улицы физически состоит из двух полигонов — улица
+        разрывается вокруг квартала. Их терять нельзя.
+        """
+        from shapely.geometry import Polygon
+
+        from geo_engine.territory import territory_polygon
+        from geo_engine.model import Zone
+
+        north = Polygon([(0, 100), (200, 100), (200, 300), (0, 300)])
+        south = Polygon([(0, 0), (200, 0), (200, 90), (0, 90)])
+        zones = [Zone(geometry=north, zone_type="territory"), Zone(geometry=south, zone_type="territory")]
+
+        territory = territory_polygon(zones)
+
+        assert territory.area == pytest.approx(north.area + south.area)
+
+    def test_the_largest_contour_anchors_the_cluster(self):
+        """Если в данных смешаны два объекта, больший почти наверняка и есть
+        заказанный участок — а не тот, что оказался первым в списке.
+        """
+        from shapely.geometry import Polygon
+
+        from geo_engine.territory import territory_polygon
+        from geo_engine.model import Zone
+
+        small_stray = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+        real_site = Polygon([(5000, 5000), (5400, 5000), (5400, 5300), (5000, 5300)])
+        zones = [
+            Zone(geometry=small_stray, zone_type="territory"),
+            Zone(geometry=real_site, zone_type="territory"),
+        ]
+
+        territory = territory_polygon(zones)
+
+        assert territory.area == pytest.approx(real_site.area)
