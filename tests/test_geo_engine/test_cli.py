@@ -260,3 +260,51 @@ def test_an_umbrella_folder_with_no_drawing_at_its_own_level_names_its_subfolder
     message = str(excinfo.value)
     assert "01 ирд" in message
     assert "10000176_Генплан_Олимп - Standard" in message
+
+
+class TestBaseDrawingChoice:
+    """Какой файл бандла становится холстом для слоя результата."""
+
+    def _drawing(self, path, entity_count, layer="Газопровод"):
+        doc = ezdxf.new(setup=True)
+        doc.layers.add(name=layer)
+        msp = doc.modelspace()
+        for i in range(entity_count):
+            msp.add_lwpolyline([(i, 0), (i + 1, 0)], dxfattribs={"layer": layer})
+        doc.saveas(str(path))
+        return path
+
+    def test_the_most_substantial_readable_drawing_wins(self, tmp_path):
+        """Не первый открывшийся и не самый большой по байтам: у бандла бывают
+        файлы-заглушки в пару объектов, и копия такой заглушки со слоем
+        результата формально проходит, но эксперт открывает её и не видит своей
+        подосновы — ровно то, ради чего результат и пишется поверх исходника.
+        """
+        from scripts.plan_dxf import pick_base_drawing
+
+        stub = self._drawing(tmp_path / "stub.dxf", 2)
+        real = self._drawing(tmp_path / "real.dxf", 50)
+
+        assert pick_base_drawing([stub, real]) == real
+
+    def test_an_unreadable_drawing_is_skipped(self, tmp_path):
+        """Живой случай: главный чертёж улицы (76 МБ) не открывается ни
+        readfile, ни recover ни в одном режиме — внутри испорченная
+        юникод-последовательность. Терять из-за неё весь прогон незачем:
+        исходник нужен только как холст.
+        """
+        from scripts.plan_dxf import pick_base_drawing
+
+        broken = tmp_path / "broken.dxf"
+        broken.write_text("это не DXF", encoding="utf-8")
+        real = self._drawing(tmp_path / "real.dxf", 20)
+
+        assert pick_base_drawing([broken, real]) == real
+
+    def test_nothing_readable_yields_none(self, tmp_path):
+        from scripts.plan_dxf import pick_base_drawing
+
+        broken = tmp_path / "broken.dxf"
+        broken.write_text("мусор", encoding="utf-8")
+
+        assert pick_base_drawing([broken]) is None

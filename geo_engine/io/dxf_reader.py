@@ -24,14 +24,18 @@ found on the pilot dataset (`Пилотный проект 20 улиц`) and bot
 from __future__ import annotations
 
 import math
+import sys
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Literal
+from collections.abc import Callable
+from typing import Iterable, Iterator, Literal
 
 import ezdxf
+import ezdxf.recover
 from shapely.geometry import LineString, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 
 from geo_engine.io.geometry_cleanup import is_origin_artifact, merge_dashed_lines, origin_is_artifact
+from geo_engine.io.layer_rules import classify_layer, is_symbol_layer
 from geo_engine.model import Utility, Zone
 
 Kind = Literal["utility", "zone"]
@@ -274,7 +278,7 @@ def iter_entities(
                 yield entity
                 continue
             layer = normalize_layer(entity.dxf.layer)
-            if layer in symbol_layers:
+            if layer in symbol_layers or is_symbol_layer(layer):
                 yield entity
                 continue
             if layer_map is not None and layer not in layer_map:
@@ -293,33 +297,77 @@ def iter_entities(
     yield from walk(container, 0)
 
 
-# Both names occur in the pilot dataset for the same role (external
-# references sitting beside a project's main drawing) -- "Xrefs" on some
-# streets ("2. Песчаный переулок"), "ссылки" on others ("1. Олимпийская
-# деревня"). Neither is a translation of the other picked by us; both are
-# verbatim folder names the deliveries actually use.
-XREF_DIRNAMES = ("Xrefs", "ссылки")
+def read_document(path: Path):
+    """Открыть DXF, по возможности пережив повреждения.
+
+    `ezdxf.readfile()` разбирает файл строго и отказывается целиком, если хоть
+    где-то нарушена структура групповых кодов. На чертежах, прошедших через
+    конвертацию из DWG, это случается: у одной улицы пилота файл ломается на
+    6.5-миллионной строке из-за одной испорченной надписи, и вместе с ним
+    терялась бы вся улица. `ezdxf.recover` собирает то, что удалось разобрать.
+
+    Сначала быстрый путь, восстановление — только как запасной: recover заметно
+    медленнее, и гонять его на исправных файлах незачем.
+    """
+    try:
+        return ezdxf.readfile(str(path))
+    except (ezdxf.DXFStructureError, UnicodeDecodeError):
+        doc, _auditor = ezdxf.recover.readfile(str(path))
+        return doc
 
 
-def dxf_bundle_paths(main_path: str | Path, xref_dirnames: tuple[str, ...] = XREF_DIRNAMES) -> list[Path]:
+def _warn_unreadable(path: Path, error: Exception) -> None:
+    """Файл бандла, который не удалось прочитать даже восстановлением.
+
+    Печатается, а не проглатывается: молчаливый пропуск — это как раз тот
+    случай, когда потерянная граница участка выглядит как отсутствующая, и
+    искать причину пришлось бы в алгоритме, а не в данных.
+    """
+    print(f"  ! не прочитан {path.name}: {type(error).__name__}: {str(error)[:120]}", file=sys.stderr)
+
+
+# Как в пилотном датасете называют папку внешних ссылок. Одного имени мало:
+# по девятнадцати улицам встретились `Xrefs`, `xref`, `xref_ИТП`, `ссылки`,
+# `00_Ссылки`, `Внешние ссылки`, `Вн.ссылки` — у каждого бюро своё. Сравнение
+# идёт по подстроке в нижнем регистре, поэтому числовые префиксы (`00_`) и
+# суффиксы (`_ИТП`) не мешают.
+XREF_DIR_MARKERS = ("xref", "ссылк")
+
+
+def _looks_like_xref_dir(name: str) -> bool:
+    lowered = name.lower()
+    return any(marker in lowered for marker in XREF_DIR_MARKERS)
+
+
+def dxf_bundle_paths(main_path: str | Path, xref_dirname: str | None = None) -> list[Path]:
     """The main drawing plus the external references sitting next to it.
 
     A project drawing is not self-contained: the pilot street keeps its geobase
-    sheets and — critically — its work-area outline in an xref folder beside
-    the main file, and `ezdxf` does not resolve those (most are DWG, and an
-    attached xref is a file reference, not embedded content). Reading the main
-    file alone gets the design but no site boundary and no utilities.
+    sheets and — critically — its work-area outline in an xref folder beside the
+    main file, and `ezdxf` does not resolve those (most are DWG, and an attached
+    xref is a file reference, not embedded content). Reading the main file alone
+    gets the design but no site boundary and no utilities.
 
-    Matches both `.dxf` and `.dwg` in the xref folder -- the raw delivery's
-    xrefs are DWG same as the main drawing, not pre-converted. `resolve_bundle_inputs`
-    converts whatever this returns; this function only locates files.
+    `xref_dirname` pins one folder name; without it every sibling directory
+    whose name looks like an xref folder is taken (see XREF_DIR_MARKERS --
+    hardcoding "Xrefs" missed most streets, which call it `00_Ссылки`,
+    `Внешние ссылки`, `xref_ИТП` and so on). Matches both `.dxf` and `.dwg` in
+    the xref folder -- the raw delivery's xrefs are DWG same as the main
+    drawing, not pre-converted. `resolve_bundle_inputs` converts whatever this
+    returns; this function only locates files.
 
     Returned in a stable order, main file first, and only files that exist.
     """
     main_path = Path(main_path)
     paths = [main_path]
-    for xref_dirname in xref_dirnames:
-        xref_dir = main_path.parent / xref_dirname
+
+    parent = main_path.parent
+    if xref_dirname is not None:
+        candidates = [parent / xref_dirname]
+    else:
+        candidates = sorted(p for p in parent.iterdir() if p.is_dir() and _looks_like_xref_dir(p.name))
+
+    for xref_dir in candidates:
         if xref_dir.is_dir():
             paths.extend(sorted(p for p in xref_dir.iterdir() if p.suffix.lower() in (".dxf", ".dwg")))
     return [p for p in paths if p.is_file()]
@@ -445,6 +493,8 @@ def read_dxf_bundle(
     symbol_layers: frozenset[str] | None = None,
     stitch_dashes: bool = False,
     drop_origin: bool = False,
+    use_layer_rules: bool = True,
+    on_error: Callable[[Path, Exception], None] | None = _warn_unreadable,
 ) -> tuple[list[Utility], list[Zone]]:
     """Read several DXF files as one drawing.
 
@@ -458,24 +508,59 @@ def read_dxf_bundle(
 
     Stitching runs once over the merged result rather than per file, so a run
     split across two sheets still joins up.
+
+    `on_error` решает судьбу файла, который не читается даже восстановлением.
+    По умолчанию — предупредить и продолжить: один повреждённый вспомогательный
+    чертёж не должен уносить с собой всю улицу (живой случай на Измайловской
+    площади). Передайте функцию, которая пробрасывает исключение, если для
+    вашего сценария потеря любого файла недопустима.
     """
     utilities: list[Utility] = []
     zones: list[Zone] = []
     for path in paths:
-        file_utilities, file_zones = read_dxf(
-            path,
-            layer_map=layer_map,
-            explode_blocks=explode_blocks,
-            symbol_layers=symbol_layers,
-            stitch_dashes=False,
-            drop_origin=drop_origin,
-        )
+        try:
+            file_utilities, file_zones = read_dxf(
+                path,
+                layer_map=layer_map,
+                explode_blocks=explode_blocks,
+                symbol_layers=symbol_layers,
+                stitch_dashes=False,
+                drop_origin=drop_origin,
+                use_layer_rules=use_layer_rules,
+            )
+        except Exception as error:  # noqa: BLE001 — судьбу решает вызывающий
+            if on_error is None:
+                raise
+            on_error(Path(path), error)
+            continue
         utilities.extend(file_utilities)
         zones.extend(file_zones)
 
     if stitch_dashes:
         utilities = stitch_utility_lines(utilities)
     return utilities, zones
+
+
+def resolve_layer(layer: str, layer_map: LayerMap, use_rules: bool = True) -> tuple[Kind, str]:
+    """Тип объекта для слоя: сначала дословная карта, потом образцы имени.
+
+    Дословная карта главнее и проверяется первой. Она однозначна и сверена, а
+    правило по подстроке неизбежно приблизительно — там, где имя известно
+    точно, гадать незачем.
+
+    Правила нужны потому, что дословная карта покрывала семь улиц пилота из
+    девятнадцати: геоподоснова называет слои единообразно, а проектные чертежи
+    у каждого бюро свои. Слой, не опознанный ни картой, ни правилами, уходит в
+    "unknown" — как и раньше, чтобы ничего не терялось молча.
+    """
+    mapped = layer_map.get(layer)
+    if mapped is not None:
+        return mapped
+    if use_rules:
+        guessed = classify_layer(layer)
+        if guessed is not None:
+            return guessed
+    return ("zone", "unknown")
 
 
 def read_dxf(
@@ -485,6 +570,7 @@ def read_dxf(
     symbol_layers: frozenset[str] | None = None,
     stitch_dashes: bool = False,
     drop_origin: bool = False,
+    use_layer_rules: bool = True,
 ) -> tuple[list[Utility], list[Zone]]:
     """Parse a DXF file's modelspace into Utility and Zone lists, keyed by
     layer name via `layer_map` (defaults to DEFAULT_LAYER_MAP).
@@ -493,9 +579,13 @@ def read_dxf(
     geometry_cleanup — off by default because they only apply to drawings that
     have those artifacts, and a caller reading a clean DXF should get exactly
     what the file contains.
+
+    `use_layer_rules` включает распознавание слоя по образцу имени, когда
+    дословной записи в карте нет (см. layer_rules). По умолчанию включено:
+    без него читались семь улиц пилота из девятнадцати.
     """
     layer_map = layer_map or DEFAULT_LAYER_MAP
-    doc = ezdxf.readfile(str(path))
+    doc = read_document(Path(path))
     msp = doc.modelspace()
 
     utilities: list[Utility] = []
@@ -507,7 +597,7 @@ def read_dxf(
             continue
 
         layer = normalize_layer(entity.dxf.layer)
-        kind, object_type = layer_map.get(layer, ("zone", "unknown"))
+        kind, object_type = resolve_layer(layer, layer_map, use_layer_rules)
 
         if kind == "utility":
             utilities.append(Utility(geometry=geometry, object_type=object_type, layer_source=layer))

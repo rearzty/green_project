@@ -51,6 +51,22 @@ def _effective_norms(norms: PlantingNorms, tree_spacing_m: float | None, shrub_s
     return norms
 
 
+def _spacing_overridden(tree_spacing_m: float | None, shrub_spacing_m: float | None) -> tuple[str, ...]:
+    """Типы, интервал которых задал пользователь.
+
+    Нужно потому, что пользовательский интервал и выведенный из класса кроны
+    (МГСН 1.02-02, п. 4.2.9.2) приходят в одно и то же поле `min_distance_m`, и
+    внутри planner их уже не различить. Без этого списка явно выставленная в
+    панели цифра молча заменялась бы нормативной.
+    """
+    overridden = []
+    if tree_spacing_m:
+        overridden.append("tree")
+    if shrub_spacing_m:
+        overridden.append("shrub")
+    return tuple(overridden)
+
+
 def _compute_planting_rows(
     plan_id: str,
     utilities,
@@ -59,6 +75,7 @@ def _compute_planting_rows(
     planting_types: list[str],
     scorer: ScoringStrategy,
     norms,
+    keep_spacing_for: tuple[str, ...] = (),
 ) -> list[PlantingItemRow]:
     """Pure CPU work (geometry buffers/candidates/greedy selection) — kept as
     one synchronous function so it can run in a worker thread via
@@ -78,7 +95,16 @@ def _compute_planting_rows(
     this with the same plan_id and must get back the exact same layout, not
     a fresh random one, when it recomputes a collapsed plan's rows.
     """
-    items = plan_items(plan_id, utilities, zones, territory, planting_types, scorer.as_score_fn(), norms)
+    items = plan_items(
+        plan_id,
+        utilities,
+        zones,
+        territory,
+        planting_types,
+        scorer.as_score_fn(),
+        norms,
+        keep_spacing_for=keep_spacing_for,
+    )
     return [domain_item_to_row(plan_id, item) for item in items]
 
 
@@ -132,7 +158,15 @@ async def ensure_materialized(plan: Plan) -> Plan:
     scorer = build_scorer(plan.scoring_mode, norms, existing_greenery)
 
     items = await run_in_threadpool(
-        _compute_planting_rows, plan.id, utilities, zones, territory, plan.planting_types, scorer, norms
+        _compute_planting_rows,
+        plan.id,
+        utilities,
+        zones,
+        territory,
+        plan.planting_types,
+        scorer,
+        norms,
+        _spacing_overridden(plan.tree_spacing_m, plan.shrub_spacing_m),
     )
     _attach(plan, items)
     plan.materialized = True
@@ -194,7 +228,17 @@ async def generate_plan(
         project=project,
     )
 
-    items = await run_in_threadpool(_compute_planting_rows, plan.id, utilities, zones, territory, planting_types, scorer, norms)
+    items = await run_in_threadpool(
+        _compute_planting_rows,
+        plan.id,
+        utilities,
+        zones,
+        territory,
+        planting_types,
+        scorer,
+        norms,
+        _spacing_overridden(tree_spacing_m, shrub_spacing_m),
+    )
     _attach(plan, items)
     plan.item_count = len(items)
 
