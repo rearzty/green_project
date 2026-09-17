@@ -32,7 +32,7 @@ from geo_engine.io.dxf_reader import (
 )
 from geo_engine.io.dxf_writer import RESULT_LAYER_PREFIX, write_dxf
 from geo_engine.norms import load_norms
-from geo_engine.planner import CROWN_SPACING_TYPES, plan_items
+from geo_engine.planner import CROWN_SPACING_TYPES, PLACEMENT_PATTERNS, ROW_RATIONALE_PREFIX, plan_items
 from geo_engine.species import load_catalogue
 from geo_engine.territory import MissingTerritoryError, territory_polygon
 from ml_scoring.heuristic_scorer import HeuristicScorer
@@ -167,6 +167,13 @@ def build_parser() -> argparse.ArgumentParser:
         "Породу видно в выводе; список — в geo_engine/config/species.yaml",
     )
     parser.add_argument("--list-species", action="store_true", help="Показать доступные породы и выйти")
+    parser.add_argument(
+        "--pattern",
+        choices=PLACEMENT_PATTERNS,
+        default="auto",
+        help="Схема расстановки: auto — ряд вдоль проездов/тротуаров/границы участка плюс россыпь "
+        "в остатке (по умолчанию); scatter — только россыпь; row — только ряды",
+    )
     return parser
 
 
@@ -260,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             scorer = HeuristicScorer(norms, existing_greenery=existing_greenery)
 
-        print(f"3/5 Генерация ({args.scoring}, типы: {', '.join(planting_types)})...")
+        print(f"3/5 Генерация ({args.scoring}, схема: {args.pattern}, типы: {', '.join(planting_types)})...")
         items = plan_items(
             args.plan_key,
             utilities,
@@ -271,9 +278,13 @@ def main(argv: list[str] | None = None) -> int:
             norms,
             keep_spacing_for=keep_spacing_for,
             species_overrides=species_overrides,
+            pattern=args.pattern,
         )
         counts = Counter(i.planting_type for i in items)
         print(f"     посадок: {len(items)} ({', '.join(f'{k}: {v}' for k, v in counts.most_common())})")
+        in_rows = sum(1 for i in items if i.rationale.startswith(ROW_RATIONALE_PREFIX))
+        if in_rows:
+            print(f"     из них рядовой посадкой: {in_rows}, свободной группой: {len(items) - in_rows}")
         catalogue = load_catalogue()
         chosen = {i.planting_type: i.species for i in items}
         for planting_type, species_name in sorted(chosen.items()):
