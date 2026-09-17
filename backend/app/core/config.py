@@ -8,9 +8,6 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 class Settings(BaseSettings):
-    # asyncpg, not psycopg2 -- backend/app/db/session.py uses a real async
-    # SQLAlchemy engine (create_async_engine), not the sync one.
-    database_url: str = "postgresql+asyncpg://greenproject:greenproject@localhost:5432/greenproject"
     planting_norms_path: Path = REPO_ROOT / "geo_engine" / "config" / "planting_norms.yaml"
     ml_artifact_path: Path = REPO_ROOT / "ml_scoring" / "artifacts" / "model.joblib"
     # Browsers treat localhost and 127.0.0.1 as different origins even

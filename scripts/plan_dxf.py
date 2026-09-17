@@ -22,13 +22,12 @@ from collections import Counter
 from pathlib import Path
 
 from geo_engine.compliance import explain_items, report_payload, unverified_sources, write_trace_csv
-from geo_engine.io.dwg_convert import available_backend, convert_dwg_to_dxf
 from geo_engine.io.dxf_reader import (
     COMBINED_LAYER_MAP,
-    _looks_like_xref_dir,
-    dxf_bundle_paths,
+    BundleResolutionError,
     read_document,
     read_dxf_bundle,
+    resolve_bundle_inputs,
 )
 from geo_engine.io.dxf_writer import RESULT_LAYER_PREFIX, write_dxf
 from geo_engine.norms import load_norms
@@ -41,62 +40,23 @@ from ml_scoring.ml_scorer import MLScorer, ModelNotTrainedError
 PLANTING_TYPES = ("tree", "shrub", "lawn")
 
 
-def _convert_if_needed(path: Path, workdir: Path) -> Path:
-    if path.suffix.lower() != ".dwg":
-        return path
-    if available_backend() is None:
-        raise SystemExit(
-            f"Файл {path.name} в формате DWG, но конвертер не найден на PATH.\n"
-            "Установите LibreDWG (brew install libredwg, либо сборка из исходников — "
-            "рецепт в geo_engine/io/dwg_convert.py) или ODA File Converter."
-        )
-    return convert_dwg_to_dxf(path, workdir)
-
-
 def resolve_inputs(source: Path, workdir: Path) -> tuple[Path, list[Path]]:
     """(главный чертёж, все файлы бандла) — с конвертацией DWG при необходимости.
 
-    Каталог разбирается так же, как устроены реальные поставки: чертежи в корне
-    каталога — главные, всё из Xrefs/ — внешние ссылки к ним.
+    Тонкая обёртка над `dxf_reader.resolve_bundle_inputs()` — тем же кодом, что
+    и веб-загрузка: рекурсивный обход папки проекта (сети по подпапкам заказов
+    на съёмку, не только Xrefs/ссылки), подсказка со списком подпапок, когда
+    чертежа нет прямо в корне. `BundleResolutionError` — единственная точка,
+    где CLI переводит это в `SystemExit`; предупреждения о пропущенных файлах
+    печатаются здесь же, а не проглатываются.
     """
-    if source.is_dir():
-        mains = sorted(p for p in source.iterdir() if p.suffix.lower() in (".dxf", ".dwg"))
-        if not mains:
-            raise SystemExit(f"В каталоге {source} нет ни одного .dxf/.dwg файла.")
-        # Самый крупный файл в корне — почти всегда и есть главный чертёж, а не
-        # вспомогательная врезка; выбор всё равно влияет только на то, в копию
-        # какого документа пишется результат.
-        main = max(mains, key=lambda p: p.stat().st_size)
-        # Папка внешних ссылок называется по-разному у каждого бюро
-        # (`Xrefs`, `00_Ссылки`, `Внешние ссылки`, `xref_ИТП`) — берутся все
-        # подходящие, см. dxf_reader.XREF_DIR_MARKERS.
-        xrefs = []
-        for xref_dir in sorted(p for p in source.iterdir() if p.is_dir() and _looks_like_xref_dir(p.name)):
-            xrefs.extend(sorted(p for p in xref_dir.iterdir() if p.suffix.lower() in (".dxf", ".dwg")))
-        converted_main = _convert_if_needed(main, workdir)
-        converted = [converted_main]
-        for path in xrefs:
-            try:
-                converted.append(_convert_if_needed(path, workdir))
-            except RuntimeError as error:
-                # Один нечитаемый xref не должен валить весь прогон — но и молча
-                # пропасть он не должен, иначе потерянная граница участка
-                # выглядит как отсутствующая.
-                print(f"  ! пропущен {path.name}: {error}", file=sys.stderr)
-        return converted_main, converted
-
-    converted = _convert_if_needed(source, workdir)
-    if source.suffix.lower() == ".dwg":
-        # У сконвертированного файла нет соседней Xrefs/ — берём её у оригинала.
-        siblings = dxf_bundle_paths(source)
-        bundle = [converted]
-        for path in siblings[1:]:
-            try:
-                bundle.append(_convert_if_needed(path, workdir))
-            except RuntimeError as error:
-                print(f"  ! пропущен {path.name}: {error}", file=sys.stderr)
-        return converted, bundle
-    return converted, dxf_bundle_paths(converted)
+    try:
+        main, bundle, warnings = resolve_bundle_inputs(source, workdir)
+    except BundleResolutionError as error:
+        raise SystemExit(str(error)) from error
+    for warning in warnings:
+        print(f"  ! {warning}", file=sys.stderr)
+    return main, bundle
 
 
 def pick_base_drawing(candidates: list[Path]) -> Path | None:

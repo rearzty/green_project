@@ -19,7 +19,7 @@ from shapely.geometry.base import BaseGeometry
 
 from geo_engine.model import PlantingCandidate
 from geo_engine.norms import PlantingNorms
-from ml_scoring.features import compute_features, feature_vector
+from ml_scoring.features import build_existing_greenery_index, compute_features, feature_vector
 from ml_scoring.scoring_strategy import ScoringStrategy
 
 DEFAULT_ARTIFACT_PATH = Path(__file__).parent / "artifacts" / "model.joblib"
@@ -44,6 +44,9 @@ class MLScorer(ScoringStrategy):
         self.pipeline = joblib.load(artifact_path)
         self.norms = norms
         self.existing_greenery = existing_greenery or []
+        # Same fix as HeuristicScorer -- see its own comment / features.py's
+        # _existing_greenery_gap docstring.
+        self._existing_greenery_index = build_existing_greenery_index(self.existing_greenery)
 
     def score(self, candidate: PlantingCandidate) -> tuple[float, str]:
         return self.score_batch([candidate])[0]
@@ -51,7 +54,10 @@ class MLScorer(ScoringStrategy):
     def score_batch(self, candidates: list[PlantingCandidate]) -> list[tuple[float, str]]:
         if not candidates:
             return []
-        vectors = [feature_vector(compute_features(c, self.norms, self.existing_greenery)) for c in candidates]
+        vectors = [
+            feature_vector(compute_features(c, self.norms, self.existing_greenery, self._existing_greenery_index))
+            for c in candidates
+        ]
         # One vectorized sklearn call over the whole batch, not one Python
         # call per candidate -- see ScoringStrategy.score_batch.
         probabilities = self.pipeline.predict_proba(vectors)[:, 1]
