@@ -22,8 +22,7 @@ from collections import Counter
 from pathlib import Path
 
 from geo_engine.compliance import explain_items, report_payload, unverified_sources, write_trace_csv
-from geo_engine.io.dwg_convert import available_backend, convert_dwg_to_dxf
-from geo_engine.io.dxf_reader import COMBINED_LAYER_MAP, dxf_bundle_paths, read_dxf_bundle
+from geo_engine.io.dxf_reader import COMBINED_LAYER_MAP, BundleResolutionError, read_dxf_bundle, resolve_bundle_inputs
 from geo_engine.io.dxf_writer import RESULT_LAYER_PREFIX, write_dxf
 from geo_engine.norms import load_norms
 from geo_engine.planner import plan_items
@@ -35,58 +34,21 @@ from ml_scoring.ml_scorer import MLScorer, ModelNotTrainedError
 PLANTING_TYPES = ("tree", "shrub", "lawn")
 
 
-def _convert_if_needed(path: Path, workdir: Path) -> Path:
-    if path.suffix.lower() != ".dwg":
-        return path
-    if available_backend() is None:
-        raise SystemExit(
-            f"Файл {path.name} в формате DWG, но конвертер не найден на PATH.\n"
-            "Установите LibreDWG (brew install libredwg, либо сборка из исходников — "
-            "рецепт в geo_engine/io/dwg_convert.py) или ODA File Converter."
-        )
-    return convert_dwg_to_dxf(path, workdir)
-
-
 def resolve_inputs(source: Path, workdir: Path) -> tuple[Path, list[Path]]:
     """(главный чертёж, все файлы бандла) — с конвертацией DWG при необходимости.
 
-    Каталог разбирается так же, как устроены реальные поставки: чертежи в корне
-    каталога — главные, всё из Xrefs/ — внешние ссылки к ним.
+    Тонкая CLI-обёртка над geo_engine.io.dxf_reader.resolve_bundle_inputs (тот
+    же код использует и веб-загрузка, см. project_service.py) — переводит
+    BundleResolutionError в SystemExit и печатает предупреждения о
+    пропущенных файлах, как раньше.
     """
-    if source.is_dir():
-        mains = sorted(p for p in source.iterdir() if p.suffix.lower() in (".dxf", ".dwg"))
-        if not mains:
-            raise SystemExit(f"В каталоге {source} нет ни одного .dxf/.dwg файла.")
-        # Самый крупный файл в корне — почти всегда и есть главный чертёж, а не
-        # вспомогательная врезка; выбор всё равно влияет только на то, в копию
-        # какого документа пишется результат.
-        main = max(mains, key=lambda p: p.stat().st_size)
-        xref_dir = source / "Xrefs"
-        xrefs = sorted(p for p in xref_dir.iterdir() if p.suffix.lower() in (".dxf", ".dwg")) if xref_dir.is_dir() else []
-        converted_main = _convert_if_needed(main, workdir)
-        converted = [converted_main]
-        for path in xrefs:
-            try:
-                converted.append(_convert_if_needed(path, workdir))
-            except RuntimeError as error:
-                # Один нечитаемый xref не должен валить весь прогон — но и молча
-                # пропасть он не должен, иначе потерянная граница участка
-                # выглядит как отсутствующая.
-                print(f"  ! пропущен {path.name}: {error}", file=sys.stderr)
-        return converted_main, converted
-
-    converted = _convert_if_needed(source, workdir)
-    if source.suffix.lower() == ".dwg":
-        # У сконвертированного файла нет соседней Xrefs/ — берём её у оригинала.
-        siblings = dxf_bundle_paths(source)
-        bundle = [converted]
-        for path in siblings[1:]:
-            try:
-                bundle.append(_convert_if_needed(path, workdir))
-            except RuntimeError as error:
-                print(f"  ! пропущен {path.name}: {error}", file=sys.stderr)
-        return converted, bundle
-    return converted, dxf_bundle_paths(converted)
+    try:
+        main, bundle, warnings = resolve_bundle_inputs(source, workdir)
+    except BundleResolutionError as error:
+        raise SystemExit(str(error)) from error
+    for warning in warnings:
+        print(f"  ! {warning}", file=sys.stderr)
+    return main, bundle
 
 
 def build_parser() -> argparse.ArgumentParser:

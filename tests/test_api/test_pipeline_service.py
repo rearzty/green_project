@@ -5,8 +5,6 @@ per-generation spacing override.
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from backend.app.db.models import Plan, Project
@@ -74,15 +72,22 @@ class TestFindReusablePlanWithSpacing:
 
 
 class TestDeletePlan:
-    """Only the is_current guard is unit-testable without a real DB session --
-    it's checked before delete_plan ever touches `session`, so this test
-    never opens one. The actual DELETE statements are exercised end-to-end
-    against a live Postgres in manual/browser verification, not here."""
-
     def test_refuses_to_delete_the_current_plan(self):
-        plan = _plan(is_current=True)
+        project = _project_with(_plan(is_current=True))
         with pytest.raises(CurrentPlanDeletionError):
-            asyncio.run(delete_plan(session=None, plan=plan))  # type: ignore[arg-type]
+            delete_plan(project, project.plans[0])
+
+    def test_removes_a_non_current_plan_from_the_project(self):
+        current = _plan(is_current=True)
+        current.id = "plan-current"
+        old = _plan(is_current=False)
+        old.id = "plan-old"
+        project = _project_with(current)
+        project.plans.append(old)
+
+        delete_plan(project, old)
+
+        assert [p.id for p in project.plans] == ["plan-current"]
 
 
 class TestEffectiveNorms:

@@ -5,7 +5,7 @@ import { Box, Loader2, Redo2, Shrub, SquareDashedMousePointer, Trash2, TreeDecid
 
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
-import type { PlanSummary, PlantingNorms, PlantingType, ScoringMode, ValidationViolation } from "@/lib/api";
+import type { ItemCompliance, PlanSummary, PlantingNorms, PlantingType, ScoringMode, ValidationViolation } from "@/lib/api";
 import { countLabel, OBJECT_FORMS, PLANTING_TYPE_FORMS, PLANTING_TYPE_LABELS } from "@/lib/format";
 import type { SelectionSummary } from "@/lib/hooks/useSelection";
 import { SEASON_LABELS, type LayerLegendEntry, type Season } from "@/lib/mapStyle";
@@ -125,6 +125,18 @@ export interface ControlPanelProps {
   /** null = not checked yet for the current plan. */
   violations: ValidationViolation[] | null;
   onFocusItem: (itemId: string) => void;
+
+  /** Normative justification for the single selected item ("Почему здесь?") --
+   * fetched in app/page.tsx whenever exactly one item is selected (see
+   * lib/api.ts::getItemsCompliance). undefined while loading/not applicable
+   * (more than one item selected, or none), an object once it resolves. This
+   * is the same geo_engine/compliance.py output the CLI already writes to its
+   * JSON report — the brief's traceability requirement, not a nicety. */
+  complianceForSelection?: ItemCompliance | null;
+  complianceLoading?: boolean;
+  /** Download the whole plan's justification as JSON/CSV -- the CLI's
+   * report.json/--csv, over HTTP. Undefined (no button) before a plan exists. */
+  onDownloadComplianceReport?: (format: "json" | "csv") => void;
 }
 
 function describeSelection(selection: SelectionSummary): string {
@@ -185,6 +197,9 @@ export function ControlPanel({
   validating,
   violations,
   onFocusItem,
+  complianceForSelection,
+  complianceLoading = false,
+  onDownloadComplianceReport,
 }: ControlPanelProps) {
   const [file, setFile] = useState<File | null>(null);
   const [name, setName] = useState("Тестовая территория");
@@ -287,13 +302,20 @@ export function ControlPanel({
         )}
         <input
           type="file"
-          accept=".dxf,.geojson,.json,.shp"
+          accept=".dxf,.dwg,.zip,.geojson,.json,.shp"
           onChange={(e) => setFile(e.target.files?.[0] ?? null)}
           className="text-sm text-stone-300 file:mr-3 file:cursor-pointer file:rounded-md file:border-0 file:bg-greenery-600 file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-white hover:file:bg-greenery-700"
         />
         <Button disabled={!file || busy} onClick={() => file && guarded(() => onUpload(file, name, sourceCrs))}>
           Загрузить
         </Button>
+        {/* .dwg -- один чертёж, конвертируется в DXF на бэкенде (LibreDWG/ODA).
+            .zip -- целая папка объекта (главный чертёж + Xrefs/), как её и
+            отдают реальные поставки -- граница участка на пилотных данных
+            лежит именно во внешних ссылках, не в главном файле. */}
+        <p className="text-xs text-stone-400">
+          .zip — вся папка объекта (чертёж + Xrefs/), .dwg — один чертёж. Оба конвертируются на сервере.
+        </p>
       </section>
 
       <section className="flex flex-col gap-2 border-t border-stone-700 pt-3">
@@ -458,6 +480,21 @@ export function ControlPanel({
                   <p className="font-medium text-stone-100">Выделено: {countLabel(selection.total, OBJECT_FORMS)}</p>
                   <p className="truncate text-stone-300">{describeSelection(selection)}</p>
                   {selection.single?.violation && <p className="text-red-400">Нарушен норматив отступа</p>}
+                  {selection.single && (
+                    <div className="mt-1.5 border-t border-stone-700 pt-1.5">
+                      <p className="font-medium text-stone-200">Почему здесь?</p>
+                      {complianceLoading ? (
+                        <p className="flex items-center gap-1 text-stone-400">
+                          <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+                          Считаю обоснование…
+                        </p>
+                      ) : complianceForSelection ? (
+                        <p className="whitespace-pre-wrap text-stone-300">{complianceForSelection.summary}</p>
+                      ) : (
+                        <p className="text-stone-500">Обоснование недоступно.</p>
+                      )}
+                    </div>
+                  )}
                 </>
               ) : (
                 <p className="text-stone-400">Ничего не выделено</p>
@@ -614,6 +651,33 @@ export function ControlPanel({
           {exporting && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" aria-hidden />}
           {exporting ? "Экспортируем…" : "Экспорт в DXF"}
         </Button>
+        {/* Полное обоснование по НПА для всего плана -- то же, что CLI пишет
+            в report.json/--csv (geo_engine/compliance.py), но по HTTP.
+            Обязательное требование ТЗ (ссылка на акт и пункт для каждой
+            посадки), не бонус — поэтому кнопка всегда рядом с экспортом, а
+            не спрятана. */}
+        <div className="flex gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={!hasPlan || !onDownloadComplianceReport}
+            className="flex-1"
+            onClick={() => onDownloadComplianceReport?.("json")}
+            title="Обоснование каждой посадки со ссылкой на акт и пункт (JSON)"
+          >
+            Обоснование (JSON)
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={!hasPlan || !onDownloadComplianceReport}
+            className="flex-1"
+            onClick={() => onDownloadComplianceReport?.("csv")}
+            title="То же самое построчно: посадка × норматив (CSV)"
+          >
+            Обоснование (CSV)
+          </Button>
+        </div>
       </section>
     </aside>
   );

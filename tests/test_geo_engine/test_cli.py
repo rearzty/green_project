@@ -170,3 +170,93 @@ def test_bundle_directory_input_picks_up_the_xrefs(tmp_path):
     assert exit_code == 0
     report = json.loads(out.with_suffix(".report.json").read_text(encoding="utf-8"))
     assert report["total_items"] > 0
+
+
+def test_bundle_directory_input_also_recognises_ссылки_as_the_xref_folder(tmp_path):
+    """Same shape as the Xrefs/ case above, but named the way the pilot
+    dataset actually names it on some streets ("1. Олимпийская деревня":
+    <id>_Генплан... - Standard/ссылки/) instead of others ("2. Песчаный
+    переулок": Xrefs/) -- both are real folder names in the delivery, neither
+    is a stand-in for testing."""
+    site = tmp_path / "site"
+    (site / "ссылки").mkdir(parents=True)
+
+    main_doc = ezdxf.new(setup=True)
+    main_doc.layers.add(name="Газопровод")
+    main_doc.modelspace().add_lwpolyline([(0, 45), (120, 45)], dxfattribs={"layer": "Газопровод"})
+    main_doc.saveas(str(site / "plan.dxf"))
+
+    xref = ezdxf.new(setup=True)
+    xref.layers.add(name="!Граница работ")
+    xref.modelspace().add_lwpolyline(
+        [(0, 0), (120, 0), (120, 90), (0, 90)], close=True, dxfattribs={"layer": "!Граница работ"}
+    )
+    xref.saveas(str(site / "ссылки" / "boundary.dxf"))
+
+    out = tmp_path / "plan.dxf"
+    exit_code = main(["--input", str(site), "--output", str(out), "--types", "tree"])
+
+    assert exit_code == 0
+    report = json.loads(out.with_suffix(".report.json").read_text(encoding="utf-8"))
+    assert report["total_items"] > 0
+
+
+def test_bundle_members_scattered_across_several_subfolders_are_all_picked_up(tmp_path):
+    """Live case: "1. Олимпийская деревня"'s project folder keeps utility
+    sheets under per-survey-order subfolders (3ДЖКХ-24_02565/,
+    3ДЖКХ-25_03117/, ...) next to ссылки/, not merged into either -- a fixed
+    Xrefs/ссылки-only check missed all of them and left the whole drawing
+    "unknown" (no boundary, no utilities). Bundle discovery has to walk the
+    whole project folder, not a fixed set of named subfolders."""
+    site = tmp_path / "site"
+    (site / "ссылки").mkdir(parents=True)
+    (site / "3ДЖКХ-25_00103").mkdir(parents=True)
+    (site / "PaxHeader").mkdir(parents=True)  # tar-extraction litter, must be skipped
+
+    main_doc = ezdxf.new(setup=True)
+    main_doc.layers.add(name="ДВ_ГП_П_МАФ")
+    main_doc.modelspace().add_lwpolyline([(0, 10), (10, 10)], dxfattribs={"layer": "ДВ_ГП_П_МАФ"})
+    main_doc.saveas(str(site / "plan.dxf"))
+
+    boundary = ezdxf.new(setup=True)
+    boundary.layers.add(name="!Граница работ")
+    boundary.modelspace().add_lwpolyline(
+        [(0, 0), (120, 0), (120, 90), (0, 90)], close=True, dxfattribs={"layer": "!Граница работ"}
+    )
+    boundary.saveas(str(site / "ссылки" / "boundary.dxf"))
+
+    utility = ezdxf.new(setup=True)
+    utility.layers.add(name="Газопровод")
+    utility.modelspace().add_lwpolyline([(0, 45), (120, 45)], dxfattribs={"layer": "Газопровод"})
+    utility.saveas(str(site / "3ДЖКХ-25_00103" / "output_1_up.dxf"))
+
+    litter = ezdxf.new(setup=True)
+    litter.saveas(str(site / "PaxHeader" / "stray.dxf"))
+
+    out = tmp_path / "plan.dxf"
+    exit_code = main(["--input", str(site), "--output", str(out), "--types", "tree"])
+
+    assert exit_code == 0
+    report = json.loads(out.with_suffix(".report.json").read_text(encoding="utf-8"))
+    # A tree needs a territory (from ссылки/) and gets a real gas_pipe
+    # citation (from 3ДЖКХ-25_00103/) only if both were actually read.
+    assert report["total_items"] > 0
+    assert any(check["object_type"] == "gas_pipe" for item in report["items"] for check in item["checks"])
+
+
+def test_an_umbrella_folder_with_no_drawing_at_its_own_level_names_its_subfolders(tmp_path):
+    """Live case: a street's top "Исходные данные" folder holds only
+    subfolders (permits, a dendrology survey, and the actual drawing set,
+    each one level down) -- zero .dxf/.dwg at that level is a real, common
+    shape, not a malformed upload. The error should point at the subfolders
+    instead of just saying nothing was found."""
+    umbrella = tmp_path / "Исходные данные"
+    (umbrella / "01 ирд").mkdir(parents=True)
+    (umbrella / "10000176_Генплан_Олимп - Standard").mkdir(parents=True)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--input", str(umbrella), "--output", str(tmp_path / "out.dxf")])
+
+    message = str(excinfo.value)
+    assert "01 ирд" in message
+    assert "10000176_Генплан_Олимп - Standard" in message

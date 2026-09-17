@@ -27,7 +27,11 @@ export interface LatLngBox {
   maxLng: number;
 }
 
-function extendWithCoordinates(box: LatLngBox, coordinates: unknown) {
+/** Recursively widens `box` to cover every [lng, lat] pair in a GeoJSON
+ * coordinates array, whatever its nesting depth (Point/LineString/Polygon/
+ * Multi*) -- exported for reuse by anything that needs a feature's bounding
+ * box, not just plan items (see MapView.tsx's VirtualizedLayers). */
+export function extendWithCoordinates(box: LatLngBox, coordinates: unknown) {
   if (!Array.isArray(coordinates) || coordinates.length === 0) return;
   if (typeof coordinates[0] === "number") {
     const [lng, lat] = coordinates as number[];
