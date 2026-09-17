@@ -104,6 +104,53 @@ def test_symbol_layer_insert_becomes_one_point_not_its_drawn_parts(tmp_path):
     assert greenery[0].geometry == Point(700, 14500)
 
 
+def test_insert_on_an_unmapped_layer_is_not_exploded(tmp_path):
+    """Found live on the pilot dataset: a telecom (MGTS) manhole/well block on
+    a layer nobody mapped exploded into hundreds of decorative
+    LINE/SPLINE/ELLIPSE/HATCH primitives that all resolve to
+    object_type="unknown" anyway -- pure parse-time cost, no effect on the
+    result. One INSERT with many primitives, on an unmapped layer, must
+    collapse to exactly one unknown zone, not one per primitive.
+
+    Uses a synthetic layer name, not the real "МГТС_ существ. ККС" one this
+    was found on -- layer_rules.classify_layer() (added by a parallel PR,
+    merged after this fix) actually recognizes that real name as a cable run
+    via its "существ"/"ККС" pattern, so it is no longer a genuinely unmapped
+    layer and correctly explodes now (see iter_entities's use_layer_rules
+    param). This test needs a layer neither the literal map nor the rules
+    ever classify, to keep testing the short-circuit itself.
+    """
+    unmapped_layer = "XYZ_random_layer_99"
+    doc = ezdxf.new(setup=True)
+    doc.layers.add(name=unmapped_layer)
+    symbol = doc.blocks.new(name="*U5")
+    for i in range(20):
+        symbol.add_line((i, 0), (i, 1), dxfattribs={"layer": unmapped_layer})
+    doc.modelspace().add_blockref("*U5", (10, 10), dxfattribs={"layer": unmapped_layer})
+
+    path = tmp_path / "well.dxf"
+    doc.saveas(str(path))
+
+    utilities, zones = read_dxf(path, layer_map=MOSGEOTREST_LAYER_MAP)
+
+    assert utilities == []
+    assert len(zones) == 1
+    assert zones[0].zone_type == "unknown"
+    assert zones[0].geometry == Point(10, 10)
+
+
+def test_insert_on_a_mapped_layer_still_explodes_fully(tmp_path):
+    """The optimisation above must not regress the exact bug it sits next to
+    (test_geometry_inside_nested_blocks_is_imported) -- a block on a real,
+    mapped utility layer still descends into its actual line geometry."""
+    path = _drawing_with_nested_block(tmp_path)
+
+    utilities, _ = read_dxf(path, layer_map=MOSGEOTREST_LAYER_MAP)
+
+    assert [u.object_type for u in utilities] == ["gas_pipe"]
+    assert isinstance(utilities[0].geometry, LineString)
+
+
 def test_symbol_layers_are_a_subset_of_what_the_map_knows_about():
     """Not every symbol layer needs a mapping, but a symbol layer that *is*
     mapped must stay mapped — otherwise its objects quietly become "unknown".
