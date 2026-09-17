@@ -15,11 +15,18 @@ import zlib
 from collections.abc import Callable, Collection
 
 from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
 
 from geo_engine.buffers import build_exclusion_zone, buildable_area
 from geo_engine.candidates import generate_candidates
 from geo_engine.model import PlantingItem, Utility, Zone
 from geo_engine.norms import PlantingNorms
+from geo_engine.patterns import (
+    ROW_PLANTING_TYPES,
+    collect_row_guides,
+    row_candidates,
+    territory_guide,
+)
 from geo_engine.placement import greedy_select
 from geo_engine.species import Species, SpeciesCatalogue, load_catalogue
 
@@ -32,6 +39,18 @@ from geo_engine.species import Species, SpeciesCatalogue, load_catalogue
 # 1,0 до 3,0 м. Групповая посадка кустарника — отдельная задача, пока не
 # реализована, и до тех пор интервал кустарника берётся из planting_norms.yaml.
 CROWN_SPACING_TYPES = ("tree",)
+
+# Как расставлять посадки. "auto" — ряд вдоль линейных ориентиров плюс россыпь
+# в оставшейся площади; так выглядит настоящий проект: аллея вдоль проезда и
+# свободные группы во дворе. "scatter" — только россыпь, прежнее поведение,
+# оставлено как способ воспроизвести старый результат и как запасной путь для
+# площадок без единого линейного ориентира.
+PLACEMENT_PATTERNS = ("auto", "scatter", "row")
+
+# По этой приставке в rationale CLI и отчёт отличают рядовую посадку от
+# россыпи. Обоснование выбора места у них разное, и смешивать их в отчёте
+# значило бы потерять единственный признак, по которому видно схему.
+ROW_RATIONALE_PREFIX = "Рядовая посадка вдоль линейного ориентира."
 
 
 def choose_species(
@@ -95,6 +114,7 @@ def plan_items(
     norms: PlantingNorms,
     keep_spacing_for: Collection[str] = (),
     species_overrides: dict[str, str] | None = None,
+    pattern: str = "auto",
     catalogue: SpeciesCatalogue | None = None,
 ) -> list[PlantingItem]:
     """Сгенерировать посадки для одного плана.
@@ -115,6 +135,14 @@ def plan_items(
     должен подменяться выведенным из класса кроны. Без этого параметра
     пользовательская настройка молча терялась бы: и она, и породное правило
     приходят в одну и ту же `min_distance_m`, и снаружи их уже не различить.
+
+    `pattern` — схема расстановки: "auto" (ряд вдоль линейных ориентиров плюс
+    россыпь в остатке), "scatter" (только россыпь, прежнее поведение) или "row"
+    (только ряды). Россыпь сама по себе нормативам не противоречит, но
+    настоящим проектом не является: получается блу-нойз, который просто нигде
+    не нарушает отступы. Сами акты описывают именно типы посадки — однорядную,
+    двухрядную, групповую (743-ПП табл. 3.6.2; МГСН 1.02-02 п. 4.2.9.2), см.
+    geo_engine/patterns.py.
 
     `species_overrides` — явно выбранная пользователем порода по типу посадки.
     Без неё порода выводится из `plan_key` детерминированно, но произвольно: от
@@ -142,11 +170,46 @@ def plan_items(
         )
         margin = type_norms.territory_margin_for(planting_type)
         buildable = buildable_area(territory, exclusion, zones, territory_margin_m=margin)
-        seed = zlib.crc32(f"{plan_key}:{planting_type}".encode())
-        candidates = generate_candidates(
-            buildable, exclusion, planting_type, type_norms, zoning_zones=zones, seed=seed
-        )
-        selected = greedy_select(candidates, score_fn, type_norms)
+        spacing = type_norms.spacing_for(planting_type)
+
+        selected: list[PlantingItem] = []
+        remaining = buildable
+
+        wants_rows = pattern in ("auto", "row") and planting_type in ROW_PLANTING_TYPES
+        if wants_rows:
+            guides = collect_row_guides(
+                zones, planting_type, type_norms, species, catalogue.crown_reference_diameter_m
+            )
+            boundary_guide = territory_guide(territory, planting_type, type_norms)
+            if boundary_guide is not None:
+                guides.append(boundary_guide)
+
+            rows = row_candidates(
+                guides, buildable, exclusion, planting_type, spacing.min_distance_m, zoning_zones=zones
+            )
+            row_items = greedy_select(rows, score_fn, type_norms)
+            for item in row_items:
+                # Пометка идёт в rationale, а не в новое поле PlantingItem:
+                # поле пришлось бы протаскивать через строки БД и миграцию ради
+                # сведения, которое нужно отчёту и CLI, а не доменной модели.
+                item.rationale = f"{ROW_RATIONALE_PREFIX} {item.rationale}"
+            selected.extend(row_items)
+            # Из площади под россыпь вычитаются кроны уже поставленного ряда.
+            # Без этого второй проход greedy_select ничего не знает о первом и
+            # насыпал бы точки поверх аллеи: у каждого прохода свой
+            # пространственный индекс, общей памяти между ними нет.
+            if row_items:
+                taken = unary_union(
+                    [item.geometry.buffer(spacing.canopy_radius_m) for item in row_items]
+                )
+                remaining = buildable.difference(taken)
+
+        if pattern != "row" and not remaining.is_empty:
+            seed = zlib.crc32(f"{plan_key}:{planting_type}".encode())
+            scattered = generate_candidates(
+                remaining, exclusion, planting_type, type_norms, zoning_zones=zones, seed=seed
+            )
+            selected.extend(greedy_select(scattered, score_fn, type_norms))
 
         if species is not None:
             for item in selected:
