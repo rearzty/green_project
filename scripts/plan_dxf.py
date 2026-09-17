@@ -22,11 +22,18 @@ from collections import Counter
 from pathlib import Path
 
 from geo_engine.compliance import explain_items, report_payload, unverified_sources, write_trace_csv
-from geo_engine.io.dxf_reader import COMBINED_LAYER_MAP, BundleResolutionError, read_dxf_bundle, resolve_bundle_inputs
+from geo_engine.io.dwg_convert import available_backend, convert_dwg_to_dxf
+from geo_engine.io.dxf_reader import (
+    COMBINED_LAYER_MAP,
+    _looks_like_xref_dir,
+    dxf_bundle_paths,
+    read_document,
+    read_dxf_bundle,
+)
 from geo_engine.io.dxf_writer import RESULT_LAYER_PREFIX, write_dxf
 from geo_engine.norms import load_norms
-from geo_engine.planner import plan_items
-from geo_engine.species import load_species  # noqa: F401  (ensures the species YAML is present early)
+from geo_engine.planner import CROWN_SPACING_TYPES, plan_items
+from geo_engine.species import load_catalogue
 from geo_engine.territory import MissingTerritoryError, territory_polygon
 from ml_scoring.heuristic_scorer import HeuristicScorer
 from ml_scoring.ml_scorer import MLScorer, ModelNotTrainedError
@@ -34,21 +41,93 @@ from ml_scoring.ml_scorer import MLScorer, ModelNotTrainedError
 PLANTING_TYPES = ("tree", "shrub", "lawn")
 
 
+def _convert_if_needed(path: Path, workdir: Path) -> Path:
+    if path.suffix.lower() != ".dwg":
+        return path
+    if available_backend() is None:
+        raise SystemExit(
+            f"Файл {path.name} в формате DWG, но конвертер не найден на PATH.\n"
+            "Установите LibreDWG (brew install libredwg, либо сборка из исходников — "
+            "рецепт в geo_engine/io/dwg_convert.py) или ODA File Converter."
+        )
+    return convert_dwg_to_dxf(path, workdir)
+
+
 def resolve_inputs(source: Path, workdir: Path) -> tuple[Path, list[Path]]:
     """(главный чертёж, все файлы бандла) — с конвертацией DWG при необходимости.
 
-    Тонкая CLI-обёртка над geo_engine.io.dxf_reader.resolve_bundle_inputs (тот
-    же код использует и веб-загрузка, см. project_service.py) — переводит
-    BundleResolutionError в SystemExit и печатает предупреждения о
-    пропущенных файлах, как раньше.
+    Каталог разбирается так же, как устроены реальные поставки: чертежи в корне
+    каталога — главные, всё из Xrefs/ — внешние ссылки к ним.
     """
-    try:
-        main, bundle, warnings = resolve_bundle_inputs(source, workdir)
-    except BundleResolutionError as error:
-        raise SystemExit(str(error)) from error
-    for warning in warnings:
-        print(f"  ! {warning}", file=sys.stderr)
-    return main, bundle
+    if source.is_dir():
+        mains = sorted(p for p in source.iterdir() if p.suffix.lower() in (".dxf", ".dwg"))
+        if not mains:
+            raise SystemExit(f"В каталоге {source} нет ни одного .dxf/.dwg файла.")
+        # Самый крупный файл в корне — почти всегда и есть главный чертёж, а не
+        # вспомогательная врезка; выбор всё равно влияет только на то, в копию
+        # какого документа пишется результат.
+        main = max(mains, key=lambda p: p.stat().st_size)
+        # Папка внешних ссылок называется по-разному у каждого бюро
+        # (`Xrefs`, `00_Ссылки`, `Внешние ссылки`, `xref_ИТП`) — берутся все
+        # подходящие, см. dxf_reader.XREF_DIR_MARKERS.
+        xrefs = []
+        for xref_dir in sorted(p for p in source.iterdir() if p.is_dir() and _looks_like_xref_dir(p.name)):
+            xrefs.extend(sorted(p for p in xref_dir.iterdir() if p.suffix.lower() in (".dxf", ".dwg")))
+        converted_main = _convert_if_needed(main, workdir)
+        converted = [converted_main]
+        for path in xrefs:
+            try:
+                converted.append(_convert_if_needed(path, workdir))
+            except RuntimeError as error:
+                # Один нечитаемый xref не должен валить весь прогон — но и молча
+                # пропасть он не должен, иначе потерянная граница участка
+                # выглядит как отсутствующая.
+                print(f"  ! пропущен {path.name}: {error}", file=sys.stderr)
+        return converted_main, converted
+
+    converted = _convert_if_needed(source, workdir)
+    if source.suffix.lower() == ".dwg":
+        # У сконвертированного файла нет соседней Xrefs/ — берём её у оригинала.
+        siblings = dxf_bundle_paths(source)
+        bundle = [converted]
+        for path in siblings[1:]:
+            try:
+                bundle.append(_convert_if_needed(path, workdir))
+            except RuntimeError as error:
+                print(f"  ! пропущен {path.name}: {error}", file=sys.stderr)
+        return converted, bundle
+    return converted, dxf_bundle_paths(converted)
+
+
+def pick_base_drawing(candidates: list[Path]) -> Path | None:
+    """Самый крупный чертёж, который реально открывается.
+
+    Исходник нужен только как холст: результат пишется в его копию отдельным
+    слоем, чтобы эксперт открыл файл и увидел свою подоснову с включаемым
+    слоем плана. Значит подойдёт любой читаемый файл бандла, и незачем терять
+    весь прогон из-за того, что самый большой повреждён.
+
+    Случай не гипотетический: на Измайловской площади главный чертёж (76 МБ)
+    не открывается ни `readfile`, ни `recover` ни в одном режиме обработки
+    ошибок — внутри испорченная юникод-escape-последовательность вида
+    "backslash-U-plus", на которой падает декодер ezdxf. Остальные файлы бандла при этом читаются, и план по
+    ним строится полностью.
+    """
+    best, best_count = None, -1
+    for path in sorted(set(candidates), key=lambda p: p.stat().st_size, reverse=True):
+        try:
+            doc = read_document(path)
+        except Exception as error:  # noqa: BLE001 — годится любой открывающийся
+            print(f"  ! как основу не использовать {path.name}: {type(error).__name__}", file=sys.stderr)
+            continue
+        # Не первый открывшийся, а самый содержательный: у бандла бывают
+        # файлы-заглушки в пару объектов, и копия такой заглушки со слоем
+        # результата формально проходит, но эксперт открывает её и не видит
+        # своей подосновы — ровно то, ради чего результат и пишется поверх.
+        count = sum(1 for _ in doc.modelspace())
+        if count > best_count:
+            best, best_count = path, count
+    return best
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,8 +135,10 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m scripts.plan_dxf",
         description="Генерация плана озеленения из чертежа: DXF/DWG -> DXF с результатом на отдельном слое + отчёт с обоснованиями по НПА.",
     )
-    parser.add_argument("--input", required=True, type=Path, help="Чертёж (.dxf/.dwg) или каталог с чертежом и Xrefs/")
-    parser.add_argument("--output", required=True, type=Path, help="Куда записать итоговый DXF")
+    # Не required: --list-species печатает каталог и выходит, требовать при
+    # этом чертёж было бы бессмысленно. Проверяются вручную ниже.
+    parser.add_argument("--input", type=Path, help="Чертёж (.dxf/.dwg) или каталог с чертежом и Xrefs/")
+    parser.add_argument("--output", type=Path, help="Куда записать итоговый DXF")
     parser.add_argument("--report", type=Path, help="Куда записать JSON-отчёт (по умолчанию — рядом с --output)")
     parser.add_argument(
         "--csv",
@@ -77,21 +158,81 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shrub-spacing", type=float, help="Интервал между кустами, м")
     parser.add_argument("--prefix", default=RESULT_LAYER_PREFIX, help="Префикс слоёв результата")
     parser.add_argument("--plan-key", default="cli", help="Ключ детерминированной расстановки (одинаковый ключ -> тот же план)")
+    parser.add_argument(
+        "--species",
+        action="append",
+        metavar="ТИП=ПОРОДА",
+        help="Задать породу явно, например --species tree=«Липа мелколистная». "
+        "Без этого порода выбирается детерминированно по --plan-key. "
+        "Породу видно в выводе; список — в geo_engine/config/species.yaml",
+    )
+    parser.add_argument("--list-species", action="store_true", help="Показать доступные породы и выйти")
     return parser
+
+
+def _parse_species_overrides(raw: list[str] | None) -> dict[str, str]:
+    """`--species tree=Липа` -> {"tree": "Липа"}. Имя сверяется с каталогом.
+
+    Сверка здесь, а не внутри planner: опечатка в названии породы иначе просто
+    не нашлась бы в каталоге и молча откатилась к автоматическому выбору, и
+    пользователь получил бы не ту породу, которую просил, без единого слова.
+    """
+    overrides: dict[str, str] = {}
+    catalogue = load_catalogue()
+    for entry in raw or []:
+        planting_type, _, name = entry.partition("=")
+        planting_type, name = planting_type.strip(), name.strip().strip("«»\"'")
+        if not name:
+            raise SystemExit(f"Ожидалось ТИП=ПОРОДА, получено: {entry!r}")
+        # Перечень проверяется ПЕРВЫМ, до наличия в каталоге: инвазивных видов
+        # в каталоге и нет, и сообщение «не найдена» скрыло бы настоящую
+        # причину — именно так выглядели бы «Дёрен белый» и «Пузыреплодник»,
+        # которые сервис предлагал до сверки с 369-ПП.
+        invasive = catalogue.is_invasive(name)
+        if invasive is not None:
+            raise SystemExit(
+                f"Порода «{name}» внесена в перечень инвазивных видов "
+                f"(369-ПП от 03.03.2026, приложение 1, группа {invasive.group}) "
+                f"и не может быть предложена к посадке."
+            )
+        if catalogue.get(name) is None:
+            available = ", ".join(catalogue.names_for_type(planting_type)) or "нет пород для этого типа"
+            raise SystemExit(f"Порода «{name}» не найдена в каталоге. Доступны для {planting_type}: {available}")
+        overrides[planting_type] = name
+    return overrides
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.list_species:
+        catalogue = load_catalogue()
+        for planting_type in ("tree", "shrub"):
+            print(f"{planting_type}:")
+            for species in catalogue.for_type(planting_type):
+                spacing = catalogue.spacing_for_crown(species.crown)
+                # Интервал по классу кроны применяется только к деревьям —
+                # у кустарника нормативные значения относятся к групповой
+                # посадке, которой генератор пока не умеет (см. planner.py).
+                interval = f"{spacing} м" if planting_type in CROWN_SPACING_TYPES else "интервал из planting_norms.yaml"
+                print(f"   «{species.name}» — крона {species.crown}, {interval}, диаметр {species.crown_diameter_m} м")
+        return 0
+    missing = [flag for flag, value in (("--input", args.input), ("--output", args.output)) if value is None]
+    if missing:
+        raise SystemExit(f"Не заданы обязательные аргументы: {', '.join(missing)}")
+    species_overrides = _parse_species_overrides(args.species)
     planting_types = [t.strip() for t in args.types.split(",") if t.strip()]
     unknown = [t for t in planting_types if t not in PLANTING_TYPES]
     if unknown:
         raise SystemExit(f"Неизвестные типы посадок: {', '.join(unknown)}. Допустимы: {', '.join(PLANTING_TYPES)}")
 
     norms = load_norms()
+    keep_spacing_for = []
     if args.tree_spacing:
         norms = norms.with_spacing_override("tree", args.tree_spacing)
+        keep_spacing_for.append("tree")
     if args.shrub_spacing:
         norms = norms.with_spacing_override("shrub", args.shrub_spacing)
+        keep_spacing_for.append("shrub")
 
     with tempfile.TemporaryDirectory(prefix="greenplan-") as tmp:
         workdir = Path(tmp)
@@ -120,9 +261,34 @@ def main(argv: list[str] | None = None) -> int:
             scorer = HeuristicScorer(norms, existing_greenery=existing_greenery)
 
         print(f"3/5 Генерация ({args.scoring}, типы: {', '.join(planting_types)})...")
-        items = plan_items(args.plan_key, utilities, zones, territory, planting_types, scorer.as_score_fn(), norms)
+        items = plan_items(
+            args.plan_key,
+            utilities,
+            zones,
+            territory,
+            planting_types,
+            scorer.as_score_fn(),
+            norms,
+            keep_spacing_for=keep_spacing_for,
+            species_overrides=species_overrides,
+        )
         counts = Counter(i.planting_type for i in items)
         print(f"     посадок: {len(items)} ({', '.join(f'{k}: {v}' for k, v in counts.most_common())})")
+        catalogue = load_catalogue()
+        chosen = {i.planting_type: i.species for i in items}
+        for planting_type, species_name in sorted(chosen.items()):
+            picked = catalogue.get(species_name)
+            if picked is None:
+                continue
+            if planting_type in keep_spacing_for:
+                note = "интервал задан вручную"
+            elif planting_type in CROWN_SPACING_TYPES:
+                note = f"интервал {catalogue.spacing_for_crown(picked.crown)} м по классу кроны (МГСН 1.02-02 п. 4.2.9.2)"
+            else:
+                # Для кустарника нормативные 0,3-1,0 м относятся к групповой
+                # посадке, а не к россыпи — см. planner.CROWN_SPACING_TYPES.
+                note = f"интервал {norms.spacing_for(planting_type).min_distance_m} м из planting_norms.yaml"
+            print(f"     {planting_type}: «{species_name}» (крона {picked.crown}, {note})")
 
         print("4/5 Проверка нормативных отступов и сборка обоснований...")
         records = explain_items(items, utilities, zones, norms)
@@ -133,7 +299,14 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"5/5 Запись результата на слои {args.prefix}$*")
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        write_dxf(items, args.output, base_dxf=main_drawing, records=records, prefix=args.prefix)
+        base = pick_base_drawing([main_drawing, *bundle])
+        if base is None:
+            raise SystemExit(
+                "\nОШИБКА: ни один чертёж бандла не открывается — не в копию чего писать результат."
+            )
+        if base != main_drawing:
+            print(f"     основа: {base.name} (главный чертёж не читается)")
+        write_dxf(items, args.output, base_dxf=base, records=records, prefix=args.prefix)
 
     report_path = args.report or args.output.with_suffix(".report.json")
     unverified = unverified_sources(records)

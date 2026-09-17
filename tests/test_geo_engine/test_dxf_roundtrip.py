@@ -139,4 +139,4 @@ def test_justification_travels_with_the_entity_as_xdata(tmp_path):
     xdata = circle.get_xdata(RESULT_LAYER_PREFIX)
     text = "".join(value for code, value in xdata if code == 1000)
 
-    assert "СП 42.13330.2016" in text
+    assert "743-ПП" in text or "СП 42.13330.2016" in text

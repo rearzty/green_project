@@ -31,6 +31,7 @@ from shapely.strtree import STRtree
 
 from geo_engine.model import PlantingItem, Utility, Zone
 from geo_engine.norms import PlantingNorms
+from geo_engine.species import SpeciesCatalogue, load_catalogue
 
 # Zone types that impose a setback the same way a utility does. Hard obstacles
 # (buildings, roads) are already subtracted by buffers.buildable_area, but the
@@ -53,6 +54,7 @@ class ConstraintCheck:
     actual_m: float
     satisfied: bool
     source_id: str
+    species_rule: str
     act: str
     clause: str
     citation: str
@@ -125,6 +127,7 @@ def explain_items(
     utilities: list[Utility],
     zones: list[Zone],
     norms: PlantingNorms,
+    catalogue: SpeciesCatalogue | None = None,
 ) -> list[ComplianceRecord]:
     """Build a citable justification for every item.
 
@@ -137,6 +140,7 @@ def explain_items(
     if not items:
         return []
 
+    catalogue = catalogue or load_catalogue()
     groups = _constraint_groups(utilities, zones)
     geometries = [item.geometry for item in items]
 
@@ -156,11 +160,21 @@ def explain_items(
     records: list[ComplianceRecord] = []
     for index, item in enumerate(items):
         checks: list[ConstraintCheck] = []
+        species = catalogue.get(item.species)
         for object_type in sorted(groups):
-            required = norms.setback_for(object_type, item.planting_type)
+            # Не norms.setback_for(): после сверки с московскими актами
+            # требуемый отступ перестал быть одним числом из таблицы — поверх
+            # неё ложатся поимённые правила по породе, и цитировать надо то
+            # правило, которое реально определило расстояние.
+            resolution = norms.resolve_setback(
+                object_type,
+                item.planting_type,
+                species,
+                catalogue.crown_reference_diameter_m,
+            )
             actual = distances[object_type][index]
-            found = norms.source_for(object_type, item.planting_type)
-            if found is None:
+            source = norms.sources.get(resolution.source_id)
+            if source is None:
                 # setback_for fell back to its fail-large default: say so instead
                 # of implying an act demanded it.
                 source_id = UNMAPPED_SOURCE_ID
@@ -170,16 +184,22 @@ def explain_items(
                 row = ""
                 verified = False
             else:
-                source, row = found
-                source_id = norms.setback_sources[object_type][item.planting_type].source
-                source_act, clause, citation, verified = source.act, source.clause, source.citation(), source.verified
+                source_id = resolution.source_id
+                row = resolution.row
+                source_act, clause, citation, verified = (
+                    source.act,
+                    source.clause,
+                    source.citation(),
+                    source.verified,
+                )
             checks.append(
                 ConstraintCheck(
                     object_type=object_type,
-                    required_m=required,
+                    required_m=resolution.required_m,
                     actual_m=actual,
-                    satisfied=actual + _TOLERANCE_M >= required,
+                    satisfied=actual + _TOLERANCE_M >= resolution.required_m,
                     source_id=source_id,
+                    species_rule=resolution.species_rule,
                     act=source_act,
                     clause=clause,
                     citation=citation,
@@ -214,6 +234,7 @@ def _record(index: int, item: PlantingItem, checks: list[ConstraintCheck]) -> Co
                 f"требуется {binding.required_m:.2f} м, фактически {binding.actual_m:.2f} м "
                 f"(запас {slack:.2f} м). Основание: {binding.citation}"
                 + (f", строка таблицы: «{binding.table_row}»" if binding.table_row else "")
+                + (f". Поправка по породе: {binding.species_rule}" if binding.species_rule else "")
                 + "."
             )
     else:
@@ -224,6 +245,7 @@ def _record(index: int, item: PlantingItem, checks: list[ConstraintCheck]) -> Co
             f"требуется {worst.required_m:.2f} м, фактически {worst.actual_m:.2f} м. "
             f"Основание: {worst.citation}"
             + (f", строка таблицы: «{worst.table_row}»" if worst.table_row else "")
+            + (f". Поправка по породе: {worst.species_rule}" if worst.species_rule else "")
             + "."
         )
 
@@ -314,6 +336,7 @@ def report_payload(records: list[ComplianceRecord], norms: PlantingNorms, **meta
                         "actual_m": round(check.actual_m, 3),
                         "satisfied": check.satisfied,
                         "source": check.source_id,
+                        **({"species_rule": check.species_rule} if check.species_rule else {}),
                     }
                     for check in record.checks
                 ],
@@ -348,6 +371,7 @@ TRACE_CSV_COLUMNS = [
     "act",
     "clause",
     "verified",
+    "species_rule",
     "table_row",
 ]
 
@@ -384,6 +408,7 @@ def write_trace_csv(records: list[ComplianceRecord], path: str | Path) -> int:
                         "act": check.act,
                         "clause": check.clause,
                         "verified": int(check.verified),
+                        "species_rule": check.species_rule,
                         "table_row": check.table_row,
                     }
                 )
