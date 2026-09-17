@@ -243,6 +243,7 @@ def iter_entities(
     explode_blocks: bool = True,
     symbol_layers: frozenset[str] | None = None,
     layer_map: LayerMap | None = None,
+    use_layer_rules: bool = False,
 ) -> Iterator:
     """Yield drawable entities, descending into block references.
 
@@ -269,6 +270,14 @@ def iter_entities(
     own layer *is* mapped (e.g. every "Газопровод" run, itself INSERT-wrapped
     by MicroStation) still explodes exactly as before -- this only short-
     circuits blocks reachable from a layer nothing in the map claims at all.
+
+    `use_layer_rules`, when true, extends "claims" to layer_rules's pattern
+    match too -- found live after layer_rules.py landed: a layer like "МГТС_
+    существ. ККС" isn't in any literal layer_map, but classify_layer() still
+    recognizes it (as a cable run) via its name pattern, so skipping the
+    explosion would collapse a real utility down to a single insertion point
+    instead of its true geometry. Only genuinely unclassifiable layers (map
+    silent AND rules silent) short-circuit when this is on.
     """
     symbol_layers = SYMBOL_LAYERS if symbol_layers is None else symbol_layers
 
@@ -282,8 +291,9 @@ def iter_entities(
                 yield entity
                 continue
             if layer_map is not None and layer not in layer_map:
-                yield entity
-                continue
+                if not use_layer_rules or classify_layer(layer) is None:
+                    yield entity
+                    continue
             if not explode_blocks or depth >= _MAX_BLOCK_DEPTH:
                 continue
             try:
@@ -591,7 +601,13 @@ def read_dxf(
     utilities: list[Utility] = []
     zones: list[Zone] = []
 
-    for entity in iter_entities(msp, explode_blocks=explode_blocks, symbol_layers=symbol_layers, layer_map=layer_map):
+    for entity in iter_entities(
+        msp,
+        explode_blocks=explode_blocks,
+        symbol_layers=symbol_layers,
+        layer_map=layer_map,
+        use_layer_rules=use_layer_rules,
+    ):
         geometry = _entity_to_geometry(entity)
         if geometry is None or geometry.is_empty:
             continue

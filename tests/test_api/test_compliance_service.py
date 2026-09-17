@@ -69,7 +69,10 @@ class TestExplainItemsById:
         [(_, record)] = explain_items_by_id(plan.project, plan, ["tree-far"], norms)
 
         assert record.compliant
-        assert "СП 42.13330.2016" in record.summary
+        # "Клён остролистный" -- широкая крона (8м > 5м) -- триггерит
+        # увеличивающую поправку по примечанию 1 (743-ПП), поэтому именно
+        # он, а не СП 42.13330.2016, становится определяющим основанием.
+        assert "743-ПП" in record.summary
 
     def test_a_planting_too_close_to_the_gas_pipe_is_a_violation(self):
         plan = _plan_with_gas_pipe_and_two_trees()
