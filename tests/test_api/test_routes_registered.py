@@ -45,3 +45,9 @@ def test_expected_routes_are_registered():
     assert "/api/projects/{project_id}/plans/{plan_id}/export-dxf/{job_id}/download" in paths
     assert "/api/config/planting-norms" in paths
     assert "/api/projects/{project_id}/assistant/message" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/compliance/items" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/compliance-report.json" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/compliance-report.csv" in paths
+    assert "/api/projects/{project_id}/layers" in paths
+    assert "/api/projects/{project_id}/layers-raster" in paths
+    assert "/api/projects/{project_id}/layers-raster/image" in paths

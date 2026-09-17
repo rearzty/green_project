@@ -24,9 +24,19 @@ import { usePlanEdits } from "@/lib/hooks/usePlanEdits";
 import { useProjectSession } from "@/lib/hooks/useProjectSession";
 import { useSelection } from "@/lib/hooks/useSelection";
 import { AssistantChat } from "@/components/AssistantChat";
-import { getPlantingNorms, type PlantingNorms, type PlantingType, type ScoringMode } from "@/lib/api";
+import {
+  complianceReportUrl,
+  getItemsCompliance,
+  getPlantingNorms,
+  getProjectLayers,
+  type GeoJSONFeatureCollection,
+  type ItemCompliance,
+  type PlantingNorms,
+  type PlantingType,
+  type ScoringMode,
+} from "@/lib/api";
 import { countLabel, OBJECT_FORMS } from "@/lib/format";
-import { buildLayerLegend, type Season } from "@/lib/mapStyle";
+import type { Season } from "@/lib/mapStyle";
 import { errorMessage, toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
@@ -37,12 +47,36 @@ const ThreeDView = dynamic(() => import("@/components/ThreeDView"), { ssr: false
 
 export default function Home() {
   const session = useProjectSession();
-  const { project, plan, plans, planRevision, planIndex } = session;
+  const { project, layersRaster, plan, plans, planRevision, planIndex } = session;
 
   const [hiddenLayerTypes, setHiddenLayerTypes] = useState<Set<string>>(new Set());
   const [showPlan, setShowPlan] = useState(true);
   const [view3d, setView3d] = useState(false);
   const [season, setSeason] = useState<Season>("summer");
+  // ThreeDView is the only remaining consumer of the full vector layer
+  // geometry (its building extrusion needs real polygons, not a raster) --
+  // fetched lazily on the first toggle into 3D rather than unconditionally
+  // on every project open, which is what ProjectOut used to do (see its
+  // docstring: 170MB/60s+ on a real 371K-layer project). Keyed by project id
+  // so switching projects re-fetches and switching back to 2D just hides
+  // the view without discarding what's already loaded.
+  const [layers3d, setLayers3d] = useState<{ projectId: string; layers: GeoJSONFeatureCollection } | undefined>(undefined);
+
+  useEffect(() => {
+    if (!view3d || !project) return;
+    if (layers3d?.projectId === project.id) return;
+    let cancelled = false;
+    getProjectLayers(project.id)
+      .then((layers) => {
+        if (!cancelled) setLayers3d({ projectId: project.id, layers });
+      })
+      .catch((error) => {
+        if (!cancelled) toast.error(errorMessage(error));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [view3d, project, layers3d?.projectId]);
   // Lifted out of ControlPanel (used to be its own local state) so
   // AssistantChat can read and change the same generation recipe Юна talks
   // about -- see ControlPanel.tsx's own comment on why this moved.
@@ -79,7 +113,13 @@ export default function Home() {
     };
   }, []);
 
-  const layerLegend = useMemo(() => buildLayerLegend(project?.layers), [project]);
+  // Sourced from the raster endpoint's own grouping now, not recomputed from
+  // project.layers on the client -- layer_raster.py already walks every
+  // layer once to build the same key/label/color/count, and project.layers
+  // itself can be hundreds of thousands of features (see MapView's backdrop
+  // switch below); redoing that walk here on every project load for a
+  // number the backend already has was pure waste.
+  const layerLegend = layersRaster?.groups ?? [];
 
   function handleToggleLayerType(key: string) {
     setHiddenLayerTypes((prev) => {
@@ -100,6 +140,46 @@ export default function Home() {
     selection.setSelection(ids)
   );
   const selection = useSelection(planIndex, planRevision, editing.violationIds);
+
+  // Обоснование ("Почему здесь?", ControlPanel.tsx) -- только для ровно одной
+  // выделенной точки: geo_engine.compliance.explain_items не зависит от
+  // остальных посадок, так что запрашивать его для группы бессмысленно (что
+  // показывать -- обоснование какой из них?). Тот же id, что уже выделен на
+  // карте -- не отдельный источник правды.
+  const [complianceForSelection, setComplianceForSelection] = useState<ItemCompliance | null>(null);
+  const [complianceLoading, setComplianceLoading] = useState(false);
+  const singleSelectedId = selection.selectedIds.size === 1 ? [...selection.selectedIds][0] : undefined;
+
+  useEffect(() => {
+    if (!project || !plan || !singleSelectedId) {
+      setComplianceForSelection(null);
+      return;
+    }
+    let cancelled = false;
+    setComplianceLoading(true);
+    getItemsCompliance(project.id, plan.plan_id, [singleSelectedId])
+      .then((items) => {
+        if (!cancelled) setComplianceForSelection(items[0] ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setComplianceForSelection(null);
+      })
+      .finally(() => {
+        if (!cancelled) setComplianceLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [project, plan, singleSelectedId]);
+
+  function handleDownloadComplianceReport(format: "json" | "csv") {
+    if (!project || !plan) return;
+    const link = document.createElement("a");
+    link.href = complianceReportUrl(project.id, plan.plan_id, format);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
 
   function toggleView3d() {
     // Turning it off is always allowed, same reasoning as toggleSelectMode
@@ -262,6 +342,7 @@ export default function Home() {
           onShrubSpacingMChange={setShrubSpacingM}
           plantingNorms={plantingNorms}
           onExportDxf={session.handleExportDxf}
+          onDownloadComplianceReport={handleDownloadComplianceReport}
           onClearAll={session.handleClearAll}
           layerLegend={layerLegend}
           hiddenLayerTypes={hiddenLayerTypes}
@@ -291,6 +372,8 @@ export default function Home() {
           validating={editing.validating}
           violations={editing.violations}
           onFocusItem={selection.focusItem}
+          complianceForSelection={complianceForSelection}
+          complianceLoading={complianceLoading}
         />
       </div>
       {sidebarOpen && (
@@ -313,10 +396,15 @@ export default function Home() {
       </button>
       <div className="relative min-w-0 flex-1">
         {view3d ? (
-          <ThreeDView layers={project?.layers} plan={plan?.features} season={season} storageKey={project?.id} />
+          <ThreeDView
+            layers={layers3d?.projectId === project?.id ? layers3d?.layers : undefined}
+            plan={plan?.features}
+            season={season}
+            storageKey={project?.id}
+          />
         ) : (
           <MapView
-            layers={project?.layers}
+            layersRaster={layersRaster}
             plan={plan?.features}
             planIndex={planIndex}
             layersKey={project?.id}

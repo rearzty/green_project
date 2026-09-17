@@ -12,7 +12,7 @@ from shapely.geometry.base import BaseGeometry
 
 from geo_engine.model import PlantingCandidate
 from geo_engine.norms import PlantingNorms
-from ml_scoring.features import compute_features
+from ml_scoring.features import build_existing_greenery_index, compute_features
 from ml_scoring.scoring_strategy import ScoringStrategy
 
 DEFAULT_WEIGHTS = {
@@ -42,9 +42,14 @@ class HeuristicScorer(ScoringStrategy):
         self.norms = norms
         self.weights = weights or DEFAULT_WEIGHTS
         self.existing_greenery = existing_greenery or []
+        # Built once per scorer instance -- see compute_features._existing_greenery_gap's
+        # docstring for the real-data blowup this avoids (confirmed live: still
+        # running after 10+ minutes on a street with 20k existing-greenery
+        # objects, vs. ~1s with this index).
+        self._existing_greenery_index = build_existing_greenery_index(self.existing_greenery)
 
     def score(self, candidate: PlantingCandidate) -> tuple[float, str]:
-        features = compute_features(candidate, self.norms, self.existing_greenery)
+        features = compute_features(candidate, self.norms, self.existing_greenery, self._existing_greenery_index)
         weighted = {name: features[name] * self.weights.get(name, 0.0) for name in features}
         total = sum(weighted.values())
 

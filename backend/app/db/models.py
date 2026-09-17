@@ -1,26 +1,27 @@
-"""SQLAlchemy + GeoAlchemy2 models.
+"""In-memory domain records.
 
-Geometry columns use srid=0 (no PostGIS-enforced SRID/reprojection): each
-project's geometries live in whatever local metric CRS that project's source
-data came in (see geo_engine/crs.py), tracked as free text in
-`Project.source_crs`, and are only reprojected to WGS84 in application code
-at the API boundary. This is deliberate — the real source CRS is unknown
-until 2026-09-15, so we don't want PostGIS silently assuming one.
+No database -- removed by explicit user decision (see docs/decision_log.md
+for the "why": the app is meant to be upload -> work in one session -> forget,
+not a system that remembers projects forever). These are plain dataclasses,
+not SQLAlchemy models, but keep the exact names and fields the rest of the
+backend (and every existing test -- none of them ever touched a real DB
+either, see e.g. test_compliance_service.py's own docstring) already imports
+from `backend.app.db.models`, so this is a storage-layer swap, not a change
+to the domain shape. `store.py` is where instances of these actually live.
+
+`geometry` fields hold a plain shapely object directly -- there is no DB
+round trip to serialize for anymore, so the old GeoAlchemy2 WKBElement
+wrapping (`geo_io.shape_to_db`/`db_to_shape`) is gone too; those two
+functions are kept as identity passthroughs so the many call sites built
+around "wrap before storing, unwrap before using" don't all need editing.
 """
 
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-
-from geoalchemy2 import Geometry
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
-from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-
-
-class Base(DeclarativeBase):
-    pass
+from typing import Any
 
 
 def _new_uuid() -> str:
@@ -31,81 +32,73 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-class Project(Base):
-    __tablename__ = "projects"
-
-    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_new_uuid)
-    name: Mapped[str] = mapped_column(String, nullable=False)
-    source_crs: Mapped[str | None] = mapped_column(String, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-
-    layers: Mapped[list["Layer"]] = relationship(back_populates="project", cascade="all, delete-orphan")
-    plans: Mapped[list["Plan"]] = relationship(back_populates="project", cascade="all, delete-orphan")
-
-
-class Layer(Base):
+@dataclass(kw_only=True)
+class Layer:
     """One imported geo object (utility line, building, zoning polygon, ...)."""
 
-    __tablename__ = "layers"
-
-    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_new_uuid)
-    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
-    kind: Mapped[str] = mapped_column(String, nullable=False)  # "utility" | "zone"
-    object_type: Mapped[str] = mapped_column(String, nullable=False)
-    geometry: Mapped[str] = mapped_column(Geometry(geometry_type="GEOMETRY", srid=0), nullable=False)
-    attrs: Mapped[dict] = mapped_column(JSONB, default=dict)
-
-    project: Mapped["Project"] = relationship(back_populates="layers")
+    id: str = field(default_factory=_new_uuid)
+    project_id: str
+    kind: str  # "utility" | "zone"
+    object_type: str
+    geometry: Any  # a shapely geometry
+    attrs: dict = field(default_factory=dict)
 
 
-class Plan(Base):
-    """A `Plan` row is the *recipe* that produced a plan (scoring_mode +
-    planting_types), not necessarily its materialized `planting_items` rows.
-    `generate_plan` is a pure function of (project layers, norms, model
-    artifact, this recipe) -- see CLAUDE.md -- so a plan that nobody has
-    hand-edited is fully reproducible and doesn't need its (potentially
-    hundreds of thousands of) item rows kept at rest forever. `materialized`
-    tracks whether they currently exist; `pipeline_service.ensure_materialized`
-    recomputes them on demand when a pruned plan is opened again.
-    `has_manual_edits` plans are never pruned -- a human-authored change isn't
-    derivable from the recipe, so it has to stay real data.
+@dataclass(kw_only=True)
+class PlantingItemRow:
+    id: str = field(default_factory=_new_uuid)
+    plan_id: str
+    geometry: Any
+    planting_type: str
+    species: str = "default"
+    score: float = 0.0
+    rationale: str = ""
+    is_manual_edit: bool = False
+    # Back-reference to the owning Plan -- ORM's `relationship(back_populates=...)`
+    # had no dataclass equivalent, so whatever appends an item to `plan.items`
+    # is responsible for setting this too (see store.py::attach_items).
+    plan: "Plan | None" = None
+
+
+@dataclass(kw_only=True)
+class Plan:
+    """A `Plan` is the *recipe* that produced a plan (scoring_mode +
+    planting_types), not necessarily its materialized `items`. `generate_plan`
+    is a pure function of (project layers, norms, model artifact, this
+    recipe) -- see CLAUDE.md -- so a plan that nobody has hand-edited is fully
+    reproducible and doesn't need its (potentially hundreds of thousands of)
+    items kept around. `materialized` tracks whether they currently exist;
+    `pipeline_service.ensure_materialized` recomputes them on demand when a
+    pruned plan is opened again. `has_manual_edits` plans are never pruned --
+    a human-authored change isn't derivable from the recipe.
     """
 
-    __tablename__ = "plans"
+    id: str = field(default_factory=_new_uuid)
+    project_id: str
+    scoring_mode: str = "heuristic"
+    planting_types: list[str] = field(default_factory=list)
+    # Per-generation tree/shrub spacing override (meters) -- None means "use
+    # whatever planting_norms.yaml says", distinct from "the user chose a
+    # value". pipeline_service.ensure_materialized reads these back to
+    # recompute a collapsed plan identically to how it was first generated.
+    tree_spacing_m: float | None = None
+    shrub_spacing_m: float | None = None
+    created_at: datetime = field(default_factory=_utcnow)
+    is_current: bool = True
+    item_count: int = 0
+    materialized: bool = True
+    has_manual_edits: bool = False
 
-    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_new_uuid)
-    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
-    scoring_mode: Mapped[str] = mapped_column(String, default="heuristic")
-    planting_types: Mapped[list[str]] = mapped_column(JSONB, default=list)
-    # Per-generation tree/shrub spacing override (meters) -- None (not 0 or a
-    # fallback constant) means "use whatever planting_norms.yaml says",
-    # genuinely distinct from "the user chose a value", unlike scoring_mode/
-    # planting_types above which are always meaningfully set. Part of the
-    # recipe for the same reason those are: pipeline_service.ensure_materialized
-    # reads these back to recompute a collapsed plan identically to how it
-    # was first generated, not with today's YAML default.
-    tree_spacing_m: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
-    shrub_spacing_m: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-    is_current: Mapped[bool] = mapped_column(Boolean, default=True)
-    item_count: Mapped[int] = mapped_column(Integer, default=0)
-    materialized: Mapped[bool] = mapped_column(Boolean, default=True)
-    has_manual_edits: Mapped[bool] = mapped_column(Boolean, default=False)
-
-    project: Mapped["Project"] = relationship(back_populates="plans")
-    items: Mapped[list["PlantingItemRow"]] = relationship(back_populates="plan", cascade="all, delete-orphan")
+    project: "Project | None" = None
+    items: list[PlantingItemRow] = field(default_factory=list)
 
 
-class PlantingItemRow(Base):
-    __tablename__ = "planting_items"
+@dataclass(kw_only=True)
+class Project:
+    id: str = field(default_factory=_new_uuid)
+    name: str = ""
+    source_crs: str | None = None
+    created_at: datetime = field(default_factory=_utcnow)
 
-    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_new_uuid)
-    plan_id: Mapped[str] = mapped_column(ForeignKey("plans.id"), nullable=False)
-    geometry: Mapped[str] = mapped_column(Geometry(geometry_type="GEOMETRY", srid=0), nullable=False)
-    planting_type: Mapped[str] = mapped_column(String, nullable=False)
-    species: Mapped[str] = mapped_column(String, default="default")
-    score: Mapped[float] = mapped_column(Float, default=0.0)
-    rationale: Mapped[str] = mapped_column(Text, default="")
-    is_manual_edit: Mapped[bool] = mapped_column(Boolean, default=False)
-
-    plan: Mapped["Plan"] = relationship(back_populates="items")
+    layers: list[Layer] = field(default_factory=list)
+    plans: list[Plan] = field(default_factory=list)

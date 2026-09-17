@@ -5,6 +5,7 @@ heuristic scorer and the ML scorer so their inputs stay comparable.
 from __future__ import annotations
 
 from shapely.geometry.base import BaseGeometry
+from shapely.strtree import STRtree
 
 from geo_engine.model import PlantingCandidate
 from geo_engine.norms import PlantingNorms
@@ -41,9 +42,39 @@ def _compactness(geom: BaseGeometry) -> float:
     return _clamp01((4 * 3.141592653589793 * geom.area) / (perimeter**2))
 
 
-def _existing_greenery_gap(geom: BaseGeometry, existing_greenery: list[BaseGeometry]) -> float:
+def build_existing_greenery_index(existing_greenery: list[BaseGeometry] | None) -> STRtree | None:
+    """Build once per scorer instance, not per candidate -- see
+    _existing_greenery_gap's own docstring for why this matters."""
+    return STRtree(existing_greenery) if existing_greenery else None
+
+
+def _existing_greenery_gap(
+    geom: BaseGeometry,
+    existing_greenery: list[BaseGeometry],
+    index: STRtree | None = None,
+) -> float:
+    """Distance to the closest existing planting, or REFERENCE_GAP_M (a
+    neutral default, not a penalty) when there's nothing to compare against.
+
+    `index`, when given, is an STRtree over `existing_greenery` built once by
+    the caller -- pass it whenever this runs in a loop over many candidates.
+    Without it this is `min(geom.distance(g) for g in existing_greenery)`,
+    O(existing_greenery) *per candidate*: fine for a handful of existing
+    plantings, but a real street can carry tens of thousands (one pilot
+    street: 20,004 "Леса и газоны"/"Полоса деревьев" objects) -- scoring tens
+    of thousands of raw candidates against that with a plain Python loop is
+    O(candidates x existing_greenery), confirmed live to still be running
+    after 10+ minutes on exactly that data (the arithmetic: ~36k candidates x
+    20k geometries is on the order of 10^9 shapely .distance() calls). The
+    indexed path is one O(log n) nearest-neighbour lookup per candidate.
+    """
+    if index is not None:
+        idx = index.nearest(geom)
+        if idx is None:
+            return REFERENCE_GAP_M
+        return geom.distance(existing_greenery[int(idx)])
     if not existing_greenery:
-        return REFERENCE_GAP_M  # no data available -> neutral-ish default, not a penalty
+        return REFERENCE_GAP_M
     return min(geom.distance(g) for g in existing_greenery)
 
 
@@ -51,6 +82,7 @@ def compute_features(
     candidate: PlantingCandidate,
     norms: PlantingNorms,
     existing_greenery: list[BaseGeometry] | None = None,
+    existing_greenery_index: STRtree | None = None,
 ) -> dict[str, float]:
     existing_greenery = existing_greenery or []
 
@@ -63,7 +95,7 @@ def compute_features(
     compactness = _compactness(candidate.geometry)
     zoning_suitability = norms.zoning_score(candidate.zoning)
 
-    gap = _existing_greenery_gap(candidate.geometry, existing_greenery)
+    gap = _existing_greenery_gap(candidate.geometry, existing_greenery, existing_greenery_index)
     existing_greenery_gap_score = _clamp01(gap / REFERENCE_GAP_M)
 
     return {

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Iterable, Iterator, Literal
+from typing import Callable, Iterable, Iterator, Literal
 
 import ezdxf
 from shapely.geometry import LineString, Point, Polygon
@@ -92,13 +92,19 @@ MOSGEOTREST_LAYER_MAP: LayerMap = {
     # --- site outline (project drawings and their xrefs) ---
     # The work area. Lives on this layer in the bound xrefs shipped next to the
     # main drawing (Xrefs/xref196297.dwg, Xrefs/xref192364.dwg on the reference
-    # street): two polygons, 29739 + 16132 m², together containing 99% of the
-    # designed plantings. The same-named layer in the main drawing holds only
-    # stray fragments — territory_polygon() ignores non-areal ones, so mapping
-    # both spellings is safe.
+    # street "2. Песчаный переулок"): two polygons, 29739 + 16132 m², together
+    # containing 99% of the designed plantings. The same-named layer in the
+    # main drawing holds only stray fragments — territory_polygon() ignores
+    # non-areal ones, so mapping every spelling below is safe even where one
+    # street's file only has fragments on it and the real outline is
+    # elsewhere. A fourth spelling ("ДВ_ГП_П_Граница работ") confirmed live on
+    # "1. Олимпийская деревня"'s ссылки/10000176_Границы работ_Олимп.dwg — a
+    # different source/drafter for that street, same role. Expect more
+    # spellings across the other 18 streets; this list is not claimed complete.
     "!Граница работ": ("zone", "territory"),
     "!!!_1. ГРАНИЦА РАБОТ": ("zone", "territory"),
     "_ГП_граница работ": ("zone", "territory"),
+    "ДВ_ГП_П_Граница работ": ("zone", "territory"),
     "Леса и газоны": ("zone", "existing_greenery"),
     "Полоса деревьев": ("zone", "existing_greenery"),
     "Отдельно стоящее дерево": ("zone", "existing_greenery"),
@@ -228,11 +234,37 @@ def _entity_to_geometry(entity) -> BaseGeometry | None:
     return None
 
 
-def iter_entities(container, explode_blocks: bool = True, symbol_layers: frozenset[str] | None = None) -> Iterator:
+def iter_entities(
+    container,
+    explode_blocks: bool = True,
+    symbol_layers: frozenset[str] | None = None,
+    layer_map: LayerMap | None = None,
+) -> Iterator:
     """Yield drawable entities, descending into block references.
 
     An INSERT on a symbol layer is yielded as-is (its insertion point is the
     feature); any other INSERT is replaced by its contents, recursively.
+
+    `layer_map`, when given, adds a second reason to stop and yield an INSERT
+    as-is: its own layer isn't in the map at all. Found live, not guessed --
+    a real MGTS (telecom) manhole/well block on "МГТС_ существ. ККС", a layer
+    nobody mapped, exploded into 600 raw LINE/SPLINE/ELLIPSE/HATCH primitives
+    per instance (18 instances in one 220KB file alone) that all become
+    object_type="unknown" anyway -- a type nothing downstream (setbacks,
+    zoning_suitability) ever reads. On "1. Олимпийская деревня" this class of
+    block accounted for ~205K of 371K layer rows. Every one of those
+    primitives, once exploded, was going to resolve to `("zone", "unknown")`
+    regardless (`layer_map.get(layer, ("zone", "unknown"))` in read_dxf) --
+    the explosion was pure cost with no effect on the object_type it would
+    land on. Not exploding it does mean an unmapped composite symbol is
+    reported as one "unknown" object instead of hundreds of decorative
+    sub-primitives -- coarser, but nothing becomes invisible (the same
+    "nothing silently dropped" guarantee this module's docstring makes for
+    a single unmapped *leaf* entity, just applied one level higher, to the
+    INSERT instead of the primitives it would explode into). A block whose
+    own layer *is* mapped (e.g. every "Газопровод" run, itself INSERT-wrapped
+    by MicroStation) still explodes exactly as before -- this only short-
+    circuits blocks reachable from a layer nothing in the map claims at all.
     """
     symbol_layers = SYMBOL_LAYERS if symbol_layers is None else symbol_layers
 
@@ -241,7 +273,11 @@ def iter_entities(container, explode_blocks: bool = True, symbol_layers: frozens
             if entity.dxftype() != "INSERT":
                 yield entity
                 continue
-            if normalize_layer(entity.dxf.layer) in symbol_layers:
+            layer = normalize_layer(entity.dxf.layer)
+            if layer in symbol_layers:
+                yield entity
+                continue
+            if layer_map is not None and layer not in layer_map:
                 yield entity
                 continue
             if not explode_blocks or depth >= _MAX_BLOCK_DEPTH:
@@ -257,23 +293,149 @@ def iter_entities(container, explode_blocks: bool = True, symbol_layers: frozens
     yield from walk(container, 0)
 
 
-def dxf_bundle_paths(main_path: str | Path, xref_dirname: str = "Xrefs") -> list[Path]:
+# Both names occur in the pilot dataset for the same role (external
+# references sitting beside a project's main drawing) -- "Xrefs" on some
+# streets ("2. Песчаный переулок"), "ссылки" on others ("1. Олимпийская
+# деревня"). Neither is a translation of the other picked by us; both are
+# verbatim folder names the deliveries actually use.
+XREF_DIRNAMES = ("Xrefs", "ссылки")
+
+
+def dxf_bundle_paths(main_path: str | Path, xref_dirnames: tuple[str, ...] = XREF_DIRNAMES) -> list[Path]:
     """The main drawing plus the external references sitting next to it.
 
     A project drawing is not self-contained: the pilot street keeps its geobase
-    sheets and — critically — its work-area outline in `Xrefs/` beside the main
-    file, and `ezdxf` does not resolve those (they are DWG, and an attached xref
-    is a file reference, not embedded content). Reading the main file alone gets
-    the design but no site boundary and no utilities.
+    sheets and — critically — its work-area outline in an xref folder beside
+    the main file, and `ezdxf` does not resolve those (most are DWG, and an
+    attached xref is a file reference, not embedded content). Reading the main
+    file alone gets the design but no site boundary and no utilities.
+
+    Matches both `.dxf` and `.dwg` in the xref folder -- the raw delivery's
+    xrefs are DWG same as the main drawing, not pre-converted. `resolve_bundle_inputs`
+    converts whatever this returns; this function only locates files.
 
     Returned in a stable order, main file first, and only files that exist.
     """
     main_path = Path(main_path)
     paths = [main_path]
-    xref_dir = main_path.parent / xref_dirname
-    if xref_dir.is_dir():
-        paths.extend(sorted(p for p in xref_dir.iterdir() if p.suffix.lower() == ".dxf"))
+    for xref_dirname in xref_dirnames:
+        xref_dir = main_path.parent / xref_dirname
+        if xref_dir.is_dir():
+            paths.extend(sorted(p for p in xref_dir.iterdir() if p.suffix.lower() in (".dxf", ".dwg")))
     return [p for p in paths if p.is_file()]
+
+
+class BundleResolutionError(RuntimeError):
+    """No drawing found at all, or a DWG needs converting and no backend is
+    available. Raised instead of `SystemExit` -- unlike `scripts/plan_dxf.py`'s
+    old `_convert_if_needed`, this runs inside a web request too."""
+
+
+def _default_dwg_convert(path: Path, workdir: Path) -> Path:
+    # Imported lazily: dwg_convert shells out to an external binary and has no
+    # reason to be on the import path of every caller of this module.
+    from geo_engine.io.dwg_convert import available_backend, convert_dwg_to_dxf
+
+    if available_backend() is None:
+        raise BundleResolutionError(
+            f"Файл {path.name} в формате DWG, но конвертер не найден на PATH. "
+            "Установите LibreDWG (dwg2dxf) или ODA File Converter."
+        )
+    return convert_dwg_to_dxf(path, workdir)
+
+
+def _other_bundle_members(source: Path, main: Path) -> list[Path]:
+    """Every other .dxf/.dwg anywhere under `source` -- not just in a folder
+    literally named Xrefs/ссылки.
+
+    Found live, not guessed: "1. Олимпийская деревня"'s project folder keeps
+    its utility sheets under per-survey-order subfolders (3ДЖКХ-24_02565/,
+    3ДЖКХ-25_03117/, ...) alongside `ссылки/`, not merged into it -- a fixed
+    allowlist of folder names (what XREF_DIRNAMES / the old Xrefs-only check
+    used) missed all 33 of them and left every object "unknown" (no
+    utilities, no territory). Once a caller has already scoped `source` down
+    to one project's folder (the directory-input case here always has --
+    the ZIP-upload/CLI-directory path, not an unrelated pile of documents),
+    everything under it genuinely belongs to that one drawing's xref tree, so
+    a full recursive glob is the correct generalisation rather than another
+    name to add to an allowlist that will just be incomplete again on street
+    #3. Skips `PaxHeader/` -- tar-extraction litter (see the dataset's own
+    stray PaxHeader folders), not real bundle content.
+    """
+    found = set(source.rglob("*.dxf")) | set(source.rglob("*.dwg"))
+    found.discard(main)
+    return sorted(p for p in found if "PaxHeader" not in p.parts)
+
+
+def resolve_bundle_inputs(
+    source: str | Path,
+    workdir: str | Path,
+    convert: Callable[[Path, Path], Path] | None = None,
+) -> tuple[Path, list[Path], list[str]]:
+    """(main drawing, every file in the bundle as DXF, warnings) for a single
+    drawing or a project folder, converting DWG on the way in.
+
+    The shared "what is the main drawing, what else belongs with it, convert
+    whatever is DWG" step behind both `scripts/plan_dxf.py`/`flatten_bundle.py`
+    and the web upload (`backend/app/services/project_service.py`) -- written
+    once here so the two do not carry separate copies of "the biggest .dxf/.dwg
+    in the folder is the main drawing" and "everything under Xrefs/ belongs to
+    it". A caller that wants `SystemExit` instead of `BundleResolutionError`
+    (the CLI) catches it at its own boundary; a caller that wants an HTTP 400
+    (the web upload) does the same.
+
+    `convert` defaults to `dwg_convert.convert_dwg_to_dxf`; overridable so this
+    can be tested without invoking a real converter.
+    """
+    source = Path(source)
+    workdir = Path(workdir)
+    convert = convert or _default_dwg_convert
+    warnings: list[str] = []
+
+    def convert_if_needed(path: Path) -> Path:
+        return convert(path, workdir) if path.suffix.lower() == ".dwg" else path
+
+    def convert_each(paths: list[Path]) -> list[Path]:
+        converted = []
+        for path in paths:
+            try:
+                converted.append(convert_if_needed(path))
+            except RuntimeError as error:
+                # One unreadable xref must not sink the whole bundle -- but it
+                # must not vanish silently either, or a lost site boundary
+                # looks like an absent one. BundleResolutionError is a
+                # RuntimeError too, so a missing converter hits this same
+                # path for every xref after the first warning.
+                warnings.append(f"пропущен {path.name}: {error}")
+        return converted
+
+    if source.is_dir():
+        candidates = sorted(p for p in source.iterdir() if p.suffix.lower() in (".dxf", ".dwg"))
+        if not candidates:
+            # A real delivery's top level holds the drawing directly -- zero
+            # files here usually means this is an umbrella folder one level
+            # above the actual project folder (live case: "Исходные данные"
+            # for a street holds three unrelated subfolders -- permits,
+            # dendrology survey, and the actual "<id>_Генплан... - Standard"
+            # drawing set -- none of them at this level). Listing what *is*
+            # here turns "no files found" into "look one level down, into one
+            # of these" instead of a dead end.
+            subdirs = sorted(p.name for p in source.iterdir() if p.is_dir())
+            hint = f" Есть подпапки: {', '.join(subdirs)} — чертёж, вероятно, в одной из них." if subdirs else ""
+            raise BundleResolutionError(f"В каталоге {source} нет ни одного .dxf/.dwg файла.{hint}")
+        # Largest file in the folder root, not by name: real deliveries name
+        # sheets after survey order numbers, not "main.dxf".
+        main = max(candidates, key=lambda p: p.stat().st_size)
+        converted_main = convert_if_needed(main)
+        return converted_main, [converted_main, *convert_each(_other_bundle_members(source, main))], warnings
+
+    converted_main = convert_if_needed(source)
+    if source.suffix.lower() == ".dwg":
+        # The converted copy has no Xrefs/ of its own -- look next to the
+        # original.
+        siblings = dxf_bundle_paths(source)
+        return converted_main, [converted_main, *convert_each(siblings[1:])], warnings
+    return converted_main, dxf_bundle_paths(converted_main), warnings
 
 
 def read_dxf_bundle(
@@ -339,7 +501,7 @@ def read_dxf(
     utilities: list[Utility] = []
     zones: list[Zone] = []
 
-    for entity in iter_entities(msp, explode_blocks=explode_blocks, symbol_layers=symbol_layers):
+    for entity in iter_entities(msp, explode_blocks=explode_blocks, symbol_layers=symbol_layers, layer_map=layer_map):
         geometry = _entity_to_geometry(entity)
         if geometry is None or geometry.is_empty:
             continue

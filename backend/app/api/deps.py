@@ -3,52 +3,41 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import Depends, HTTPException
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
+from backend.app.db import session as store
 from backend.app.db.models import Plan, PlantingItemRow, Project
-from backend.app.db.session import get_session
 from backend.app.services.pipeline_service import ensure_materialized
 
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
-
-async def get_project_or_404(project_id: str, session: SessionDep) -> Project:
-    # selectinload: project.layers/project.plans get touched later (domain
-    # conversion, DXF export, generate_plan's "mark old plans not current")
-    # outside this request's immediate async context in some call paths
-    # (e.g. handed to run_in_threadpool) -- lazy-loading there would need an
-    # await a plain thread can't make, so load both eagerly up front.
-    result = await session.execute(
-        select(Project).where(Project.id == project_id).options(selectinload(Project.layers), selectinload(Project.plans))
-    )
-    project = result.scalar_one_or_none()
+def get_project_or_404(project_id: str) -> Project:
+    project = store.get_project(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Проект не найден — возможно, он был удалён.")
     return project
 
 
 ProjectDep = Annotated[Project, Depends(get_project_or_404)]
+# No database round trip left to avoid -- both names used to point at
+# different dependencies (one eager-loading project.layers via SQL, one
+# not) purely to dodge an expensive selectinload on the routes that didn't
+# need it. Everything is already an in-memory object now, so there's nothing
+# left to be lean about; kept as a second name only so routes_projects.py
+# doesn't need editing just for this.
+ProjectMetaDep = ProjectDep
 
 
-async def get_plan_or_404(project_id: str, plan_id: str, session: SessionDep) -> Plan:
-    result = await session.execute(
-        select(Plan)
-        .where(Plan.id == plan_id)
-        .options(selectinload(Plan.items), selectinload(Plan.project).selectinload(Project.layers))
-    )
-    plan = result.scalar_one_or_none()
-    if plan is None or plan.project_id != project_id:
+async def get_plan_or_404(project_id: str, plan_id: str) -> Plan:
+    project = get_project_or_404(project_id)
+    plan = next((p for p in project.plans if p.id == plan_id), None)
+    if plan is None:
         raise HTTPException(status_code=404, detail="План не найден в этом проекте.")
     if not plan.materialized:
-        # A plan not currently open and never hand-edited has its
-        # planting_items rows pruned (see pipeline_service.Plan docstring) --
-        # recompute them transparently the moment anything asks for this
-        # plan's items (view it, edit it, validate it, export it), rather
-        # than making every route that can receive an old plan_id handle
-        # "materialized or not" itself.
-        plan = await ensure_materialized(session, plan)
+        # A plan not currently open and never hand-edited has its items
+        # pruned (see pipeline_service.Plan docstring) -- recompute them
+        # transparently the moment anything asks for this plan (view it, edit
+        # it, validate it, export it), rather than making every route that can
+        # receive an old plan_id handle "materialized or not" itself.
+        plan = await ensure_materialized(plan)
     return plan
 
 
