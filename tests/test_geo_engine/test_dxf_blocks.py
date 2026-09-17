@@ -106,13 +106,21 @@ def test_symbol_layer_insert_becomes_one_point_not_its_drawn_parts(tmp_path):
 
 def test_insert_on_an_unmapped_layer_is_not_exploded(tmp_path):
     """Found live on the pilot dataset: a telecom (MGTS) manhole/well block on
-    a layer nobody mapped (e.g. "МГТС_ существ. ККС") exploded into hundreds
-    of decorative LINE/SPLINE/ELLIPSE/HATCH primitives that all resolve to
+    a layer nobody mapped exploded into hundreds of decorative
+    LINE/SPLINE/ELLIPSE/HATCH primitives that all resolve to
     object_type="unknown" anyway -- pure parse-time cost, no effect on the
     result. One INSERT with many primitives, on an unmapped layer, must
     collapse to exactly one unknown zone, not one per primitive.
+
+    Uses a synthetic layer name, not the real "МГТС_ существ. ККС" one this
+    was found on -- layer_rules.classify_layer() (added by a parallel PR,
+    merged after this fix) actually recognizes that real name as a cable run
+    via its "существ"/"ККС" pattern, so it is no longer a genuinely unmapped
+    layer and correctly explodes now (see iter_entities's use_layer_rules
+    param). This test needs a layer neither the literal map nor the rules
+    ever classify, to keep testing the short-circuit itself.
     """
-    unmapped_layer = "МГТС_ существ. ККС"
+    unmapped_layer = "XYZ_random_layer_99"
     doc = ezdxf.new(setup=True)
     doc.layers.add(name=unmapped_layer)
     symbol = doc.blocks.new(name="*U5")
