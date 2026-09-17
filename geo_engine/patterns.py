@@ -33,7 +33,10 @@
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
+
+import shapely
 
 from shapely.geometry import LineString, MultiLineString, Point
 from shapely.geometry.base import BaseGeometry
@@ -48,11 +51,34 @@ from geo_engine.species import Species
 # см. docstring модуля.
 ROW_GUIDE_ZONE_TYPES = ("road", "sidewalk", "tram_track")
 
-# Типы посадки, для которых рядовая схема осмысленна. Газон — площадной объект,
-# ряда из него не бывает; кустарник в рядах тоже сажают, но его нормативные
-# интервалы (0,3-1,0 м) относятся к плотной рядовой/групповой посадке, которую
-# генератор пока не моделирует — см. planner.CROWN_SPACING_TYPES.
+# Типы посадки, для которых рядовая схема осмысленна. Газон — площадной
+# объект, ряда из него не бывает.
 ROW_PLANTING_TYPES = ("tree",)
+
+# Типы, которые сажают куртинами. Это и есть тот паттерн, под который писаны
+# плотные нормативные интервалы кустарника: 743-ПП табл. 3.6.2 даёт «групповая
+# посадка кустарников — 0,3 м», а 515-ПП табл. 5 задаёт плотность в штуках на
+# квадратный метр по видам (1-3 шт/м²). Разбрасывать кусты с таким интервалом
+# по всей площади нельзя — получится сплошной ковёр, который в этом проекте
+# уже однажды чинили; внутри ограниченной куртины это ровно норма.
+GROUP_PLANTING_TYPES = ("shrub",)
+
+# Расстояние между центрами куртин. Не норматив: акты задают плотность ВНУТРИ
+# группы, но не то, как часто группы стоят. Взято из практики — куртина каждые
+# полтора десятка метров читается как отдельная масса, а не сливается с
+# соседней в тот же ковёр.
+GROUP_PITCH_M = 14.0
+
+# Радиус куртины. Тоже практика: 515-ПП оперирует плотностью на квадратный
+# метр, то есть предполагает группу площадью в единицы-десятки метров —
+# круг радиусом 3 м даёт около 28 м², это 28-84 куста по её плотности.
+GROUP_RADIUS_M = 3.0
+
+# Во сколько раз больше точек кидается внутрь куртины, чем поместилось бы по
+# шагу. Прореживание делает greedy_select; двукратного запаса ему хватает, а
+# больший только раздувает список кандидатов.
+_GROUP_OVERSAMPLE = 2
+_MAX_SAMPLES_PER_GROUP = 400
 
 # Насколько отойти внутрь от края допустимой площади. Ставить ровно на край
 # нельзя: он получен буферами, а буфер — многоугольная аппроксимация круга, и
@@ -294,3 +320,133 @@ def row_candidates(
                     )
                 )
     return candidates
+
+
+def group_positions(
+    buildable_area: BaseGeometry,
+    group_pitch_m: float,
+    group_radius_m: float,
+    seed: int,
+) -> list[BaseGeometry]:
+    """Круги-куртины, разбросанные по допустимой площади.
+
+    Центры берутся псевдослучайно с отбраковкой ближе `group_pitch_m` друг к
+    другу — тот же принцип, что у dart-throwing в candidates.py, только на
+    порядок разреженнее: здесь разбрасывается не растение, а место под группу.
+
+    Сид обязателен и детерминирован по той же причине, что и у расстановки
+    точек: план обязан быть воспроизводимым, иначе пересчёт схлопнутого плана
+    вернёт другую композицию.
+    """
+    if buildable_area is None or buildable_area.is_empty or group_pitch_m <= 0:
+        return []
+
+    rng = random.Random(seed)
+    minx, miny, maxx, maxy = buildable_area.bounds
+    width, height = maxx - minx, maxy - miny
+    if width <= 0 or height <= 0:
+        return []
+
+    # Сколько попыток: столько, сколько мест теоретически поместилось бы на
+    # bounding box, с запасом на отбраковку.
+    attempts = int((width / group_pitch_m + 1) * (height / group_pitch_m + 1) * 8) + 16
+    attempts = min(attempts, 20000)
+
+    # Подготовленная геометрия обязательна, а не «для скорости»: допустимая
+    # площадь на реальной улице собрана из тысяч буферов, и обычный
+    # `contains` на ней стоит миллисекунды. Двадцать тысяч попыток превращали
+    # генерацию групп в десятки минут — замерено, прогон пришлось прервать.
+    shapely.prepare(buildable_area)
+
+    # Отбраковка близких центров — по ячейкам сетки со стороной в шаг групп:
+    # сравнивать каждую новую точку со всеми принятыми это O(n²), а соседей у
+    # неё в любом случае не больше, чем в девяти окрестных ячейках.
+    cell = group_pitch_m
+    buckets: dict[tuple[int, int], list[Point]] = {}
+    centres: list[Point] = []
+    for _ in range(attempts):
+        point = Point(minx + rng.random() * width, miny + rng.random() * height)
+        if not buildable_area.contains(point):
+            continue
+        key = (int(point.x // cell), int(point.y // cell))
+        near = [
+            other
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            for other in buckets.get((key[0] + dx, key[1] + dy), ())
+        ]
+        if any(point.distance(other) < group_pitch_m for other in near):
+            continue
+        buckets.setdefault(key, []).append(point)
+        centres.append(point)
+
+    discs = []
+    for centre in centres:
+        disc = centre.buffer(group_radius_m).intersection(buildable_area)
+        if not disc.is_empty:
+            discs.append(disc)
+    return discs
+
+
+def group_candidates(
+    buildable_area: BaseGeometry,
+    exclusion_zone: BaseGeometry,
+    planting_type: PlantingType,
+    in_group_pitch_m: float,
+    seed: int,
+    zoning_zones: list[Zone] | None = None,
+    group_pitch_m: float = GROUP_PITCH_M,
+    group_radius_m: float = GROUP_RADIUS_M,
+) -> list[PlantingCandidate]:
+    """Кандидаты внутри куртин: плотно в группе, пусто между группами.
+
+    Именно это, а не россыпь по всей площади, соответствует нормативным
+    интервалам кустарника (743-ПП табл. 3.6.2: «групповая посадка кустарников
+    — 0,3 м»). Прежняя россыпь с интервалом 3 м была компромиссом ровно из-за
+    того, что групп не было: применить 0,3 м ко всей площади означало ковёр,
+    а 3 м по всей площади — равномерный крап, не похожий на проект.
+    """
+    zoning_zones = zoning_zones or []
+    discs = group_positions(buildable_area, group_pitch_m, group_radius_m, seed)
+    if not discs:
+        return []
+
+    rng = random.Random(seed ^ 0x5EED)
+    points: list[Point] = []
+    for disc in discs:
+        minx, miny, maxx, maxy = disc.bounds
+        width, height = maxx - minx, maxy - miny
+        if width <= 0 or height <= 0:
+            continue
+        shapely.prepare(disc)
+        # Сэмплирование с запасом относительно целевого шага: настоящее
+        # прореживание сделает greedy_select, которому на этот проход
+        # передаются нормы с групповым интервалом.
+        target = int((width / in_group_pitch_m + 1) * (height / in_group_pitch_m + 1) * _GROUP_OVERSAMPLE)
+        for _ in range(min(target + 8, _MAX_SAMPLES_PER_GROUP)):
+            point = Point(minx + rng.random() * width, miny + rng.random() * height)
+            if disc.contains(point):
+                points.append(point)
+
+    if not points:
+        return []
+
+    # Расстояние до зоны отступов считается одним векторизованным вызовом на
+    # все точки сразу, а не по точке. Это не микрооптимизация: зона отступов
+    # на реальной улице собрана из тысяч буферов, и поштучный `distance` по
+    # десяткам тысяч точек уводил генерацию за десять минут — замерено,
+    # прогон пришлось прервать.
+    if exclusion_zone is None or exclusion_zone.is_empty:
+        clearances = [float("inf")] * len(points)
+    else:
+        clearances = [float(d) for d in shapely.distance(points, exclusion_zone)]
+
+    return [
+        PlantingCandidate(
+            geometry=point,
+            planting_type=planting_type,
+            clearance_m=clearance,
+            zoning=_zoning_at(point, zoning_zones),
+        )
+        for point, clearance in zip(points, clearances)
+    ]

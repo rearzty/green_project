@@ -32,7 +32,13 @@ from geo_engine.io.dxf_reader import (
 )
 from geo_engine.io.dxf_writer import RESULT_LAYER_PREFIX, write_dxf
 from geo_engine.norms import load_norms
-from geo_engine.planner import CROWN_SPACING_TYPES, PLACEMENT_PATTERNS, ROW_RATIONALE_PREFIX, plan_items
+from geo_engine.planner import (
+    CROWN_SPACING_TYPES,
+    GROUP_RATIONALE_PREFIX,
+    PLACEMENT_PATTERNS,
+    ROW_RATIONALE_PREFIX,
+    plan_items,
+)
 from geo_engine.species import load_catalogue
 from geo_engine.territory import MissingTerritoryError, territory_polygon
 from ml_scoring.heuristic_scorer import HeuristicScorer
@@ -168,6 +174,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--list-species", action="store_true", help="Показать доступные породы и выйти")
     parser.add_argument(
+        "--density",
+        action="append",
+        metavar="ТИП=ШТ_НА_ГА",
+        help="Плотность посадки, например --density tree=120 --density shrub=400. "
+        "Без неё алгоритм заполняет каждое легально доступное место — это «сколько влезает», "
+        "а не «сколько нужно». Нормативной величины в доступных актах нет, поэтому значения "
+        "по умолчанию нет тоже",
+    )
+    parser.add_argument(
         "--pattern",
         choices=PLACEMENT_PATTERNS,
         default="auto",
@@ -209,6 +224,21 @@ def _parse_species_overrides(raw: list[str] | None) -> dict[str, str]:
     return overrides
 
 
+def _parse_densities(raw: list[str] | None) -> dict[str, float]:
+    """`--density tree=120` -> {"tree": 120.0}."""
+    out: dict[str, float] = {}
+    for entry in raw or []:
+        planting_type, _, value = entry.partition("=")
+        try:
+            density = float(value)
+        except ValueError:
+            raise SystemExit(f"Ожидалось ТИП=ЧИСЛО, получено: {entry!r}") from None
+        if density <= 0:
+            raise SystemExit(f"Плотность должна быть положительной, получено: {entry!r}")
+        out[planting_type.strip()] = density
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.list_species:
@@ -227,6 +257,7 @@ def main(argv: list[str] | None = None) -> int:
     if missing:
         raise SystemExit(f"Не заданы обязательные аргументы: {', '.join(missing)}")
     species_overrides = _parse_species_overrides(args.species)
+    densities = _parse_densities(args.density)
     planting_types = [t.strip() for t in args.types.split(",") if t.strip()]
     unknown = [t for t in planting_types if t not in PLANTING_TYPES]
     if unknown:
@@ -279,12 +310,20 @@ def main(argv: list[str] | None = None) -> int:
             keep_spacing_for=keep_spacing_for,
             species_overrides=species_overrides,
             pattern=args.pattern,
+            density_per_ha=densities,
         )
         counts = Counter(i.planting_type for i in items)
         print(f"     посадок: {len(items)} ({', '.join(f'{k}: {v}' for k, v in counts.most_common())})")
         in_rows = sum(1 for i in items if i.rationale.startswith(ROW_RATIONALE_PREFIX))
-        if in_rows:
-            print(f"     из них рядовой посадкой: {in_rows}, свободной группой: {len(items) - in_rows}")
+        in_groups = sum(1 for i in items if i.rationale.startswith(GROUP_RATIONALE_PREFIX))
+        loose = len(items) - in_rows - in_groups
+        parts = [
+            f"{label}: {count}"
+            for label, count in (("рядом", in_rows), ("куртинами", in_groups), ("россыпью", loose))
+            if count
+        ]
+        if parts:
+            print(f"     схемы посадки — {', '.join(parts)}")
         catalogue = load_catalogue()
         chosen = {i.planting_type: i.species for i in items}
         for planting_type, species_name in sorted(chosen.items()):
