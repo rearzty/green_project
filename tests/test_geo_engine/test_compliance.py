@@ -95,16 +95,20 @@ def test_an_object_type_with_no_citation_says_so_instead_of_inventing_one():
 
 def test_unverified_citations_are_counted_not_hidden():
     """A traceability feature fails quietly when a citation nobody checked looks
-    exactly like one that was checked. gas_pipe's value comes from the brief's
-    own wording of 743-ПП, not from the act.
+    exactly like one that was checked. Power lines are the honest remaining
+    gap: СП 42.13330.2016's table 9.1 note 2 defers to ПУЭ, which has not been
+    read, so the value applied here is ours and must say so.
     """
     norms = load_norms()
+    power_line = Utility(
+        geometry=LineString([(-100, 0), (100, 0)]), object_type="power_line_corridor"
+    )
 
-    records = explain_items([_tree(0, 2.2)], [_gas()], [], norms)
+    records = explain_items([_tree(0, 3.2)], [power_line], [], norms)
     counts = unverified_sources(records)
 
-    assert records[0].binding_constraint == "gas_pipe"
-    assert any("743-ПП" in citation for citation in counts)
+    assert records[0].binding_constraint == "power_line_corridor"
+    assert any("ПУЭ" in citation for citation in counts)
 
 
 def test_report_payload_normalizes_sources_instead_of_repeating_them():

@@ -1,18 +1,18 @@
-"""The planting pipeline itself: territory + constraints -> selected plantings.
+"""Пайплайн размещения: территория и ограничения -> отобранные посадки.
 
-Pure geometry and scoring, no database and no web framework — that is the point.
-The backend used to own this loop inside `pipeline_service._compute_planting_rows`,
-which meant the only way to run the project's core algorithm was to bring up
-PostGIS and FastAPI. The brief asks for a runnable DXF -> DXF pipeline and
-explicitly accepts a CLI as the delivery, so the algorithm lives here and both
-callers — the CLI and the backend — drive the same code.
+Чистая геометрия и скоринг, без базы и веб-фреймворка — в этом и смысл. Раньше
+этот цикл жил внутри `pipeline_service._compute_planting_rows`, то есть
+единственным способом запустить ядро проекта было поднять PostGIS и FastAPI.
+ТЗ просит воспроизводимый пайплайн DXF → DXF и прямо принимает CLI как способ
+сдачи, поэтому алгоритм живёт здесь, а оба вызывающих — CLI и backend —
+гоняют один и тот же код.
 """
 
 from __future__ import annotations
 
 import random
 import zlib
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 
 from shapely.geometry.base import BaseGeometry
 
@@ -21,7 +21,68 @@ from geo_engine.candidates import generate_candidates
 from geo_engine.model import PlantingItem, Utility, Zone
 from geo_engine.norms import PlantingNorms
 from geo_engine.placement import greedy_select
-from geo_engine.species import load_species
+from geo_engine.species import Species, SpeciesCatalogue, load_catalogue
+
+# Интервал по классу кроны (МГСН 1.02-02, п. 4.2.9.2) выводится только для
+# деревьев. Для кустарника 743-ПП, табл. 3.6.2 даёт 0,3-1,0 м — но это
+# расстояния ВНУТРИ рядовой или групповой посадки (куртины), а генератор
+# разбрасывает кусты независимыми точками. Подставить сюда 0,3 м означало бы
+# применить нормативное число к чужому паттерну посадки и получить сплошной
+# ковёр — ровно то, что в этом проекте уже однажды чинили, подняв интервал с
+# 1,0 до 3,0 м. Групповая посадка кустарника — отдельная задача, пока не
+# реализована, и до тех пор интервал кустарника берётся из planting_norms.yaml.
+CROWN_SPACING_TYPES = ("tree",)
+
+
+def choose_species(
+    plan_key: str,
+    planting_type: str,
+    catalogue: SpeciesCatalogue | None = None,
+) -> Species | None:
+    """Порода для этого типа посадки в этом плане — одна на весь тип.
+
+    Не по объекту, и это осознанно. Во-первых, `greedy_select` отбирает по
+    одному радиусу кроны на тип (см. placement.py), так что разные породы в
+    одной россыпи сделали бы требуемое расстояние между соседями
+    неопределённым. Во-вторых, так и выглядит настоящий дендроплан: посадки
+    идут группами одной породы, а не случайной смесью в одной точке.
+
+    Сид детерминированный и отдельный от сида расстановки — пересчёт
+    схлопнутого плана обязан выдать ту же породу, а не свежий случайный выбор.
+    """
+    catalogue = catalogue or load_catalogue()
+    pool = catalogue.for_type(planting_type)
+    if not pool:
+        return None
+    rng = random.Random(zlib.crc32(f"{plan_key}:{planting_type}:species".encode()))
+    return rng.choice(pool)
+
+
+def norms_for_species(
+    norms: PlantingNorms,
+    planting_type: str,
+    species: Species | None,
+    catalogue: SpeciesCatalogue,
+) -> PlantingNorms:
+    """Нормы с интервалом, выведенным из класса кроны выбранной породы.
+
+    МГСН 1.02-02, п. 4.2.9.2: 8-10 м широкая крона, 5-6 м средняя, 3-4 м узкая
+    (берётся нижняя граница — это минимум, см. species.yaml).
+
+    Радиус кроны для отбора берётся как половина интервала, а НЕ как половина
+    реального диаметра кроны породы. Это разные вопросы: `min_distance_m`
+    служит ещё и шагом сетки кандидатов, и пара «шаг сетки / радиус отбора»
+    обязана держать отношение 2:1, иначе отбор перестаёт отсеивать соседей —
+    именно так когда-то сломали плотность кустарника. Реальный диаметр кроны
+    используется в другом месте: им масштабируются отступы по примечанию 1 к
+    таблицам 743-ПП и СП.
+    """
+    if species is None or planting_type not in CROWN_SPACING_TYPES:
+        return norms
+    spacing = catalogue.spacing_for_crown(species.crown)
+    if not spacing:
+        return norms
+    return norms.with_spacing_override(planting_type, spacing)
 
 
 def plan_items(
@@ -32,41 +93,64 @@ def plan_items(
     planting_types: list[str],
     score_fn: Callable,
     norms: PlantingNorms,
+    keep_spacing_for: Collection[str] = (),
+    species_overrides: dict[str, str] | None = None,
+    catalogue: SpeciesCatalogue | None = None,
 ) -> list[PlantingItem]:
-    """Generate the plantings for one plan.
+    """Сгенерировать посадки для одного плана.
 
-    Each planting_type is generated independently from the same buildable_area,
-    with no cross-type exclusion — a tree/shrub landing on a lawn's area is
-    expected, not a bug: a tree standing in grass is the normal case (a cutout in
-    pavement around a trunk is the rare exception, not something this models).
-    Trimming the lawn around what actually got planted, if wanted, is a separate,
-    user-driven editing feature, not something generation should enforce.
+    Каждый тип посадки генерируется независимо от одной и той же buildable-area,
+    без взаимного вычитания — дерево или куст, попавший на площадь газона, это
+    норма, а не баг: в живом озеленении дерево почти всегда стоит именно в
+    газоне. Подрезка газона под уже стоящие посадки, если понадобится, —
+    отдельная правка по воле пользователя, а не поведение генерации.
 
-    Point placement (tree/shrub) is randomized, not gridded (see candidates.py),
-    seeded from `plan_key` + planting_type via zlib.crc32 — stable across
-    processes and runs, unlike Python's own str hash. That is what makes this a
-    pure function of the plan's recipe: recomputing a collapsed plan must return
-    the exact same layout, not a fresh random one.
+    Расстановка точек (дерево/куст) случайная, не сеточная (см. candidates.py),
+    сид выводится из `plan_key` + типа через zlib.crc32 — устойчиво между
+    процессами и запусками, в отличие от питоновского hash(). Именно это делает
+    функцию чистой от рецепта плана: пересчёт схлопнутого плана обязан вернуть
+    ту же раскладку, а не свежую случайную.
+
+    `keep_spacing_for` — типы, у которых интервал задан пользователем явно и не
+    должен подменяться выведенным из класса кроны. Без этого параметра
+    пользовательская настройка молча терялась бы: и она, и породное правило
+    приходят в одну и ту же `min_distance_m`, и снаружи их уже не различить.
+
+    `species_overrides` — явно выбранная пользователем порода по типу посадки.
+    Без неё порода выводится из `plan_key` детерминированно, но произвольно: от
+    класса кроны зависит интервал, поэтому смена породы заметно меняет число
+    посадок, и оставлять этот выбор только за сидом было бы неудобно.
     """
+    catalogue = catalogue or load_catalogue()
+    species_overrides = species_overrides or {}
     items: list[PlantingItem] = []
-    species = load_species()
 
     for planting_type in planting_types:
-        exclusion = build_exclusion_zone(utilities, zones, planting_type, norms)
-        margin = norms.territory_margin_for(planting_type)
+        override = species_overrides.get(planting_type)
+        species = catalogue.get(override) if override else choose_species(plan_key, planting_type, catalogue)
+        type_norms = norms
+        if planting_type not in keep_spacing_for:
+            type_norms = norms_for_species(norms, planting_type, species, catalogue)
+
+        exclusion = build_exclusion_zone(
+            utilities,
+            zones,
+            planting_type,
+            type_norms,
+            species,
+            catalogue.crown_reference_diameter_m,
+        )
+        margin = type_norms.territory_margin_for(planting_type)
         buildable = buildable_area(territory, exclusion, zones, territory_margin_m=margin)
         seed = zlib.crc32(f"{plan_key}:{planting_type}".encode())
-        candidates = generate_candidates(buildable, exclusion, planting_type, norms, zoning_zones=zones, seed=seed)
-        selected = greedy_select(candidates, score_fn, norms)
+        candidates = generate_candidates(
+            buildable, exclusion, planting_type, type_norms, zoning_zones=zones, seed=seed
+        )
+        selected = greedy_select(candidates, score_fn, type_norms)
 
-        species_pool = species.get(planting_type)
-        if species_pool:
-            # A seed distinct from the candidate-scatter one above — species
-            # assignment shouldn't be even conceptually tied to placement
-            # randomness. Same reproducibility requirement either way.
-            species_rng = random.Random(zlib.crc32(f"{plan_key}:{planting_type}:species".encode()))
+        if species is not None:
             for item in selected:
-                item.species = species_rng.choice(species_pool)
+                item.species = species.name
 
         items.extend(selected)
     return items
