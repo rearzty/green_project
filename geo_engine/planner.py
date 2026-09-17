@@ -22,8 +22,10 @@ from geo_engine.candidates import generate_candidates
 from geo_engine.model import PlantingItem, Utility, Zone
 from geo_engine.norms import PlantingNorms
 from geo_engine.patterns import (
+    GROUP_PLANTING_TYPES,
     ROW_PLANTING_TYPES,
     collect_row_guides,
+    group_candidates,
     row_candidates,
     territory_guide,
 )
@@ -45,12 +47,49 @@ CROWN_SPACING_TYPES = ("tree",)
 # свободные группы во дворе. "scatter" — только россыпь, прежнее поведение,
 # оставлено как способ воспроизвести старый результат и как запасной путь для
 # площадок без единого линейного ориентира.
-PLACEMENT_PATTERNS = ("auto", "scatter", "row")
+PLACEMENT_PATTERNS = ("auto", "scatter", "row", "group")
 
 # По этой приставке в rationale CLI и отчёт отличают рядовую посадку от
 # россыпи. Обоснование выбора места у них разное, и смешивать их в отчёте
 # значило бы потерять единственный признак, по которому видно схему.
 ROW_RATIONALE_PREFIX = "Рядовая посадка вдоль линейного ориентира."
+GROUP_RATIONALE_PREFIX = "Групповая посадка (куртина)."
+
+# Интервал внутри куртины. 743-ПП, табл. 3.6.2: «групповая посадка
+# кустарников — 0,3 м». Берётся 0,5 м, а не 0,3: таблица даёт ориентир для
+# рядовой и групповой посадки вперемешку, а 515-ПП табл. 5 задаёт плотность
+# 1-3 шт/м², чему 0,5 м (около 4 шт/м² по сетке, меньше после прореживания
+# кругами крон) соответствует ближе, чем 0,3 (около 11 шт/м²).
+IN_GROUP_PITCH_M = 0.5
+
+
+def _limit_by_density(
+    items: list[PlantingItem], area_m2: float, density_per_ha: float | None
+) -> list[PlantingItem]:
+    """Оставить лучшие по оценке, если задана плотность посадки.
+
+    Существует потому, что «сколько влезает» и «сколько нужно» — разные
+    величины, и до сих пор алгоритм считал первую. `greedy_select` принимает
+    каждого кандидата, который не конфликтует с уже принятыми, то есть
+    заполняет каждый легально доступный квадратный метр. Проектировщик так не
+    делает: он выбирает места и намеренно оставляет пустое. Без ограничения
+    план на реальной улице выходил лесом из 3892 посадок на 4,6 га, где ни
+    ряды, ни куртины не читаются — их забивает сплошная масса.
+
+    Нормативной величины плотности в доступных актах нет (515-ПП задаёт
+    штуки на квадратный метр ВНУТРИ группы, а не по территории), поэтому это
+    пользовательский параметр без значения по умолчанию, а не ещё одна
+    несверенная константа.
+
+    Отбор — по убыванию оценки, той же, по которой greedy_select уже
+    расставлял приоритет: ограничение отсекает худшие места, а не случайные.
+    """
+    if density_per_ha is None or density_per_ha <= 0 or area_m2 <= 0:
+        return items
+    allowed = max(1, int(round(density_per_ha * area_m2 / 10_000)))
+    if len(items) <= allowed:
+        return items
+    return sorted(items, key=lambda item: item.score, reverse=True)[:allowed]
 
 
 def choose_species(
@@ -115,6 +154,7 @@ def plan_items(
     keep_spacing_for: Collection[str] = (),
     species_overrides: dict[str, str] | None = None,
     pattern: str = "auto",
+    density_per_ha: dict[str, float] | None = None,
     catalogue: SpeciesCatalogue | None = None,
 ) -> list[PlantingItem]:
     """Сгенерировать посадки для одного плана.
@@ -151,6 +191,7 @@ def plan_items(
     """
     catalogue = catalogue or load_catalogue()
     species_overrides = species_overrides or {}
+    density_per_ha = density_per_ha or {}
     items: list[PlantingItem] = []
 
     for planting_type in planting_types:
@@ -204,12 +245,46 @@ def plan_items(
                 )
                 remaining = buildable.difference(taken)
 
-        if pattern != "row" and not remaining.is_empty:
-            seed = zlib.crc32(f"{plan_key}:{planting_type}".encode())
+        seed = zlib.crc32(f"{plan_key}:{planting_type}".encode())
+
+        wants_groups = pattern in ("auto", "group") and planting_type in GROUP_PLANTING_TYPES
+        if wants_groups and not remaining.is_empty:
+            clumps = group_candidates(
+                remaining, exclusion, planting_type, IN_GROUP_PITCH_M, seed, zoning_zones=zones
+            )
+            # Отбор внутри куртины идёт по ГРУППОВОМУ интервалу, а не по
+            # обычному: иначе greedy_select, буферизующий каждую точку на
+            # canopy_radius_m от одиночной посадки, прорядил бы группу до той
+            # же россыпи, ради ухода от которой она и делается.
+            group_norms = type_norms.with_spacing_override(planting_type, IN_GROUP_PITCH_M)
+            group_items = greedy_select(clumps, score_fn, group_norms)
+            for item in group_items:
+                item.rationale = f"{GROUP_RATIONALE_PREFIX} {item.rationale}"
+            selected.extend(group_items)
+
+        # Тип, посаженный куртинами, россыпью НЕ досыпается. Две причины, и обе
+        # существенные. Композиционная: смысл куртины в том, что между группами
+        # пусто, а досыпанная поверх россыпь возвращает ровно тот равномерный
+        # крап, ради ухода от которого группы и делались. Вычислительная:
+        # вычитание крон нескольких тысяч посадок из допустимой площади, которая
+        # на реальной улице состоит из тысячи с лишним кусков, стоило минут —
+        # замерено, весь прогон уходил за 23 минуты при 51 секунде на сами
+        # куртины.
+        if wants_groups and selected:
+            selected = _limit_by_density(selected, territory.area, density_per_ha.get(planting_type))
+            if species is not None:
+                for item in selected:
+                    item.species = species.name
+            items.extend(selected)
+            continue
+
+        if pattern not in ("row", "group") and not remaining.is_empty:
             scattered = generate_candidates(
                 remaining, exclusion, planting_type, type_norms, zoning_zones=zones, seed=seed
             )
             selected.extend(greedy_select(scattered, score_fn, type_norms))
+
+        selected = _limit_by_density(selected, territory.area, density_per_ha.get(planting_type))
 
         if species is not None:
             for item in selected:
