@@ -54,6 +54,22 @@ def _effective_norms(norms: PlantingNorms, tree_spacing_m: float | None, shrub_s
     return norms
 
 
+def _spacing_overridden(tree_spacing_m: float | None, shrub_spacing_m: float | None) -> tuple[str, ...]:
+    """Типы, интервал которых задал пользователь.
+
+    Нужно потому, что пользовательский интервал и выведенный из класса кроны
+    (МГСН 1.02-02, п. 4.2.9.2) приходят в одно и то же поле `min_distance_m`, и
+    внутри planner их уже не различить. Без этого списка явно выставленная в
+    панели цифра молча заменялась бы нормативной.
+    """
+    overridden = []
+    if tree_spacing_m:
+        overridden.append("tree")
+    if shrub_spacing_m:
+        overridden.append("shrub")
+    return tuple(overridden)
+
+
 def _compute_planting_rows(
     plan_id: str,
     utilities,
@@ -62,6 +78,7 @@ def _compute_planting_rows(
     planting_types: list[str],
     scorer: ScoringStrategy,
     norms,
+    keep_spacing_for: tuple[str, ...] = (),
 ) -> list[dict]:
     """Pure CPU work (geometry buffers/candidates/greedy selection, no DB
     access) — kept as one synchronous function so it can run in a worker
@@ -86,7 +103,16 @@ def _compute_planting_rows(
     this with the same plan_id and must get back the exact same layout, not
     a fresh random one, when it recomputes a collapsed plan's rows.
     """
-    items = plan_items(plan_id, utilities, zones, territory, planting_types, scorer.as_score_fn(), norms)
+    items = plan_items(
+        plan_id,
+        utilities,
+        zones,
+        territory,
+        planting_types,
+        scorer.as_score_fn(),
+        norms,
+        keep_spacing_for=keep_spacing_for,
+    )
     return [domain_item_to_row_values(plan_id, item) for item in items]
 
 
@@ -163,7 +189,15 @@ async def ensure_materialized(session: AsyncSession, plan: Plan) -> Plan:
     scorer = build_scorer(plan.scoring_mode, norms, existing_greenery)
 
     rows = await run_in_threadpool(
-        _compute_planting_rows, plan.id, utilities, zones, territory, plan.planting_types, scorer, norms
+        _compute_planting_rows,
+        plan.id,
+        utilities,
+        zones,
+        territory,
+        plan.planting_types,
+        scorer,
+        norms,
+        _spacing_overridden(plan.tree_spacing_m, plan.shrub_spacing_m),
     )
     if rows:
         await session.execute(insert(PlantingItemRow), rows)
@@ -233,7 +267,17 @@ async def generate_plan(
     session.add(plan)
     await session.flush()  # assigns plan.id (client-side default, no DB round trip needed), needed by _compute_planting_rows below
 
-    rows = await run_in_threadpool(_compute_planting_rows, plan.id, utilities, zones, territory, planting_types, scorer, norms)
+    rows = await run_in_threadpool(
+        _compute_planting_rows,
+        plan.id,
+        utilities,
+        zones,
+        territory,
+        planting_types,
+        scorer,
+        norms,
+        _spacing_overridden(tree_spacing_m, shrub_spacing_m),
+    )
     if rows:
         # Core bulk INSERT, not session.add_all() -- a real territory can
         # produce thousands of planting items per request, and individually
