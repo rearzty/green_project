@@ -108,7 +108,15 @@ _ZONING_PREFIX = "zoning:"
 # the same way, which is exactly what the per-group process pool below
 # (_PARALLEL_RENDER_THRESHOLD) exists to absorb.
 _MAX_CANVAS_PX = 6000
-_LINE_WIDTH_PX = {"utility": 3}
+# "building" wider than the default: most of the real dataset's building
+# outlines don't actually close into a polygon even after
+# geometry_cleanup.reconstruct_closed_footprints()'s snap-and-polygonize pass
+# (measured: 88% of real building zones stay a thin dangle-buffer sliver, not
+# a true footprint -- see that function's docstring for why a more aggressive
+# fix was tried and rejected as unsafe). A LineString at the default 2px reads
+# as a stray scribble; at wall-like thickness it reads as what it is -- a real
+# wall the survey drew, just one this reader couldn't close into a shape.
+_LINE_WIDTH_PX = {"utility": 3, "building": 4}
 _DEFAULT_LINE_WIDTH_PX = 2
 _POINT_RADIUS_PX = 3
 _FILL_ALPHA = 115  # ~0.45 opacity, matching MapView.tsx's layerStyle fillOpacity

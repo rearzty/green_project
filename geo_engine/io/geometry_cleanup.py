@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import math
 
+import shapely
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import linemerge, polygonize_full, unary_union
@@ -357,10 +358,25 @@ def _total_bounds(geometries: list[BaseGeometry]) -> tuple[float, float, float, 
 # nothing here can actually reconstruct the shape of.
 DEFAULT_DANGLE_BUFFER_M = 0.3
 
+# Snap tolerance before polygonize() -- deliberately the same value as
+# dxf_reader._POLYLINE_CLOSE_TOLERANCE_M (can't import it directly: dxf_reader
+# imports *this* module, importing back would be circular), reused rather than
+# invented because it is measuring the same thing: how far apart two vertices
+# that are drafted "at the same point" actually land in this dataset. Found
+# necessary, not just nice-to-have -- on one real sheet (12 867 open building
+# lines), naive polygonize() with no snapping closed 862 rings; nearest-
+# neighbour endpoint gaps showed most of the shortfall wasn't missing data but
+# sub-centimetre drafting noise (8 786 of 23 948 endpoints had a neighbour
+# within 1 cm). Snapping every vertex to this grid before polygonize() raised
+# that to 1 197 -- checked at 0.01/0.05/0.1/0.2 m, 0.05 m gave the most closed
+# rings of the four.
+DEFAULT_SNAP_GRID_M = 0.05
+
 
 def reconstruct_closed_footprints(
     geometries: list[BaseGeometry],
     dangle_buffer_m: float = DEFAULT_DANGLE_BUFFER_M,
+    snap_grid_m: float = DEFAULT_SNAP_GRID_M,
 ) -> list[BaseGeometry]:
     """Turn a building-outline line soup into real footprint polygons.
 
@@ -396,6 +412,28 @@ def reconstruct_closed_footprints(
     are kept as a thin buffered sliver rather than dropped, so a fragment we
     can't shape correctly still blocks a candidate rather than silently
     vanishing like the unfixed LineString did.
+
+    Even with snapping, most real building outlines in this dataset still
+    don't close: measured on the full real bundle (not one sheet), 18 204
+    zones read as `zone_type="building"`, only 122 with a footprint-scale
+    area (>20 m²) and 15 954 (88%) as sub-1 m² slivers. A proximity-clustering
+    fallback was tried and deliberately rejected: grouping nearby leftover
+    fragments (buffer-union within a tolerance, then convex hull of each
+    connected group) and reconstructing *that* as a footprint recovers more
+    shapes, but at 1 m clustering tolerance it also produced one 25 874 m²
+    "building" on a single real sheet — an unrelated chain of fragments
+    bridged into one shape via transitive proximity, which would silently
+    swallow real plantable area, a worse failure than the conservative sliver
+    it would replace. Correctness here favours under-recognizing a building
+    (a thin sliver still blocks *something*, and the loss is a few m² of
+    missed exclusion) over over-recognizing one (a wrongly merged blob can
+    blot out territory that was never a building at all). If this needs
+    revisiting, the direction is a *shape-aware* accept test on top of
+    clustering — e.g. comparing a cluster's hull perimeter against the summed
+    length of its member fragments, since a true single-building cluster's
+    fragments roughly trace its perimeter while a wrongly-bridged chain's
+    don't — not just a tighter distance threshold, which only trades one
+    failure mode for the other.
     """
     polygons: list[BaseGeometry] = []
     lines: list[LineString] = []
@@ -417,6 +455,8 @@ def reconstruct_closed_footprints(
     if not lines:
         return polygons
 
+    if snap_grid_m > 0:
+        lines = [shapely.set_precision(line, snap_grid_m) for line in lines]
     closed, cuts, dangles, invalid = polygonize_full(unary_union(lines))
     polygons.extend(g for g in closed.geoms if not g.is_empty)
 
