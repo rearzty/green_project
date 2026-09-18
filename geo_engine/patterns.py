@@ -388,54 +388,51 @@ def group_positions(
     return discs
 
 
-def group_candidates(
-    buildable_area: BaseGeometry,
+def fill_group(
+    disc: BaseGeometry,
     exclusion_zone: BaseGeometry,
     planting_type: PlantingType,
     in_group_pitch_m: float,
     seed: int,
     zoning_zones: list[Zone] | None = None,
-    group_pitch_m: float = GROUP_PITCH_M,
-    group_radius_m: float = GROUP_RADIUS_M,
 ) -> list[PlantingCandidate]:
-    """Кандидаты внутри куртин: плотно в группе, пусто между группами.
+    """Кандидаты внутри ОДНОЙ куртины.
 
-    Именно это, а не россыпь по всей площади, соответствует нормативным
-    интервалам кустарника (743-ПП табл. 3.6.2: «групповая посадка кустарников
-    — 0,3 м»). Прежняя россыпь с интервалом 3 м была компромиссом ровно из-за
-    того, что групп не было: применить 0,3 м ко всей площади означало ковёр,
-    а 3 м по всей площади — равномерный крап, не похожий на проект.
+    По одной группе за раз, а не все сразу: каждая куртина получает свою
+    породу, и одновидовая группа — это как устроен настоящий дендроплан.
+    Раздельная обработка возможна потому, что куртины по построению не
+    соприкасаются, так что общий отбор между ними не нужен.
+
+    Плотно внутри и пусто между группами — именно это соответствует
+    нормативным интервалам кустарника (743-ПП табл. 3.6.2: «групповая посадка
+    кустарников — 0,3 м»). Прежняя россыпь с интервалом 3 м была компромиссом
+    ровно из-за отсутствия групп: применить 0,3 м ко всей площади означало
+    ковёр, а 3 м по всей площади — равномерный крап, не похожий на проект.
     """
     zoning_zones = zoning_zones or []
-    discs = group_positions(buildable_area, group_pitch_m, group_radius_m, seed)
-    if not discs:
+    if disc is None or disc.is_empty:
         return []
 
-    rng = random.Random(seed ^ 0x5EED)
-    points: list[Point] = []
-    for disc in discs:
-        minx, miny, maxx, maxy = disc.bounds
-        width, height = maxx - minx, maxy - miny
-        if width <= 0 or height <= 0:
-            continue
-        shapely.prepare(disc)
-        # Сэмплирование с запасом относительно целевого шага: настоящее
-        # прореживание сделает greedy_select, которому на этот проход
-        # передаются нормы с групповым интервалом.
-        target = int((width / in_group_pitch_m + 1) * (height / in_group_pitch_m + 1) * _GROUP_OVERSAMPLE)
-        for _ in range(min(target + 8, _MAX_SAMPLES_PER_GROUP)):
-            point = Point(minx + rng.random() * width, miny + rng.random() * height)
-            if disc.contains(point):
-                points.append(point)
+    minx, miny, maxx, maxy = disc.bounds
+    width, height = maxx - minx, maxy - miny
+    if width <= 0 or height <= 0:
+        return []
 
+    shapely.prepare(disc)
+    rng = random.Random(seed ^ 0x5EED)
+    target = int((width / in_group_pitch_m + 1) * (height / in_group_pitch_m + 1) * _GROUP_OVERSAMPLE)
+    points: list[Point] = []
+    for _ in range(min(target + 8, _MAX_SAMPLES_PER_GROUP)):
+        point = Point(minx + rng.random() * width, miny + rng.random() * height)
+        if disc.contains(point):
+            points.append(point)
     if not points:
         return []
 
-    # Расстояние до зоны отступов считается одним векторизованным вызовом на
-    # все точки сразу, а не по точке. Это не микрооптимизация: зона отступов
-    # на реальной улице собрана из тысяч буферов, и поштучный `distance` по
-    # десяткам тысяч точек уводил генерацию за десять минут — замерено,
-    # прогон пришлось прервать.
+    # Расстояние до зоны отступов — одним векторизованным вызовом на все точки
+    # группы. Зона отступов на реальной улице собрана из тысяч буферов, и
+    # поштучный `distance` по десяткам тысяч точек уводил генерацию за десять
+    # минут — замерено, прогон пришлось прервать.
     if exclusion_zone is None or exclusion_zone.is_empty:
         clearances = [float("inf")] * len(points)
     else:

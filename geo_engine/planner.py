@@ -22,10 +22,13 @@ from geo_engine.candidates import generate_candidates
 from geo_engine.model import PlantingItem, Utility, Zone
 from geo_engine.norms import PlantingNorms
 from geo_engine.patterns import (
+    GROUP_PITCH_M,
     GROUP_PLANTING_TYPES,
+    GROUP_RADIUS_M,
     ROW_PLANTING_TYPES,
     collect_row_guides,
-    group_candidates,
+    fill_group,
+    group_positions,
     row_candidates,
     territory_guide,
 )
@@ -63,6 +66,85 @@ GROUP_RATIONALE_PREFIX = "Групповая посадка (куртина)."
 IN_GROUP_PITCH_M = 0.5
 
 
+def _fit_row_species(
+    palette: list[Species],
+    planting_type: str,
+    zones: list[Zone],
+    territory: BaseGeometry,
+    utilities: list[Utility],
+    norms: PlantingNorms,
+    keep_spacing_for: Collection[str],
+    catalogue: SpeciesCatalogue,
+):
+    """Выбрать из палитры породу, которой на этой площадке реально есть место.
+
+    Возвращает (порода, нормы под неё, кандидаты ряда, ориентиры).
+
+    Нужно потому, что от класса кроны зависит и интервал (МГСН 1.02-02
+    п. 4.2.9.2: 8-10 м широкая против 3-4 узкая), и величина отступов
+    (примечание 1 к таблицам 743-ПП и СП: табличные значения увеличиваются
+    для кроны крупнее 5 м). На плотной улице широкая крона даёт единицы
+    посадок: замерено — дуб с кроной 10 м дал 14 деревьев там, где узкая
+    даёт сотни. Жребий тут неуместен: проектировщик в таком месте берёт
+    породу поуже, и это ровно то решение, которое инструмент может принять
+    сам, потому что критерий объективен.
+
+    Перебор по палитре, а не оптимизация: пород в палитре единицы, каждая
+    проверка — один проход построения ряда.
+    """
+    best = None
+    for candidate_species in palette or [None]:
+        type_norms = norms
+        if candidate_species is not None and planting_type not in keep_spacing_for:
+            type_norms = norms_for_species(norms, planting_type, candidate_species, catalogue)
+        exclusion = build_exclusion_zone(
+            utilities, zones, planting_type, type_norms, candidate_species, catalogue.crown_reference_diameter_m
+        )
+        buildable = buildable_area(
+            territory, exclusion, zones, territory_margin_m=type_norms.territory_margin_for(planting_type)
+        )
+        guides = collect_row_guides(
+            zones, planting_type, type_norms, candidate_species, catalogue.crown_reference_diameter_m
+        )
+        boundary = territory_guide(territory, planting_type, type_norms)
+        if boundary is not None:
+            guides.append(boundary)
+        rows = row_candidates(
+            guides,
+            buildable,
+            exclusion,
+            planting_type,
+            type_norms.spacing_for(planting_type).min_distance_m,
+            zoning_zones=zones,
+        )
+        if best is None or len(rows) > len(best[2]):
+            best = (candidate_species, type_norms, rows, guides)
+    return best
+
+
+def _other_species(palette: list[Species], besides: Species | None) -> Species | None:
+    """Первая порода палитры, не совпадающая с уже выбранной."""
+    for candidate in palette:
+        if besides is None or candidate.name != besides.name:
+            return candidate
+    return besides
+
+
+def _palette_pick(palette: list[Species], index: int) -> Species | None:
+    """Порода номер `index` палитры, по кругу.
+
+    Детерминированно и без сида: сид уже определил саму палитру и её порядок,
+    второй источник случайности тут только мешал бы — соседние куртины должны
+    чередоваться предсказуемо, а не совпадать по случайности. Именно так и
+    вышло в первой версии: фаза россыпи выбрала ту же породу, что и ряд,
+    потому что `(1 + seed) % 3` совпало с нулём, и весь план оказался
+    одновидовым при палитре из трёх.
+    """
+    if not palette:
+        return None
+    return palette[index % len(palette)]
+
+
 def _limit_by_density(
     items: list[PlantingItem], area_m2: float, density_per_ha: float | None
 ) -> list[PlantingItem]:
@@ -92,6 +174,32 @@ def _limit_by_density(
     return sorted(items, key=lambda item: item.score, reverse=True)[:allowed]
 
 
+def choose_species_palette(
+    plan_key: str,
+    planting_type: str,
+    catalogue: SpeciesCatalogue | None = None,
+    count: int = 3,
+) -> list[Species]:
+    """Несколько пород на один тип посадки — палитра плана.
+
+    Одна порода на весь тип давала монотонность: план читался как равномерное
+    заполнение, а не как замысел. Настоящий дендроплан устроен иначе — аллея
+    одной породой (в ряду однородность и есть смысл), а группы разными.
+
+    Порядок детерминирован от `plan_key`: первая порода палитры идёт в ряд,
+    остальные — по куртинам. Тот же сид, что и у выбора одной породы, чтобы
+    план оставался чистой функцией от рецепта.
+    """
+    catalogue = catalogue or load_catalogue()
+    pool = catalogue.for_type(planting_type)
+    if not pool:
+        return []
+    rng = random.Random(zlib.crc32(f"{plan_key}:{planting_type}:species".encode()))
+    shuffled = list(pool)
+    rng.shuffle(shuffled)
+    return shuffled[: max(1, count)]
+
+
 def choose_species(
     plan_key: str,
     planting_type: str,
@@ -112,8 +220,8 @@ def choose_species(
     pool = catalogue.for_type(planting_type)
     if not pool:
         return None
-    rng = random.Random(zlib.crc32(f"{plan_key}:{planting_type}:species".encode()))
-    return rng.choice(pool)
+    palette = choose_species_palette(plan_key, planting_type, catalogue, count=1)
+    return palette[0] if palette else None
 
 
 def norms_for_species(
@@ -196,7 +304,10 @@ def plan_items(
 
     for planting_type in planting_types:
         override = species_overrides.get(planting_type)
-        species = catalogue.get(override) if override else choose_species(plan_key, planting_type, catalogue)
+        palette = choose_species_palette(plan_key, planting_type, catalogue)
+        # Породу ряда берём первой из палитры: в ряду однородность и есть
+        # смысл, а остальные породы уходят по куртинам.
+        species = catalogue.get(override) if override else (palette[0] if palette else None)
         type_norms = norms
         if planting_type not in keep_spacing_for:
             type_norms = norms_for_species(norms, planting_type, species, catalogue)
@@ -218,18 +329,34 @@ def plan_items(
 
         wants_rows = pattern in ("auto", "row") and planting_type in ROW_PLANTING_TYPES
         if wants_rows:
-            guides = collect_row_guides(
-                zones, planting_type, type_norms, species, catalogue.crown_reference_diameter_m
+            # Породу ряда выбирает не жребий, а площадка: у широкой кроны и
+            # интервал вдвое больше, и отступы масштабируются примечанием 1 к
+            # таблицам, так что на тесной улице она даёт единицы посадок.
+            # Замерено: дуб (крона 10 м) дал 14 деревьев там, где узкая крона
+            # даёт сотни. Проектировщик в таком месте берёт породу поуже —
+            # здесь это делается перебором палитры по фактическому результату.
+            species, type_norms, rows, guides = _fit_row_species(
+                [species] if override else palette,
+                planting_type,
+                zones,
+                territory,
+                utilities,
+                norms,
+                keep_spacing_for,
+                catalogue,
             )
-            boundary_guide = territory_guide(territory, planting_type, type_norms)
-            if boundary_guide is not None:
-                guides.append(boundary_guide)
-
-            rows = row_candidates(
-                guides, buildable, exclusion, planting_type, spacing.min_distance_m, zoning_zones=zones
+            spacing = type_norms.spacing_for(planting_type)
+            exclusion = build_exclusion_zone(
+                utilities, zones, planting_type, type_norms, species, catalogue.crown_reference_diameter_m
             )
+            buildable = buildable_area(
+                territory, exclusion, zones, territory_margin_m=type_norms.territory_margin_for(planting_type)
+            )
+            remaining = buildable
             row_items = greedy_select(rows, score_fn, type_norms)
             for item in row_items:
+                if species is not None:
+                    item.species = species.name
                 # Пометка идёт в rationale, а не в новое поле PlantingItem:
                 # поле пришлось бы протаскивать через строки БД и миграцию ради
                 # сведения, которое нужно отчёту и CLI, а не доменной модели.
@@ -249,18 +376,30 @@ def plan_items(
 
         wants_groups = pattern in ("auto", "group") and planting_type in GROUP_PLANTING_TYPES
         if wants_groups and not remaining.is_empty:
-            clumps = group_candidates(
-                remaining, exclusion, planting_type, IN_GROUP_PITCH_M, seed, zoning_zones=zones
-            )
             # Отбор внутри куртины идёт по ГРУППОВОМУ интервалу, а не по
             # обычному: иначе greedy_select, буферизующий каждую точку на
             # canopy_radius_m от одиночной посадки, прорядил бы группу до той
             # же россыпи, ради ухода от которой она и делается.
             group_norms = type_norms.with_spacing_override(planting_type, IN_GROUP_PITCH_M)
-            group_items = greedy_select(clumps, score_fn, group_norms)
-            for item in group_items:
-                item.rationale = f"{GROUP_RATIONALE_PREFIX} {item.rationale}"
-            selected.extend(group_items)
+            discs = group_positions(remaining, GROUP_PITCH_M, GROUP_RADIUS_M, seed)
+            # Каждая куртина обрабатывается отдельно и получает СВОЮ породу.
+            # Одновидовая группа — это как устроен настоящий дендроплан, и
+            # именно смена породы между куртинами делает план рисунком, а не
+            # равномерным заполнением. Раздельная обработка возможна потому,
+            # что куртины по построению не соприкасаются (радиус 3 м при шаге
+            # центров 14 м), так что общий отбор между ними не нужен.
+            for index, disc in enumerate(discs):
+                disc_species = species if override else _palette_pick(palette, index)
+                clumps = fill_group(
+                    disc, exclusion, planting_type, IN_GROUP_PITCH_M, seed + index, zoning_zones=zones
+                )
+                if not clumps:
+                    continue
+                for item in greedy_select(clumps, score_fn, group_norms):
+                    item.rationale = f"{GROUP_RATIONALE_PREFIX} {item.rationale}"
+                    if disc_species is not None:
+                        item.species = disc_species.name
+                    selected.append(item)
 
         # Тип, посаженный куртинами, россыпью НЕ досыпается. Две причины, и обе
         # существенные. Композиционная: смысл куртины в том, что между группами
@@ -272,23 +411,59 @@ def plan_items(
         # куртины.
         if wants_groups and selected:
             selected = _limit_by_density(selected, territory.area, density_per_ha.get(planting_type))
-            if species is not None:
-                for item in selected:
-                    item.species = species.name
             items.extend(selected)
             continue
 
         if pattern not in ("row", "group") and not remaining.is_empty:
+            # Россыпь идёт ВТОРОЙ породой палитры, если она есть: аллея одной
+            # породы и свободные группы другой — это и отличает план-рисунок
+            # от равномерной раскладки. Интервал берётся под эту породу, её
+            # класс кроны может отличаться от рядовой.
+            # Первая порода палитры, ОТЛИЧНАЯ от рядовой, а не просто вторая
+            # по счёту: породу ряда выбирает площадка (_fit_row_species), и она
+            # запросто оказывается той же, что стоит в палитре второй. Именно
+            # так и вышло — весь древесный ярус получился одновидовым при
+            # палитре из трёх. Аллея одной породы и свободные группы другой —
+            # это и отличает план-рисунок от равномерной раскладки.
+            loose_species = species if override else _other_species(palette, species)
+            loose_norms = type_norms
+            loose_exclusion = exclusion
+            loose_area = remaining
+            if loose_species is not None and (loose_species is not species):
+                # Зона отступов и допустимая площадь пересчитываются ПОД ЭТУ
+                # породу. Без этого россыпь сажает по чужим отступам: площадь
+                # посчитана под рядовую породу, а сажается другая, с иным
+                # классом кроны и, значит, иными отступами (примечание 1 к
+                # таблицам 743-ПП и СП масштабирует их по диаметру кроны).
+                # Живьём это дало 52 нарушения из 1262 — план, который
+                # отвергает собственная проверка сервиса, ровно тот же класс
+                # ошибки, что уже ловили на буферах.
+                if planting_type not in keep_spacing_for:
+                    loose_norms = norms_for_species(norms, planting_type, loose_species, catalogue)
+                loose_exclusion = build_exclusion_zone(
+                    utilities, zones, planting_type, loose_norms, loose_species,
+                    catalogue.crown_reference_diameter_m,
+                )
+                loose_buildable = buildable_area(
+                    territory, loose_exclusion, zones,
+                    territory_margin_m=loose_norms.territory_margin_for(planting_type),
+                )
+                # Пересечение, а не замена: из `remaining` уже вычтены кроны
+                # поставленного ряда, и терять это нельзя.
+                loose_area = loose_buildable.intersection(remaining)
+            if loose_area.is_empty:
+                loose_area = remaining
+                loose_exclusion = exclusion
+                loose_norms = type_norms
+                loose_species = species
             scattered = generate_candidates(
-                remaining, exclusion, planting_type, type_norms, zoning_zones=zones, seed=seed
+                loose_area, loose_exclusion, planting_type, loose_norms, zoning_zones=zones, seed=seed
             )
-            selected.extend(greedy_select(scattered, score_fn, type_norms))
+            for item in greedy_select(scattered, score_fn, loose_norms):
+                if loose_species is not None:
+                    item.species = loose_species.name
+                selected.append(item)
 
         selected = _limit_by_density(selected, territory.area, density_per_ha.get(planting_type))
-
-        if species is not None:
-            for item in selected:
-                item.species = species.name
-
         items.extend(selected)
     return items
