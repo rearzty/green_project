@@ -12,7 +12,24 @@ import { SEASON_LABELS, type LayerLegendEntry, type Season } from "@/lib/mapStyl
 import { errorMessage, toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
+// Пустая строка первым пунктом — это «не указывать CRS», а не заглушка:
+// lib/api.ts не отправляет поле, если значение пустое, и тогда бэкенд сам
+// выводит систему координат из координат файла. Только в этом случае
+// Project.crs_verified становится true и под планом показывается настоящая
+// карта — выбранное человеком значение остаётся догадкой, которую нечем
+// проверить.
+//
+// Стоит первым и по умолчанию потому, что до этого умолчанием был UTM 37N, и
+// он молча подставлялся всем подряд: у пилотных чертежей координаты локальные,
+// и такая «проверенная» подстановка уносила московскую улицу к экватору. Теперь
+// обычный путь «загрузил файл и ничего не трогал» просит программу разобраться
+// самой, а явный выбор остаётся тем, кто CRS действительно знает.
+//
+// Найдено на живом тесте: добраться до автоопределения можно было только через
+// «Свой…» с последующей очисткой поля — догадаться об этом невозможно.
+const AUTO_CRS = "";
 const CRS_PRESETS = [
+  { value: AUTO_CRS, label: "Определить автоматически" },
   { value: "EPSG:4326", label: "WGS84 (EPSG:4326)" },
   { value: "EPSG:3857", label: "Web Mercator (EPSG:3857)" },
   { value: "EPSG:32636", label: "UTM 36N (EPSG:32636)" },
@@ -203,12 +220,12 @@ export function ControlPanel({
 }: ControlPanelProps) {
   const [file, setFile] = useState<File | null>(null);
   const [name, setName] = useState("Тестовая территория");
-  // Defaults to the CRS scripts/generate_synthetic_data.py writes test data
-  // in (UTM 37N, covers Moscow) so synthetic uploads land on the real map
-  // out of the box — clear/replace it once real Mosgeotrest data (unknown
-  // CRS until 15.09) is being uploaded instead.
-  const [sourceCrs, setSourceCrs] = useState("EPSG:32637");
-  const [crsPreset, setCrsPreset] = useState<string>("EPSG:32637");
+  // Умолчание — автоопределение, а НЕ UTM 37N, каким оно было раньше «чтобы
+  // синтетика сразу попадала на карту»: см. AUTO_CRS выше. Реальные чертежи
+  // приходят в локальных координатах, и молчаливая подстановка UTM 37N всем
+  // подряд уносила московскую улицу к экватору, причём с видом уверенности.
+  const [sourceCrs, setSourceCrs] = useState(AUTO_CRS);
+  const [crsPreset, setCrsPreset] = useState<string>(AUTO_CRS);
   const [busy, setBusy] = useState(false);
   // Per violation group: how many times "show on map" was clicked, to step through its items.
   const [violationCursor, setViolationCursor] = useState<Record<string, number>>({});

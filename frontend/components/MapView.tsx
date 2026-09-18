@@ -951,10 +951,24 @@ export default function MapView({
           copyright below stays: that one *is* required by OpenStreetMap's
           tile usage policy for using their tiles at all. */}
       <AttributionControl prefix={false} />
+      {/* maxZoom has to be repeated on the layer, not just on <MapContainer>.
+          L.TileLayer carries its OWN maxZoom, default 18 (confirmed in
+          node_modules/leaflet/dist/leaflet-src.js), and _setView sets tileZoom
+          to undefined as soon as the map zoom exceeds it -- past that point the
+          layer draws NOTHING instead of upscaling, and the basemap turns into a
+          black screen. maxNativeZoom does not rescue that: it is read in
+          _clampZoom, which sits in the else branch the undefined already
+          skipped. Found live by a user: the map opened fine zoomed out and went
+          black on zooming in.
+
+          The two values stay different on purpose: OSM has no tiles past 19, so
+          ask for level 19 and let Leaflet upscale it for 20-21 rather than
+          request tiles that do not exist. */}
       {crsVerified && (
         <TileLayer
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          maxZoom={21}
           maxNativeZoom={19}
         />
       )}
