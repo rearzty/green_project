@@ -273,6 +273,11 @@ class TestGeneratorAndCheckerAgree:
                     norms,
                     species_overrides={"tree": species_name},
                     catalogue=catalogue,
+                    # DEFAULT_DENSITY_PER_HA (planner.py) would otherwise cap
+                    # both species down to the same allowance on this
+                    # 3.2ha/narrow-crown-heavy scene, hiding exactly the
+                    # count difference this test exists to catch.
+                    density_per_ha={"tree": 0},
                 )
             )
 

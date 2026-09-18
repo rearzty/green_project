@@ -13,7 +13,7 @@ import pytest
 from shapely.geometry import Point
 
 from geo_engine.io.dxf_writer import RESULT_LAYER_PREFIX
-from scripts.plan_dxf import main
+from scripts.plan_dxf import _parse_densities, main
 
 
 def _drawing(tmp_path, name="site.dxf"):
@@ -117,6 +117,40 @@ def test_unknown_planting_type_is_rejected_before_any_work(tmp_path):
     assert "кактус" in str(excinfo.value)
 
 
+class TestParseDensities:
+    """--density tree=0 has to mean "explicitly disable the default cap for
+    tree", not "reject as invalid" -- see geo_engine.planner.DEFAULT_DENSITY_PER_HA."""
+
+    def test_positive_values_parse(self):
+        assert _parse_densities(["tree=25", "shrub=250.5"]) == {"tree": 25.0, "shrub": 250.5}
+
+    def test_zero_is_accepted_not_rejected(self):
+        assert _parse_densities(["tree=0"]) == {"tree": 0.0}
+
+    def test_negative_is_still_rejected(self):
+        with pytest.raises(SystemExit, match="отрицательной"):
+            _parse_densities(["tree=-5"])
+
+    def test_missing_argument_uses_the_default_density(self):
+        assert _parse_densities(None) == {}
+
+    def test_malformed_entry_is_rejected(self):
+        with pytest.raises(SystemExit, match="ТИП=ЧИСЛО"):
+            _parse_densities(["tree"])
+
+
+def test_density_zero_disables_the_default_cap_for_that_type(tmp_path):
+    """End-to-end: --density tree=0 must run to completion (not be rejected
+    as an invalid value) and skip the density limiter for tree specifically."""
+    source = _drawing(tmp_path)
+    out = tmp_path / "out" / "plan.dxf"
+
+    exit_code = main(["--input", str(source), "--output", str(out), "--types", "tree", "--density", "tree=0"])
+
+    assert exit_code == 0
+    assert out.exists()
+
+
 def test_the_same_plan_key_reproduces_the_same_plan(tmp_path):
     """Placement is randomized but seeded from the plan key, so a rerun with the
     same arguments has to give the same drawing — the brief grades
@@ -135,12 +169,24 @@ def test_the_same_plan_key_reproduces_the_same_plan(tmp_path):
 
 
 def test_a_different_plan_key_gives_a_different_layout(tmp_path):
+    """--density tree=0 disables the default density cap on purpose: the row
+    phase picks its species by which one fits the most rows, not by plan_key
+    (see planner._fit_row_species), so it's identical across plan_keys on
+    this drawing (103 "Рябина обыкновенная" either way) -- what actually
+    varies with plan_key is the scatter phase's second species/count. With
+    the default cap (25 trees/ha on this drawing's 1.08 ha -> 27 allowed)
+    the row alone already exceeds that, so capping keeps only row candidates
+    and the two plan_keys converge on byte-identical output -- a real,
+    correct interaction with DEFAULT_DENSITY_PER_HA (see planner.py), not
+    what this test means to exercise. Reproducibility-under-a-fixed-key is
+    covered separately above and isn't affected by this.
+    """
     source = _drawing(tmp_path)
 
     layouts = []
     for key in ("one", "two"):
         out = tmp_path / f"{key}.dxf"
-        main(["--input", str(source), "--output", str(out), "--types", "tree", "--plan-key", key])
+        main(["--input", str(source), "--output", str(out), "--types", "tree", "--plan-key", key, "--density", "tree=0"])
         report = json.loads(out.with_suffix(".report.json").read_text(encoding="utf-8"))
         layouts.append([(i["x"], i["y"]) for i in report["items"]])
 

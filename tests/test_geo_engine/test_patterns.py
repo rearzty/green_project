@@ -216,9 +216,15 @@ class TestPlannerPatterns:
 
         territory, zones = self._scene()
 
+        # density_per_ha={"tree": 0}: this test checks that BOTH phases
+        # (row + scatter) occur, which DEFAULT_DENSITY_PER_HA can suppress
+        # on a scene this small/dense (the row alone can already exceed the
+        # 25/ha default, leaving nothing for the density cap to keep from
+        # scatter) -- unrelated to what this test verifies, see planner.py.
         items = plan_items(
             "rows", [], zones, territory, ["tree"], self._score, norms,
             species_overrides={"tree": "Липа мелколистная"}, pattern="auto", catalogue=catalogue,
+            density_per_ha={"tree": 0},
         )
         in_rows = [i for i in items if i.rationale.startswith(ROW_RATIONALE_PREFIX)]
 
@@ -290,9 +296,14 @@ class TestPlannerPatterns:
 
         territory, zones = self._scene()
 
+        # density_per_ha={"tree": 0}: needs both phases present with
+        # different species to catch the defect -- DEFAULT_DENSITY_PER_HA
+        # would otherwise cap the plan down to row-only on this scene (see
+        # test_auto_produces_rows_and_marks_them's comment above).
         items = plan_items(
             "mixed", [], zones, territory, ["tree"], self._score, norms,
             pattern="auto", catalogue=catalogue,
+            density_per_ha={"tree": 0},
         )
         rows = [i for i in items if i.rationale.startswith(ROW_RATIONALE_PREFIX)]
         loose = [i for i in items if not i.rationale.startswith(ROW_RATIONALE_PREFIX)]
