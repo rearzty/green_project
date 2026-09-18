@@ -35,8 +35,14 @@ import ezdxf
 import ezdxf.recover
 from shapely.geometry import LineString, Point, Polygon
 from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
 
-from geo_engine.io.geometry_cleanup import is_origin_artifact, merge_dashed_lines, origin_is_artifact
+from geo_engine.io.geometry_cleanup import (
+    is_origin_artifact,
+    merge_dashed_lines,
+    origin_is_artifact,
+    reconstruct_closed_footprints,
+)
 from geo_engine.io.layer_rules import classify_layer, is_symbol_layer
 from geo_engine.model import Utility, Zone
 
@@ -237,7 +243,101 @@ def _entity_to_geometry(entity) -> BaseGeometry | None:
         insert = entity.dxf.insert
         return Point(insert.x, insert.y)
 
+    if dxftype == "HATCH":
+        return _hatch_to_geometry(entity)
+
     return None
+
+
+def _boundary_path_points(path) -> list[tuple[float, float]]:
+    """One HATCH boundary loop's vertices, flattened to straight segments.
+
+    A path is either a `PolylinePath` (vertices already flat, `(x, y, bulge)`
+    tuples — bulge/arc segments within the polyline are not curved here,
+    a small approximation accepted for the same reason the rest of this
+    reader accepts one: this feeds an obstacle/fill area, not a surveyed
+    boundary that has to be exact to the millimetre) or an `EdgePath` (each
+    edge is its own LINE/ARC/ELLIPSE/SPLINE with its own start point; curved
+    edges are flattened via ezdxf's own `construction_tool().flattening()`,
+    straight ones just contribute their start point — the next edge's start,
+    or the loop's own closing point, supplies the rest).
+    """
+    if hasattr(path, "vertices"):
+        return [(v[0], v[1]) for v in path.vertices]
+
+    points: list[tuple[float, float]] = []
+    edges = list(getattr(path, "edges", []))
+    for edge in edges:
+        edge_type = getattr(edge, "EDGE_TYPE", "")
+        if edge_type == "LineEdge":
+            start = edge.start_point
+            points.append((start[0], start[1]))
+            continue
+        try:
+            tool = edge.construction_tool()
+            flattened = [(p.x, p.y) for p in tool.flattening(0.2)]
+        except Exception:
+            start = edge.start_point
+            flattened = [(start[0], start[1])]
+        points.extend(flattened[:-1] if len(flattened) > 1 else flattened)
+    if edges:
+        end = edges[-1].end_point
+        points.append((end[0], end[1]))
+    return points
+
+
+def _hatch_to_geometry(entity) -> BaseGeometry | None:
+    """A HATCH's fill area as shapely geometry -- the actual paved/lawn/tile
+    surface polygons a real bureau's drawing carries in a dedicated "fills"
+    layer/file, separate from the outline linework `_entity_to_geometry`
+    otherwise reads (see geometry_cleanup.reconstruct_closed_footprints's
+    docstring for why the outline alone is often not even closed). Until this
+    branch existed, HATCH fell through to the final `return None` above --
+    not misclassified, not counted as "unknown", just silently absent from
+    both utilities and zones.
+
+    Multiple boundary loops on one HATCH are holes-in-an-outer-loop far more
+    often than "several unrelated shapes that happen to share a layer" (a
+    donut-shaped planter bed cut out of a paved courtyard, say) -- but this
+    dataset's fill layers are small per-entity seam/patch hatches (measured:
+    tens to a couple hundred m² per entity at most), so treating the largest
+    loop as the exterior and subtracting any loop actually contained in it,
+    unioning whatever is not contained as separate shapes, covers the real
+    shapes without having to trust the DXF boundary-path flag bits (which
+    don't reliably distinguish "hole" from "second exterior" across CAD
+    export chains).
+    """
+    loops: list[Polygon] = []
+    for path in entity.paths:
+        points = _boundary_path_points(path)
+        if len(points) < 3:
+            continue
+        try:
+            polygon = Polygon(points)
+        except Exception:
+            continue
+        if not polygon.is_valid:
+            polygon = polygon.buffer(0)
+        if polygon.is_empty or polygon.area <= 0:
+            continue
+        loops.append(polygon)
+
+    if not loops:
+        return None
+    if len(loops) == 1:
+        return loops[0]
+
+    loops.sort(key=lambda p: p.area, reverse=True)
+    outer, rest = loops[0], loops[1:]
+    holes = [p for p in rest if outer.contains(p)]
+    separate = [p for p in rest if p not in holes]
+
+    result = outer
+    if holes:
+        result = result.difference(unary_union(holes))
+    if separate:
+        result = unary_union([result, *separate])
+    return result if not result.is_empty else None
 
 
 def iter_entities(
@@ -541,6 +641,7 @@ def _read_one_bundle_file(
     symbol_layers: frozenset[str] | None,
     drop_origin: bool,
     use_layer_rules: bool,
+    reconstruct_footprints: bool = False,
 ) -> tuple[list[Utility], list[Zone]]:
     """One file's read_dxf call, module-level and picklable so it can run in
     a worker process (see read_dxf_bundle). Raises straight through --
@@ -555,6 +656,7 @@ def _read_one_bundle_file(
         stitch_dashes=False,
         drop_origin=drop_origin,
         use_layer_rules=use_layer_rules,
+        reconstruct_footprints=reconstruct_footprints,
     )
 
 
@@ -566,6 +668,7 @@ def read_dxf_bundle(
     stitch_dashes: bool = False,
     drop_origin: bool = False,
     use_layer_rules: bool = True,
+    reconstruct_footprints: bool = False,
     on_error: Callable[[Path, Exception], None] | None = _warn_unreadable,
 ) -> tuple[list[Utility], list[Zone]]:
     """Read several DXF files as one drawing.
@@ -608,7 +711,14 @@ def read_dxf_bundle(
         with ProcessPoolExecutor(max_workers=worker_count) as pool:
             futures = {
                 pool.submit(
-                    _read_one_bundle_file, path, layer_map, explode_blocks, symbol_layers, drop_origin, use_layer_rules
+                    _read_one_bundle_file,
+                    path,
+                    layer_map,
+                    explode_blocks,
+                    symbol_layers,
+                    drop_origin,
+                    use_layer_rules,
+                    reconstruct_footprints,
                 ): path
                 for path in paths
             }
@@ -634,6 +744,7 @@ def read_dxf_bundle(
                     stitch_dashes=False,
                     drop_origin=drop_origin,
                     use_layer_rules=use_layer_rules,
+                    reconstruct_footprints=reconstruct_footprints,
                 )
             except Exception as error:  # noqa: BLE001 — судьбу решает вызывающий
                 if on_error is None:
@@ -670,6 +781,17 @@ def resolve_layer(layer: str, layer_map: LayerMap, use_rules: bool = True) -> tu
     return ("zone", "unknown")
 
 
+# Zone types reconstructed from line soup into closed polygons when
+# `reconstruct_footprints=True` — see geometry_cleanup.reconstruct_closed_footprints
+# for why this is necessary at all. Building only for now: it's the one
+# checked live on the pilot data (real "Здания" layer, 0/409 LWPOLYLINE
+# entities closed) and the one with a real correctness consequence
+# (buildable_area's hard-obstacle subtraction is a no-op on a LineString).
+# "road" stays a deliberate line (the kerb, not the carriageway — see
+# MOSGEOTREST_LAYER_MAP's "Бортовой камень" comment), so it is not in here.
+RECONSTRUCT_FOOTPRINT_ZONE_TYPES = ("building",)
+
+
 def read_dxf(
     path: str | Path,
     layer_map: LayerMap | None = None,
@@ -678,14 +800,15 @@ def read_dxf(
     stitch_dashes: bool = False,
     drop_origin: bool = False,
     use_layer_rules: bool = True,
+    reconstruct_footprints: bool = False,
 ) -> tuple[list[Utility], list[Zone]]:
     """Parse a DXF file's modelspace into Utility and Zone lists, keyed by
     layer name via `layer_map` (defaults to DEFAULT_LAYER_MAP).
 
-    `stitch_dashes` and `drop_origin` are the CAD-export cleanups described in
-    geometry_cleanup — off by default because they only apply to drawings that
-    have those artifacts, and a caller reading a clean DXF should get exactly
-    what the file contains.
+    `stitch_dashes`, `drop_origin` and `reconstruct_footprints` are the
+    CAD-export cleanups described in geometry_cleanup — off by default
+    because they only apply to drawings that have those artifacts, and a
+    caller reading a clean DXF should get exactly what the file contains.
 
     `use_layer_rules` включает распознавание слоя по образцу имени, когда
     дословной записи в карте нет (см. layer_rules). По умолчанию включено:
@@ -716,6 +839,20 @@ def read_dxf(
             utilities.append(Utility(geometry=geometry, object_type=object_type, layer_source=layer))
         else:
             zones.append(Zone(geometry=geometry, zone_type=object_type, attrs={"layer": layer}))
+
+    if reconstruct_footprints:
+        # Per zone_type, not globally: pooling e.g. building outlines with
+        # unrelated road-edge lines into one polygonize() call would let GEOS
+        # node them together at any incidental shared point and merge two
+        # unrelated objects into one bogus ring.
+        for footprint_type in RECONSTRUCT_FOOTPRINT_ZONE_TYPES:
+            targeted = [z for z in zones if z.zone_type == footprint_type]
+            if not targeted:
+                continue
+            rest = [z for z in zones if z.zone_type != footprint_type]
+            rebuilt = reconstruct_closed_footprints([z.geometry for z in targeted])
+            layer_note = targeted[0].attrs or {}
+            zones = rest + [Zone(geometry=g, zone_type=footprint_type, attrs=layer_note) for g in rebuilt]
 
     if drop_origin:
         # One decision over the whole extraction, then a per-object predicate:
