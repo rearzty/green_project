@@ -33,6 +33,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass
 
@@ -40,6 +41,7 @@ import shapely
 
 from shapely.geometry import LineString, MultiLineString, Point
 from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
 
 from geo_engine.candidates import ZoningIndex, _clearance
 from geo_engine.io.geometry_cleanup import merge_dashed_lines
@@ -104,6 +106,33 @@ ROW_SEARCH_BAND_M = 6.0
 # линии обязательна, а после неё короткие остатки всё равно надо отбрасывать:
 # аллеи вдоль трёхметрового бордюрного огрызка не бывает.
 MIN_GUIDE_LENGTH_M = 15.0
+
+# Шаг вдоль ряда при ДВУХРЯДНОЙ посадке. 743-ПП, п. 3.6.4, табл. 3.6.2
+# «Ориентировочные расстояния между деревьями и кустарниками на магистралях»:
+# «Газон с однорядной посадкой деревьев — 5-6; с двухрядной посадкой деревьев
+# — 7-8». Столбец таблицы называется «Расстояние между деревьями и
+# кустарниками», то есть 7-8 м — это шаг ВДОЛЬ ряда, а не промежуток между
+# рядами; промежуток эта таблица для деревьев не задаёт вовсе (примечание про
+# ширину полосы относится к кустарнику). Берётся нижняя граница диапазона —
+# то же правило, что и для интервала по классу кроны: диапазон задаёт минимум,
+# и 7 ему удовлетворяет.
+#
+# Почему шаг БОЛЬШЕ, чем у однорядной: рядов два, и суммарная плотность
+# посадки на погонный метр улицы остаётся той же.
+DOUBLE_ROW_PITCH_M = 7.0
+
+# Минимальная длина полезного куска второй эквидистанты, при которой второй ряд
+# вообще имеет смысл. Два шага — тот же порог, по которому уже выбирается
+# эквидистанта первого ряда: вдоль более короткого куска «ряда» не получается,
+# получается пара случайных точек.
+_MIN_SECOND_ROW_PITCHES = 2
+
+# Во сколько промежутков между рядами «дотягивается» второй ряд, решая, считать
+# ли участок первого ряда двухрядным. Полтора — с запасом больше самого
+# промежутка (иначе пограничные точки попадали бы то в один набор, то в другой
+# из-за погрешности буферов) и заведомо меньше расстояния, на котором второй
+# ряд уже никак не влияет на восприятие первого.
+_SECOND_ROW_REACH = 1.1
 
 
 @dataclass(frozen=True)
@@ -206,7 +235,7 @@ def _as_lines(geometry: BaseGeometry | None) -> list[LineString]:
     return lines
 
 
-def points_along(line: LineString, pitch_m: float) -> list[Point]:
+def points_along(line: LineString, pitch_m: float, anchor_m: float | None = None) -> list[Point]:
     """Точки вдоль линии с шагом `pitch_m`.
 
     Для незамкнутой линии — отцентрованные по её длине. Центрирование, а не
@@ -229,6 +258,15 @@ def points_along(line: LineString, pitch_m: float) -> list[Point]:
         # заметной длины, иначе ничего.
         return [line.interpolate(length / 2)] if length >= pitch_m / 2 else []
     count = int(length // pitch_m)
+    if anchor_m is not None:
+        # Привязка к заданной точке вместо центрирования. Нужна второму ряду
+        # двухрядной посадки: чтобы его деревья гарантированно попадали в
+        # просветы первого, шаг надо отсчитывать не от начала СВОЕЙ линии, а от
+        # дерева соседнего ряда. Кольца двух рядов разной длины, и сдвиг фазы
+        # «от начала» никакого шахматного порядка не давал — тест это и поймал.
+        first = anchor_m - pitch_m * math.floor(anchor_m / pitch_m)
+        positions = [first + index * pitch_m for index in range(int((length - first) // pitch_m) + 1)]
+        return [line.interpolate(t) for t in positions if 0.0 <= t <= length]
     if line.is_closed:
         step = length / count
         return [line.interpolate(index * step) for index in range(count)]
@@ -242,8 +280,8 @@ def _row_path(
     band_m: float,
     inset_m: float,
     pitch_m: float,
-) -> BaseGeometry | None:
-    """Линия, вдоль которой пойдёт ряд: эквидистанта ориентира на связывающем
+) -> tuple[BaseGeometry, float] | None:
+    """Линия, вдоль которой пойдёт ряд, и её смещение от ориентира: эквидистанта ориентира на связывающем
     расстоянии.
 
     Почему не край допустимой площади напрямую. Край — это контур со всеми
@@ -268,7 +306,7 @@ def _row_path(
         offsets.append(distance)
         distance += step
 
-    best: BaseGeometry | None = None
+    best: tuple[BaseGeometry, float] | None = None
     best_length = 0.0
     for offset in offsets:
         ring = guide.geometry.buffer(offset).boundary
@@ -277,9 +315,9 @@ def _row_path(
         if length >= pitch_m * 2:
             # Первая же эквидистанта, на которой помещается настоящий ряд, —
             # она и самая близкая к ориентиру, то есть самая правильная.
-            return ring
+            return ring, offset
         if length > best_length:
-            best, best_length = ring, length
+            best, best_length = (ring, offset), length
     return best
 
 
@@ -292,6 +330,7 @@ def row_candidates(
     zoning_zones: list[Zone] | None = None,
     inset_m: float = ROW_INSET_M,
     band_m: float | None = None,
+    row_gap_m: float | None = None,
 ) -> list[PlantingCandidate]:
     """Кандидаты рядовой посадки вдоль каждого ориентира.
 
@@ -321,20 +360,89 @@ def row_candidates(
     band_m = ROW_SEARCH_BAND_M if band_m is None else band_m
 
     candidates: list[PlantingCandidate] = []
-    for guide in guides:
-        usable = _row_path(guide, buildable_area, band_m, inset_m, pitch_m)
-        for line in _as_lines(usable):
-            for point in points_along(line, pitch_m):
-                if not buildable_area.contains(point):
-                    continue
-                candidates.append(
-                    PlantingCandidate(
-                        geometry=point,
-                        planting_type=planting_type,
-                        clearance_m=_clearance(point, exclusion_zone),
-                        zoning=zoning_index.category_at(point),
-                    )
+    def emit(line: LineString, step_m: float, anchor_m: float | None = None) -> list[Point]:
+        placed: list[Point] = []
+        for point in points_along(line, step_m, anchor_m):
+            if not buildable_area.contains(point):
+                continue
+            candidates.append(
+                PlantingCandidate(
+                    geometry=point,
+                    planting_type=planting_type,
+                    clearance_m=_clearance(point, exclusion_zone),
+                    zoning=zoning_index.category_at(point),
                 )
+            )
+            placed.append(point)
+        return placed
+
+    for guide in guides:
+        found = _row_path(guide, buildable_area, band_m, inset_m, pitch_m)
+        if found is None:
+            continue
+        ring, offset = found
+
+        # Второй ряд — 743-ПП табл. 3.6.2, «газон с двухрядной посадкой
+        # деревьев». Ставится НЕ всегда, а только если для него реально есть
+        # место: считаем вторую эквидистанту, отодвинутую на промежуток между
+        # рядами, и смотрим, остаётся ли от неё внутри допустимой площади хотя
+        # бы два шага. На тесной улице её не остаётся, и посадка сама собой
+        # сводится к однорядной — навязывать второй ряд там, где его негде
+        # разместить, значило бы выдавать нарушение за замысел.
+        #
+        # Промежуток между рядами таблица для деревьев не задаёт, поэтому его
+        # связывает МГСН 1.02-02 п. 4.2.9.2 — расстояние между стволами по
+        # классу кроны, то есть `row_gap_m`. Его же проверяет compliance, так
+        # что генератор и проверка тут считают по одному правилу.
+        second_lines: list[LineString] = []
+        if row_gap_m and row_gap_m > 0:
+            outer = guide.geometry.buffer(offset + row_gap_m).boundary.intersection(buildable_area)
+            # Длина проверяется у КАЖДОГО куска отдельно, а не в сумме. Сумма
+            # обманывает: десяток двухметровых обрывков даёт «достаточную»
+            # длину, рядом с которой никакого второго ряда на самом деле нет,
+            # а раздутый буфером обрывок помечает двухрядным полтора десятка
+            # метров первого ряда — и тот разрежается на пустом месте.
+            minimum = DOUBLE_ROW_PITCH_M * _MIN_SECOND_ROW_PITCHES
+            second_lines = [line for line in _as_lines(outer) if line.length >= minimum]
+
+        if not second_lines:
+            for line in _as_lines(ring):
+                emit(line, pitch_m)
+            continue
+
+        # Шаг вдоль ряда у двухрядной посадки больше (7-8 м против 5-6):
+        # рядов два, и плотность на погонный метр улицы остаётся той же.
+        # Если порода по классу кроны требует ещё большего — побеждает он.
+        double_step = max(DOUBLE_ROW_PITCH_M, pitch_m)
+
+        # Широкий шаг применяется ТОЛЬКО там, где второй ряд реально есть.
+        # Первая версия переключала шаг на весь ориентир целиком, стоило
+        # второму ряду поместиться хоть где-то, — и на длинной улице это
+        # разрежало первый ряд и на тех участках, где второго ряда нет.
+        # Видно было сразу: аллея перестала читаться сплошной линией, а замер
+        # показал рост медианы шага с 5,3 до 7,0 м по ВСЕМУ ряду. Поэтому
+        # эквидистанта первого ряда делится на два набора отрезков — вдоль
+        # второго ряда и без него, — и каждый идёт со своим шагом.
+        alongside = unary_union([line.buffer(row_gap_m * _SECOND_ROW_REACH) for line in second_lines])
+        first_row: list[Point] = []
+        for line in _as_lines(ring.intersection(alongside)):
+            first_row.extend(emit(line, double_step))
+        for line in _as_lines(ring.difference(alongside)):
+            emit(line, pitch_m)
+
+        # Второй ряд — в шахматном порядке: дерево второго ряда попадает в
+        # просвет первого, и это читается двухрядной аллеей, а не решёткой.
+        # Отсчёт ведётся ОТ дерева первого ряда, спроецированного на линию
+        # второго, а не от начала самой линии: кольца двух рядов разной длины,
+        # и «сдвиг фазы на полшага от своего начала» никакого шахматного
+        # порядка не даёт — первая версия так и делала, и тест это поймал.
+        for line in second_lines:
+            if first_row:
+                nearest = min(first_row, key=line.distance)
+                emit(line, double_step, line.project(nearest) + double_step / 2)
+            else:
+                emit(line, double_step)
+
     return candidates
 
 

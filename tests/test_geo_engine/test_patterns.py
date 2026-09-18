@@ -19,6 +19,7 @@ from shapely.geometry import LineString, Point, Polygon
 from geo_engine.model import Zone
 from geo_engine.norms import load_norms
 from geo_engine.patterns import (
+    DOUBLE_ROW_PITCH_M,
     MIN_GUIDE_LENGTH_M,
     collect_row_guides,
     points_along,
@@ -318,3 +319,75 @@ class TestPlannerPatterns:
                 assert row_item.geometry.distance(loose_item.geometry) >= required - 1e-3, (
                     f"{row_item.species} и {loose_item.species} ближе {required} м"
                 )
+
+
+class TestDoubleRow:
+    """743-ПП, п. 3.6.4, табл. 3.6.2: «газон с двухрядной посадкой деревьев —
+    7-8». Столбец таблицы называется «Расстояние между деревьями и
+    кустарниками», то есть это шаг ВДОЛЬ ряда, а не промежуток между рядами.
+    """
+
+    def _scene(self, norms, depth):
+        """Полоса газона вдоль проезда заданной глубины.
+
+        Построена руками, как и соседние тесты этого файла: нужен предсказуемый
+        прямоугольник, а не результат всей цепочки buffers.
+        """
+        territory = Polygon([(0, 0), (240, 0), (240, depth), (0, depth)])
+        road = LineString([(0, 0), (240, 0)])
+        exclusion = road.buffer(norms.setback_for("road", "tree"))
+        buildable = territory.buffer(-norms.territory_margin_for("tree")).difference(exclusion)
+        guides = collect_row_guides([Zone(geometry=road, zone_type="road")], "tree", norms)
+        return road, exclusion, buildable, guides
+
+    def test_a_wide_verge_gets_a_second_row(self, norms):
+        road, exclusion, buildable, guides = self._scene(norms, depth=60)
+
+        single = row_candidates(guides, buildable, exclusion, "tree", pitch_m=5.0)
+        double = row_candidates(guides, buildable, exclusion, "tree", pitch_m=5.0, row_gap_m=5.0)
+
+        assert len(double) > len(single), "второй ряд должен добавить посадки"
+        # Ряды различаются расстоянием до проезда: должно быть ровно две группы.
+        bands = {round(c.geometry.distance(road)) for c in double}
+        assert len(bands) >= 2, f"ожидались два ряда на разном отступе, получено {bands}"
+
+    def test_the_double_row_uses_the_wider_normative_pitch(self, norms):
+        """Шаг вдоль ряда у двухрядной посадки БОЛЬШЕ, чем у однорядной: рядов
+        два, и плотность на погонный метр улицы остаётся той же."""
+        road, exclusion, buildable, guides = self._scene(norms, depth=60)
+
+        double = row_candidates(guides, buildable, exclusion, "tree", pitch_m=5.0, row_gap_m=5.0)
+
+        near = sorted(c.geometry.x for c in double if c.geometry.distance(road) < 8)
+        gaps = [b - a for a, b in zip(near, near[1:])]
+        assert gaps, "вдоль проезда должен получиться ряд"
+        assert min(gaps) >= DOUBLE_ROW_PITCH_M - 1e-6, (
+            f"шаг двухрядной посадки не может быть меньше {DOUBLE_ROW_PITCH_M} м"
+        )
+
+    def test_a_narrow_verge_stays_single_row(self, norms):
+        """Навязывать второй ряд там, где его негде разместить, значило бы
+        выдавать нарушение за замысел."""
+        road, exclusion, buildable, guides = self._scene(norms, depth=13)
+
+        double = row_candidates(guides, buildable, exclusion, "tree", pitch_m=5.0, row_gap_m=5.0)
+
+        bands = {round(c.geometry.distance(road)) for c in double}
+        assert len(bands) <= 1, f"на узкой полосе второму ряду места нет, получено {bands}"
+
+    def test_the_second_row_is_staggered(self, norms):
+        """Шахматный порядок: дерево второго ряда попадает в просвет первого,
+        иначе два ряда читаются решёткой."""
+        road, exclusion, buildable, guides = self._scene(norms, depth=60)
+
+        double = row_candidates(guides, buildable, exclusion, "tree", pitch_m=5.0, row_gap_m=5.0)
+        by_band: dict[int, list[float]] = {}
+        for c in double:
+            by_band.setdefault(round(c.geometry.distance(road)), []).append(c.geometry.x)
+        bands = sorted(by_band, key=lambda k: -len(by_band[k]))[:2]
+        assert len(bands) == 2, "тест бессмыслен без двух рядов"
+
+        first, second = sorted(by_band[bands[0]]), sorted(by_band[bands[1]])
+        # У сдвинутого на полшага ряда ни одно дерево не стоит напротив дерева
+        # соседнего ряда.
+        assert not any(abs(a - b) < 1.0 for a in first for b in second), "ряды встали в решётку"

@@ -132,13 +132,22 @@ def _fit_row_species(
         boundary = territory_guide(territory, planting_type, type_norms)
         if boundary is not None:
             guides.append(boundary)
+        interval = type_norms.spacing_for(planting_type).min_distance_m
         rows = row_candidates(
             guides,
             buildable,
             exclusion,
             planting_type,
-            type_norms.spacing_for(planting_type).min_distance_m,
+            interval,
             zoning_zones=zones,
+            # Промежуток между рядами двухрядной посадки — расстояние между
+            # стволами по классу кроны (МГСН 1.02-02 п. 4.2.9.2). 743-ПП
+            # табл. 3.6.2 задаёт для двухрядной только шаг ВДОЛЬ ряда (7-8 м),
+            # про промежуток между рядами у неё сказано лишь применительно к
+            # кустарнику. Передаём тот же интервал, который проверяет
+            # compliance, — генератор и проверка обязаны считать по одному
+            # правилу, на этом в проекте уже обжигались.
+            row_gap_m=interval,
         )
         if best is None or len(rows) > len(best[2]):
             best = (candidate_species, type_norms, rows, guides)
