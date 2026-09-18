@@ -41,7 +41,7 @@ import shapely
 from shapely.geometry import LineString, MultiLineString, Point
 from shapely.geometry.base import BaseGeometry
 
-from geo_engine.candidates import _clearance, _zoning_at
+from geo_engine.candidates import ZoningIndex, _clearance
 from geo_engine.io.geometry_cleanup import merge_dashed_lines
 from geo_engine.model import PlantingCandidate, PlantingType, Zone
 from geo_engine.norms import PlantingNorms
@@ -311,6 +311,10 @@ def row_candidates(
     который к этой улице отношения не имеет.
     """
     zoning_zones = zoning_zones or []
+    # Индекс строится один раз на вызов, а не на точку: `ZoningIndex` появился
+    # в candidates.py именно затем, чтобы убрать перебор всех зон на каждого
+    # кандидата, и рядовая посадка обязана пользоваться тем же.
+    zoning_index = ZoningIndex(zoning_zones)
     if buildable_area is None or buildable_area.is_empty:
         return []
 
@@ -328,7 +332,7 @@ def row_candidates(
                         geometry=point,
                         planting_type=planting_type,
                         clearance_m=_clearance(point, exclusion_zone),
-                        zoning=_zoning_at(point, zoning_zones),
+                        zoning=zoning_index.category_at(point),
                     )
                 )
     return candidates
@@ -422,6 +426,7 @@ def fill_group(
     ковёр, а 3 м по всей площади — равномерный крап, не похожий на проект.
     """
     zoning_zones = zoning_zones or []
+    zoning_index = ZoningIndex(zoning_zones)
     if disc is None or disc.is_empty:
         return []
 
@@ -455,7 +460,7 @@ def fill_group(
             geometry=point,
             planting_type=planting_type,
             clearance_m=clearance,
-            zoning=_zoning_at(point, zoning_zones),
+            zoning=zoning_index.category_at(point),
         )
         for point, clearance in zip(points, clearances)
     ]
