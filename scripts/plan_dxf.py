@@ -325,20 +325,27 @@ def main(argv: list[str] | None = None) -> int:
         if parts:
             print(f"     схемы посадки — {', '.join(parts)}")
         catalogue = load_catalogue()
-        chosen = {i.planting_type: i.species for i in items}
-        for planting_type, species_name in sorted(chosen.items()):
-            picked = catalogue.get(species_name)
-            if picked is None:
-                continue
-            if planting_type in keep_spacing_for:
-                note = "интервал задан вручную"
-            elif planting_type in CROWN_SPACING_TYPES:
-                note = f"интервал {catalogue.spacing_for_crown(picked.crown)} м по классу кроны (МГСН 1.02-02 п. 4.2.9.2)"
-            else:
-                # Для кустарника нормативные 0,3-1,0 м относятся к групповой
-                # посадке, а не к россыпи — см. planner.CROWN_SPACING_TYPES.
-                note = f"интервал {norms.spacing_for(planting_type).min_distance_m} м из planting_norms.yaml"
-            print(f"     {planting_type}: «{species_name}» (крона {picked.crown}, {note})")
+        # Пород на тип теперь несколько: ряд одной, куртины разными. Печатать
+        # первую попавшуюся значило бы скрывать состав плана.
+        used: dict[str, Counter] = {}
+        for item in items:
+            used.setdefault(item.planting_type, Counter())[item.species] += 1
+        for planting_type in sorted(used):
+            print(f"     {planting_type}:")
+            for species_name, count in used[planting_type].most_common():
+                picked = catalogue.get(species_name)
+                if picked is None:
+                    print(f"        «{species_name}» — {count}")
+                    continue
+                if planting_type in keep_spacing_for:
+                    note = "интервал задан вручную"
+                elif planting_type in CROWN_SPACING_TYPES:
+                    note = f"интервал {catalogue.spacing_for_crown(picked.crown)} м по классу кроны"
+                else:
+                    # Для кустарника нормативные 0,3-1,0 м относятся к
+                    # групповой посадке, а не к россыпи.
+                    note = f"интервал {norms.spacing_for(planting_type).min_distance_m} м из planting_norms.yaml"
+                print(f"        «{species_name}» — {count}, крона {picked.crown}, {note}")
 
         print("4/5 Проверка нормативных отступов и сборка обоснований...")
         records = explain_items(items, utilities, zones, norms)
