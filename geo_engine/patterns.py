@@ -207,11 +207,19 @@ def _as_lines(geometry: BaseGeometry | None) -> list[LineString]:
 
 
 def points_along(line: LineString, pitch_m: float) -> list[Point]:
-    """Точки вдоль линии с шагом `pitch_m`, отцентрованные по её длине.
+    """Точки вдоль линии с шагом `pitch_m`.
 
-    Центрирование, а не «от начала»: отрезок редко делится на шаг нацело, и
-    при отсчёте от начала весь остаток копится на дальнем конце — ряд
-    выглядит оборванным. Здесь остаток делится поровну между концами.
+    Для незамкнутой линии — отцентрованные по её длине. Центрирование, а не
+    «от начала»: отрезок редко делится на шаг нацело, и при отсчёте от начала
+    весь остаток копится на дальнем конце — ряд выглядит оборванным. Здесь
+    остаток делится поровну между концами.
+
+    Для замкнутой (а эквидистанта ориентира замкнута всегда — это граница
+    буфера) центрировать нечего, и остаток нельзя оставить на стыке: там
+    первая и последняя точки оказались бы ближе шага друг к другу, то есть с
+    нарушением интервала между стволами. Поэтому остаток раскладывается
+    поровну на все промежутки — шаг выходит чуть больше номинального и
+    никогда меньше, а ряд замыкается без шва.
     """
     if pitch_m <= 0:
         return []
@@ -221,6 +229,9 @@ def points_along(line: LineString, pitch_m: float) -> list[Point]:
         # заметной длины, иначе ничего.
         return [line.interpolate(length / 2)] if length >= pitch_m / 2 else []
     count = int(length // pitch_m)
+    if line.is_closed:
+        step = length / count
+        return [line.interpolate(index * step) for index in range(count)]
     start = (length - count * pitch_m) / 2
     return [line.interpolate(start + index * pitch_m) for index in range(count + 1)]
 
@@ -260,14 +271,15 @@ def _row_path(
     best: BaseGeometry | None = None
     best_length = 0.0
     for offset in offsets:
-        usable = guide.geometry.buffer(offset).boundary.intersection(buildable_area)
+        ring = guide.geometry.buffer(offset).boundary
+        usable = ring.intersection(buildable_area)
         length = usable.length
         if length >= pitch_m * 2:
             # Первая же эквидистанта, на которой помещается настоящий ряд, —
             # она и самая близкая к ориентиру, то есть самая правильная.
-            return usable
+            return ring
         if length > best_length:
-            best, best_length = usable, length
+            best, best_length = ring, length
     return best
 
 

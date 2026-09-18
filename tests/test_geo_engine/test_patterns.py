@@ -176,7 +176,13 @@ class TestRowCandidates:
 
         gaps = [b - a for a, b in zip(xs, xs[1:])]
         assert gaps, "вдоль улицы должен получиться настоящий ряд, а не одна точка"
-        assert statistics.median(gaps) == pytest.approx(8.0, abs=0.01)
+        # Шаг НЕ обязан равняться номиналу ровно, но обязан быть не меньше:
+        # эквидистанта замкнута, и остаток от деления её длины на шаг
+        # раскладывается поровну на все промежутки. Оставить остаток целиком на
+        # стыке было бы хуже — там первая и последняя точки оказались бы ближе
+        # шага друг к другу, то есть с нарушением интервала между стволами.
+        assert min(gaps) >= 8.0 - 1e-6, "шаг ряда не может быть меньше норматива"
+        assert statistics.median(gaps) == pytest.approx(8.0, rel=0.05)
 
     def test_nothing_lands_outside_the_buildable_area(self, norms):
         _, road, _, exclusion, buildable = self._setup(norms)
@@ -268,3 +274,40 @@ class TestPlannerPatterns:
         records = explain_items(items, [], zones, norms, catalogue)
 
         assert [r for r in records if not r.compliant] == []
+
+    def test_scatter_keeps_the_crown_interval_away_from_the_row(self, norms, catalogue):
+        """Ряд и россыпь — два независимых прохода отбора, и между ними никто
+        не держал интервал.
+
+        Ловится только на РАЗНЫХ породах у ряда и у россыпи: `greedy_select`
+        внутри одной фазы интервал соблюдает, а из площади под россыпь
+        вычитался радиус кроны рядовой породы — то есть половина её же
+        интервала, да ещё и чужого. Живьём на эталонной улице это дало берёзу
+        (интервал 5 м) и дуб (8 м) в 2,60 м друг от друга, и отчёт показывал
+        полное соответствие: проверка мерила только отступы от сетей и зон.
+        """
+        from geo_engine.planner import ROW_RATIONALE_PREFIX, plan_items
+
+        territory, zones = self._scene()
+
+        items = plan_items(
+            "mixed", [], zones, territory, ["tree"], self._score, norms,
+            pattern="auto", catalogue=catalogue,
+        )
+        rows = [i for i in items if i.rationale.startswith(ROW_RATIONALE_PREFIX)]
+        loose = [i for i in items if not i.rationale.startswith(ROW_RATIONALE_PREFIX)]
+        assert rows and loose, "сцена должна давать обе фазы, иначе тест ничего не проверяет"
+        assert {i.species for i in rows} != {i.species for i in loose}, (
+            "породы фаз должны различаться — на одинаковых дефект не проявляется"
+        )
+
+        def interval(name):
+            species = catalogue.get(name)
+            return catalogue.spacing_for_crown(species.crown)
+
+        for row_item in rows:
+            for loose_item in loose:
+                required = max(interval(row_item.species), interval(loose_item.species))
+                assert row_item.geometry.distance(loose_item.geometry) >= required - 1e-3, (
+                    f"{row_item.species} и {loose_item.species} ближе {required} м"
+                )

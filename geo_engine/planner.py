@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 import zlib
 from collections.abc import Callable, Collection
@@ -64,6 +65,19 @@ GROUP_RATIONALE_PREFIX = "Групповая посадка (куртина)."
 # 1-3 шт/м², чему 0,5 м (около 4 шт/м² по сетке, меньше после прореживания
 # кругами крон) соответствует ближе, чем 0,3 (около 11 шт/м²).
 IN_GROUP_PITCH_M = 0.5
+
+# Буфер shapely — многоугольник, ВПИСАННЫЙ в окружность: его стороны-хорды
+# проходят ближе к центру, чем сам радиус, поэтому точка, легшая на границу
+# такого буфера, оказывается ближе требуемого расстояния. Этот дефект в проекте
+# ловят уже третий раз (buffers._BUFFER_QUAD_SEGS, placement._CANOPY_BUFFER_QUAD_SEGS),
+# но там хватало поднять число сегментов — здесь не хватает: при quad_segs=32
+# недобор всё ещё 2,4 мм на 8 м, а compliance сравнивает с допуском 1 мм, и
+# нарушение прошло бы на пустом месте. Поэтому радиус ещё и компенсируется
+# точно: у правильного N-угольника, вписанного в окружность радиуса R,
+# ближайшая к центру точка границы лежит на R·cos(π/N), значит буфер радиуса
+# r/cos(π/N) заведомо содержит окружность радиуса r. N = 4·quad_segs.
+_CLEARANCE_QUAD_SEGS = 32
+_CLEARANCE_INFLATION = 1.0 / math.cos(math.pi / (4 * _CLEARANCE_QUAD_SEGS))
 
 
 def _fit_row_species(
@@ -326,6 +340,7 @@ def plan_items(
 
         selected: list[PlantingItem] = []
         remaining = buildable
+        row_items: list[PlantingItem] = []
 
         wants_rows = pattern in ("auto", "row") and planting_type in ROW_PLANTING_TYPES
         if wants_rows:
@@ -362,15 +377,6 @@ def plan_items(
                 # сведения, которое нужно отчёту и CLI, а не доменной модели.
                 item.rationale = f"{ROW_RATIONALE_PREFIX} {item.rationale}"
             selected.extend(row_items)
-            # Из площади под россыпь вычитаются кроны уже поставленного ряда.
-            # Без этого второй проход greedy_select ничего не знает о первом и
-            # насыпал бы точки поверх аллеи: у каждого прохода свой
-            # пространственный индекс, общей памяти между ними нет.
-            if row_items:
-                taken = unary_union(
-                    [item.geometry.buffer(spacing.canopy_radius_m) for item in row_items]
-                )
-                remaining = buildable.difference(taken)
 
         seed = zlib.crc32(f"{plan_key}:{planting_type}".encode())
 
@@ -456,6 +462,46 @@ def plan_items(
                 loose_exclusion = exclusion
                 loose_norms = type_norms
                 loose_species = species
+            if row_items:
+                # Из площади под россыпь вычитаются места уже поставленного
+                # ряда: у каждого прохода greedy_select свой пространственный
+                # индекс, общей памяти между фазами нет, и без вычитания
+                # россыпь насыпала бы точки поверх аллеи.
+                #
+                # Радиус вычитания — ПОЛНЫЙ требуемый интервал, и берётся он по
+                # большей из двух пород, а не по рядовой. Стояло
+                # `spacing.canopy_radius_m` — радиус кроны рядовой породы, то
+                # есть половина её же интервала, — и это ошибка сразу дважды.
+                # Во-первых, вычитать надо целое расстояние между стволами, а
+                # не половину: точка россыпи ставится в САМ остаток, её
+                # собственный радиус здесь ничем не компенсируется. Во-вторых,
+                # у россыпи своя порода и свой класс кроны: МГСН 1.02-02
+                # п. 4.2.9.2 требует 8-10 м для широкой кроны против 3-4 для
+                # узкой, так что мерить чужим интервалом нельзя. Для смешанной
+                # пары акт числа не даёт — берётся большее из двух, по тому же
+                # правилу «значение, при котором нарушить норму нельзя», по
+                # которому во всём проекте выбирается число из диапазона.
+                #
+                # Замерено живьём на эталонной улице: берёза (интервал 5 м) в
+                # ряду и дуб (8 м) россыпью вставали в 2,60 м друг от друга —
+                # ровно радиус кроны берёзы, — и ни один отчёт этого не видел,
+                # потому что проверка соответствия мерила только отступы от
+                # сетей и зон, но не расстояние между самими посадками.
+                clearance = max(
+                    spacing.min_distance_m,
+                    loose_norms.spacing_for(planting_type).min_distance_m,
+                )
+                loose_area = loose_area.difference(
+                    unary_union(
+                        [
+                            item.geometry.buffer(
+                                clearance * _CLEARANCE_INFLATION,
+                                quad_segs=_CLEARANCE_QUAD_SEGS,
+                            )
+                            for item in row_items
+                        ]
+                    )
+                )
             scattered = generate_candidates(
                 loose_area, loose_exclusion, planting_type, loose_norms, zoning_zones=zones, seed=seed
             )

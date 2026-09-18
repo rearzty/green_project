@@ -103,7 +103,30 @@ OBJECT_LABELS_RU = {
     "lighting_pole": "опора освещения/контактной сети",
     "retaining_wall": "подпорная стенка",
     "tram_track": "трамвайное полотно",
+    "neighbour_tree": "соседнее дерево",
 }
+
+# Расстояние между стволами — МГСН 1.02-02, п. 4.2.9.2 (8-10 м широкая крона,
+# 5-6 средняя, 3-4 узкая). Источник был объявлен в planting_norms.yaml и не
+# использовался ни одной строчкой кода: интервал применялся при ОТБОРЕ
+# (planner.norms_for_species -> placement.greedy_select), но нигде не
+# проверялся, а отбор идёт отдельным проходом на каждую фазу посадки, и у
+# каждого прохода свой пространственный индекс. Значит соблюдение интервала
+# между фазами не гарантировал никто — и это не теория: замерено, берёза из
+# ряда и дуб из россыпи вставали в 2,60 м при требуемых 8, а отчёт показывал
+# полное соответствие, потому что мерил только отступы от сетей и зон.
+CROWN_SPACING_SOURCE_ID = "mgsn_1_02_02_4_2_9_2"
+NEIGHBOUR_OBJECT_TYPE = "neighbour_tree"
+
+# Интервал между посадками проверяется ТОЛЬКО у деревьев — по той же причине,
+# по которой planner.CROWN_SPACING_TYPES выводит его тоже только для них.
+# 743-ПП табл. 3.6.2 даёт кустарнику 0,3-1,0 м, но это расстояние ВНУТРИ
+# куртины или ряда, а не минимум между любыми двумя кустами плана; сама
+# таблица названа «ориентировочные расстояния». Проверять по ней россыпь
+# значило бы объявить нарушением нормальную плотную группу.
+SPACING_CHECKED_TYPES = ("tree",)
+
+CROWN_LABELS_RU = {"wide": "широкая", "medium": "средняя", "narrow": "узкая"}
 
 PLANTING_LABELS_RU = {"tree": "дерево", "shrub": "кустарник", "lawn": "газон"}
 
@@ -120,6 +143,80 @@ def _constraint_groups(utilities: list[Utility], zones: list[Zone]) -> dict[str,
         if zone.zone_type in SETBACK_ZONE_TYPES and zone.geometry is not None and not zone.geometry.is_empty:
             groups.setdefault(zone.zone_type, []).append(zone.geometry)
     return {k: v for k, v in groups.items() if v}
+
+
+def _crown_interval(item: PlantingItem, catalogue: SpeciesCatalogue) -> tuple[float | None, str]:
+    """Требуемый интервал по классу кроны и словесный класс, для цитаты."""
+    species = catalogue.get(item.species)
+    if species is None:
+        return None, ""
+    return catalogue.spacing_for_crown(species.crown), species.crown
+
+
+def _neighbour_checks(
+    items: list[PlantingItem], norms: PlantingNorms, catalogue: SpeciesCatalogue
+) -> dict[int, ConstraintCheck]:
+    """Расстояние до ближайшей соседней посадки того же типа.
+
+    Отдельно от отступов от сетей: там ограничение — чужой объект чертежа,
+    здесь — другая посадка этого же плана, и требуемое значение зависит от
+    ОБЕИХ пород сразу. Для смешанной пары (широкая крона рядом со средней)
+    акт числа не даёт, берётся больший из двух интервалов — то же правило
+    «значение, при котором нарушить норму нельзя», по которому во всём
+    проекте выбирается число из нормативного диапазона.
+
+    Один `query_nearest` с `exclusive=True` на тип посадки, а не цикл по
+    объектам: на реальном масштабе плана это сотни тысяч точек.
+    """
+    by_type: dict[str, list[int]] = {}
+    for index, item in enumerate(items):
+        if item.planting_type in SPACING_CHECKED_TYPES and item.geometry is not None:
+            by_type.setdefault(item.planting_type, []).append(index)
+
+    source = norms.sources.get(CROWN_SPACING_SOURCE_ID)
+    checks: dict[int, ConstraintCheck] = {}
+    for positions in by_type.values():
+        if len(positions) < 2:
+            # Одна посадка своего типа — соседа нет, и мерить нечего. Не
+            # «соблюдено», а отсутствие ограничения: добавить сюда проверку
+            # с бесконечным расстоянием значило бы засорить отчёт строкой,
+            # которая ничего не утверждает.
+            continue
+        geometries = [items[i].geometry for i in positions]
+        tree = STRtree(geometries)
+        pairs, measured = tree.query_nearest(
+            geometries, exclusive=True, all_matches=False, return_distance=True
+        )
+        for offset, local in enumerate(pairs[0]):
+            index = positions[int(local)]
+            neighbour = positions[int(pairs[1][offset])]
+            own_interval, own_crown = _crown_interval(items[index], catalogue)
+            other_interval, other_crown = _crown_interval(items[neighbour], catalogue)
+            known = [v for v in (own_interval, other_interval) if v]
+            if not known:
+                # Порода не в каталоге либо у её класса кроны интервал не
+                # задан — цитировать нечего, и выдумывать число нельзя.
+                continue
+            required = max(known)
+            actual = float(measured[offset])
+            checks[index] = ConstraintCheck(
+                object_type=NEIGHBOUR_OBJECT_TYPE,
+                required_m=required,
+                actual_m=actual,
+                satisfied=actual + _TOLERANCE_M >= required,
+                source_id=CROWN_SPACING_SOURCE_ID if source else UNMAPPED_SOURCE_ID,
+                species_rule=(
+                    f"крона {CROWN_LABELS_RU.get(own_crown, own_crown or '—')} "
+                    f"и {CROWN_LABELS_RU.get(other_crown, other_crown or '—')} "
+                    f"({items[neighbour].species}) — берётся больший интервал"
+                ),
+                act=source.act if source else "Норматив не сопоставлен",
+                clause=source.clause if source else "—",
+                citation=source.citation() if source else "источник не определён",
+                table_row="8-10 м широкая крона, 5-6 средняя, 3-4 узкая",
+                verified=source.verified if source else False,
+            )
+    return checks
 
 
 def explain_items(
@@ -142,6 +239,7 @@ def explain_items(
 
     catalogue = catalogue or load_catalogue()
     groups = _constraint_groups(utilities, zones)
+    neighbour_checks = _neighbour_checks(items, norms, catalogue)
     geometries = [item.geometry for item in items]
 
     # object_type -> distance from each item to the nearest object of that type.
@@ -207,6 +305,10 @@ def explain_items(
                     verified=verified,
                 )
             )
+
+        neighbour = neighbour_checks.get(index)
+        if neighbour is not None:
+            checks.append(neighbour)
 
         records.append(_record(index, item, checks))
     return records
