@@ -172,9 +172,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         metavar="ТИП=ШТ_НА_ГА",
         help="Плотность посадки, например --density tree=120 --density shrub=400. "
-        "Без неё алгоритм заполняет каждое легально доступное место — это «сколько влезает», "
-        "а не «сколько нужно». Нормативной величины в доступных актах нет, поэтому значения "
-        "по умолчанию нет тоже",
+        "По умолчанию tree=25, shrub=250 (практика, не норматив — см. geo_engine/planner.py:: "
+        "DEFAULT_DENSITY_PER_HA); без этого ограничения алгоритм заполняет каждое легально "
+        "доступное место — это «сколько влезает», а не «сколько нужно». --density tree=0 "
+        "отключает ограничение именно для этого типа",
     )
     parser.add_argument(
         "--pattern",
@@ -219,7 +220,11 @@ def _parse_species_overrides(raw: list[str] | None) -> dict[str, str]:
 
 
 def _parse_densities(raw: list[str] | None) -> dict[str, float]:
-    """`--density tree=120` -> {"tree": 120.0}."""
+    """`--density tree=120` -> {"tree": 120.0}. `--density tree=0` -> {"tree": 0.0}
+    -- разрешено намеренно: это единственный способ явно отключить
+    DEFAULT_DENSITY_PER_HA для конкретного типа, не трогая остальные (см.
+    planner.plan_items's докстринг и _limit_by_density, которая уже
+    трактует 0/отрицательное как «без ограничения»)."""
     out: dict[str, float] = {}
     for entry in raw or []:
         planting_type, _, value = entry.partition("=")
@@ -227,8 +232,8 @@ def _parse_densities(raw: list[str] | None) -> dict[str, float]:
             density = float(value)
         except ValueError:
             raise SystemExit(f"Ожидалось ТИП=ЧИСЛО, получено: {entry!r}") from None
-        if density <= 0:
-            raise SystemExit(f"Плотность должна быть положительной, получено: {entry!r}")
+        if density < 0:
+            raise SystemExit(f"Плотность не может быть отрицательной, получено: {entry!r}")
         out[planting_type.strip()] = density
     return out
 
