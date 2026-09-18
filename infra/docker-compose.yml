@@ -1,27 +1,10 @@
 services:
-  db:
-    image: postgis/postgis:16-3.4
-    environment:
-      POSTGRES_USER: greenproject
-      POSTGRES_PASSWORD: greenproject
-      POSTGRES_DB: greenproject
-    ports:
-      - "5432:5432"
-    volumes:
-      - db_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U greenproject"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
   backend:
     build:
       context: ..
       dockerfile: infra/Dockerfile.backend
     restart: on-failure
     environment:
-      GREENPROJECT_DATABASE_URL: postgresql+asyncpg://greenproject:greenproject@db:5432/greenproject
       GREENPROJECT_CORS_ORIGINS: '["http://localhost:3000", "http://127.0.0.1:3000"]'
       # Юна (assistant_service.py) -- read from the host's own environment
       # (docker compose substitutes ${VAR} from the shell/.env next to this
@@ -32,9 +15,6 @@ services:
       GREENPROJECT_GROQ_API_KEY: ${GREENPROJECT_GROQ_API_KEY:-}
     ports:
       - "8000:8000"
-    depends_on:
-      db:
-        condition: service_healthy
 
   frontend:
     build:
@@ -51,6 +31,3 @@ services:
       - "3000:3000"
     depends_on:
       - backend
-
-volumes:
-  db_data:

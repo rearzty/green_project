@@ -6,11 +6,13 @@ import {
   deletePlan,
   exportDxf,
   generatePlan,
+  getLayersRaster,
   getPlan,
   getProject,
   listPlans,
   uploadProject,
   type GeoJSONFeature,
+  type LayersRaster,
   type PlanOut,
   type PlanSummary,
   type PlantingType,
@@ -94,6 +96,10 @@ function applyEffectToFeatures(features: GeoJSONFeature[], effect: LocalEditEffe
  */
 export function useProjectSession() {
   const [project, setProject] = useState<ProjectOut | null>(null);
+  // The map's source-layer backdrop -- fetched once per project (layers are
+  // immutable after upload, see layer_raster.py), separately from `project`
+  // itself so a failed/slow raster fetch can't block restoring the session.
+  const [layersRaster, setLayersRaster] = useState<LayersRaster | null>(null);
   const [plan, setPlan] = useState<PlanOut | null>(null);
   const [plans, setPlans] = useState<PlanSummary[]>([]);
   const [planRevision, setPlanRevision] = useState(0);
@@ -125,7 +131,7 @@ export function useProjectSession() {
    * -- no local mutation, no refetch. Used after a rejected edit: nothing
    * changed locally (the action never got to applyLocalEdit), so this only
    * needs to undo a live drag-preview's raw DOM position (see
-   * MapView.tsx::VirtualizedMarkers), not fix any actual data. */
+   * MapView.tsx::ClusteredMarkers), not fix any actual data. */
   function bumpPlanRevision() {
     setPlanRevision((r) => r + 1);
   }
@@ -136,6 +142,18 @@ export function useProjectSession() {
 
   async function refreshPlans(projectId: string) {
     setPlans(await listPlans(projectId));
+  }
+
+  /** Own try/catch, not folded into the callers' -- a raster failure (a
+   * transient network hiccup, a project with layers PIL chokes on) shouldn't
+   * take down the whole restore/upload flow the way a project fetch failure
+   * should. The map just shows no backdrop instead. */
+  async function refreshLayersRaster(projectId: string) {
+    try {
+      setLayersRaster(await getLayersRaster(projectId));
+    } catch {
+      setLayersRaster(null);
+    }
   }
 
   // Runs once on mount, client-side only (localStorage isn't available
@@ -152,6 +170,7 @@ export function useProjectSession() {
       try {
         const fetchedProject = await getProject(stored.projectId);
         setProject(fetchedProject);
+        await refreshLayersRaster(stored.projectId);
         await refreshPlans(stored.projectId);
         if (stored.planId) applyPlan(await getPlan(stored.projectId, stored.planId));
       } catch {
@@ -167,6 +186,7 @@ export function useProjectSession() {
     const { project_id } = await uploadProject(name, file, sourceCrs || undefined);
     const fetched = await getProject(project_id);
     setProject(fetched);
+    await refreshLayersRaster(project_id);
     applyPlan(null);
     setPlans([]);
     saveStoredSession({ projectId: project_id, planId: null });
@@ -237,12 +257,14 @@ export function useProjectSession() {
     saveStoredSession(null);
     clearAllUndoHistory();
     setProject(null);
+    setLayersRaster(null);
     applyPlan(null);
     setPlans([]);
   }
 
   return {
     project,
+    layersRaster,
     plan,
     plans,
     planRevision,

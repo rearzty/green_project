@@ -18,11 +18,13 @@ import type { GeoJSONFeatureCollection, GeoJSONGeometry, PlantingNorms } from "@
 const METERS_PER_DEGREE_LAT = 111_320;
 
 /** Above this many trees+shrubs+lawn polygons, ThreeDView shows a message
- * instead of building the scene. Generous compared to the 2D map's
- * MAX_VISIBLE_MARKERS (4000, MapView.tsx) -- GPU instancing (see
- * ThreeDView.tsx) doesn't pay a per-object DOM cost, so it comfortably
- * handles far more; this is a safety valve for pathological input, not a
- * realistic ceiling (CLAUDE.md's real-scale benchmarks go up to ~1M items). */
+ * instead of building the scene. Generous compared to the 2D map's own
+ * per-viewport-cell cluster cap (MapView.tsx::CLUSTER_CELL_PX -- clustering
+ * bounds the *rendered* marker count, not how much of the plan is loaded) --
+ * GPU instancing (see ThreeDView.tsx) doesn't pay a per-object DOM cost, so
+ * it comfortably handles far more; this is a safety valve for pathological
+ * input, not a realistic ceiling (CLAUDE.md's real-scale benchmarks go up to
+ * ~1M items). */
 export const MAX_3D_ITEMS = 300_000;
 
 /** Default tree_default/shrub_default.canopy_radius_m from

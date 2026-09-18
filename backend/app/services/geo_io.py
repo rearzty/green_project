@@ -1,15 +1,14 @@
-"""Conversions between DB rows (GeoAlchemy2 geometry columns), geo_engine's
-plain shapely-based domain objects, and the GeoJSON the frontend speaks.
+"""Conversions between stored records (backend.app.db.models -- in-memory
+dataclasses, see their module docstring), geo_engine's plain shapely-based
+domain objects, and the GeoJSON the frontend speaks.
 """
 
 from __future__ import annotations
 
-import uuid
 from functools import lru_cache
 
 import numpy as np
 import shapely
-from geoalchemy2.shape import from_shape, to_shape
 from pyproj import Transformer
 from shapely.geometry import mapping
 from shapely.geometry.base import BaseGeometry
@@ -20,12 +19,19 @@ from backend.app.schemas.geo import GeoJSONFeature, GeoJSONFeatureCollection, Ge
 from geo_engine.model import PlantingItem, Utility, Zone
 
 
-def shape_to_db(geometry: BaseGeometry):
-    return from_shape(geometry, srid=0)
+def shape_to_db(geometry: BaseGeometry) -> BaseGeometry:
+    """Identity -- a stored `geometry` field is just a plain shapely object
+    now, nothing to wrap for a DB round trip. Kept (not deleted) because
+    dozens of call sites across services and tests read as "wrap before
+    storing, unwrap before using" (see db_to_shape); rewriting every one of
+    them to drop the wrapping added no value over just making the wrapping
+    itself a no-op."""
+    return geometry
 
 
-def db_to_shape(geometry) -> BaseGeometry:
-    return to_shape(geometry)
+def db_to_shape(geometry: BaseGeometry) -> BaseGeometry:
+    """Identity -- see shape_to_db."""
+    return geometry
 
 
 @lru_cache(maxsize=32)
@@ -189,21 +195,18 @@ def planting_items_to_geojson_dicts(items: list[PlantingItemRow], source_crs: st
     return [{"type": "Feature", "geometry": mapping(geom), "properties": _item_properties(item)} for item, geom in zip(items, geoms)]
 
 
-def domain_item_to_row_values(plan_id: str, item: PlantingItem) -> dict:
-    """Plain dict of PlantingItemRow column values, for a Core bulk INSERT
-    (`sqlalchemy.insert(PlantingItemRow), rows`) rather than individually
-    `session.add()`-ed ORM objects -- generate_plan can produce thousands of
-    these per request, and per-object ORM tracking measured at ~2.5ms/row
-    (no statement batching) where a single bulk INSERT takes a fraction of
-    a second regardless of row count.
-    """
-    return {
-        "id": str(uuid.uuid4()),
-        "plan_id": plan_id,
-        "geometry": shape_to_db(item.geometry),
-        "planting_type": item.planting_type,
-        "species": item.species,
-        "score": item.score,
-        "rationale": item.rationale,
-        "is_manual_edit": item.is_manual_edit,
-    }
+def domain_item_to_row(plan_id: str, item: PlantingItem) -> PlantingItemRow:
+    """A geo_engine PlantingItem, in the shape a Plan actually stores. Used
+    to build every item generate_plan/ensure_materialized produce -- there's
+    no DB insert step anymore for this to be "values for", just a list append
+    (see pipeline_service.py), so this returns the record directly rather
+    than an intermediate dict."""
+    return PlantingItemRow(
+        plan_id=plan_id,
+        geometry=item.geometry,
+        planting_type=item.planting_type,
+        species=item.species,
+        score=item.score,
+        rationale=item.rationale,
+        is_manual_edit=item.is_manual_edit,
+    )

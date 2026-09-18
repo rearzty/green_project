@@ -13,8 +13,6 @@ import shapely
 from shapely.affinity import translate
 from shapely.geometry import Point, shape
 from shapely.geometry.base import BaseGeometry
-from sqlalchemy import delete, insert
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.db.models import Plan, PlantingItemRow, Project
 from backend.app.services import exclusion_cache
@@ -23,9 +21,6 @@ from backend.app.services.geo_io import db_to_shape, from_wgs84, planting_items_
 _POINT_PLANTING_TYPES = {"tree", "shrub"}
 _POLYGON_PLANTING_TYPES = {"lawn"}
 _PLANTING_TYPE_LABELS = {"tree": "Дерево", "shrub": "Кустарник", "lawn": "Газон"}
-
-# asyncpg caps one statement at 32767 bind parameters -- keep IN (...) lists well under that.
-_IN_CLAUSE_CHUNK = 5000
 
 
 class PlantingTypeGeometryMismatchError(ValueError):
@@ -114,13 +109,7 @@ def _items_by_ids(plan: Plan, ids: list[str]) -> list[PlantingItemRow]:
     return [by_id[item_id] for item_id in unique_ids]
 
 
-def _chunks(values: list, size: int = _IN_CLAUSE_CHUNK):
-    for start in range(0, len(values), size):
-        yield values[start : start + size]
-
-
-async def apply_item_patch(
-    session: AsyncSession,
+def apply_item_patch(
     item: PlantingItemRow,
     geometry: dict | None,
     planting_type: str | None,
@@ -148,40 +137,32 @@ async def apply_item_patch(
 
     item.is_manual_edit = True
     item.plan.has_manual_edits = True  # a hand-edited plan is no longer just a recipe -- see Plan's docstring, never pruned by _prune_stale_plans
-    await session.commit()
-    await session.refresh(item)
     return item
 
 
-async def delete_item(session: AsyncSession, item: PlantingItemRow) -> None:
+def delete_item(item: PlantingItemRow) -> None:
     """Remove a single planting item by id."""
     plan = item.plan
-    await session.delete(item)
+    plan.items = [i for i in plan.items if i.id != item.id]
     plan.item_count -= 1
     plan.has_manual_edits = True  # see Plan's docstring: never pruned by _prune_stale_plans once a human has touched it
-    await session.commit()
 
 
-async def delete_items(session: AsyncSession, plan: Plan, ids: list[str], source_crs: str | None) -> list[dict]:
+def delete_items(plan: Plan, ids: list[str], source_crs: str | None) -> list[dict]:
     """Batch delete by id (the selection tool's Del, the redo of a delete).
     Returns each item's pre-delete GeoJSON snapshot -- exactly what
-    restore_items needs to undo it. Core DELETEs rather than per-object ORM
-    deletes: the ORM's own flush would emit one DELETE statement per row,
-    which a large selection can't afford.
+    restore_items needs to undo it.
     """
     items = _items_by_ids(plan, ids)
     snapshots = planting_items_to_geojson_dicts(items, source_crs)
-    for chunk in _chunks([item.id for item in items]):
-        await session.execute(delete(PlantingItemRow).where(PlantingItemRow.id.in_(chunk)).execution_options(synchronize_session=False))
+    remove_ids = {item.id for item in items}
+    plan.items = [item for item in plan.items if item.id not in remove_ids]
     plan.item_count -= len(items)
     plan.has_manual_edits = True
-    await session.commit()
     return snapshots
 
 
-async def retype_items(
-    session: AsyncSession, plan: Plan, changes: list[tuple[str, str]], source_crs: str | None
-) -> tuple[list[dict], list[str]]:
+def retype_items(plan: Plan, changes: list[tuple[str, str]], source_crs: str | None) -> tuple[list[dict], list[str]]:
     """Batch planting_type change, one target type per item -- so the same
     call serves the selection tool ("make all of these trees") and an undo
     restoring each item's own previous type.
@@ -217,12 +198,10 @@ async def retype_items(
         item.is_manual_edit = True
     if changed:
         plan.has_manual_edits = True
-    await session.commit()
     return previous, skipped
 
 
-async def move_items(
-    session: AsyncSession,
+def move_items(
     plan: Plan,
     ids: list[str],
     from_point: tuple[float, float],
@@ -255,11 +234,10 @@ async def move_items(
         item.is_manual_edit = True
     if items:
         plan.has_manual_edits = True
-    await session.commit()
     return planting_items_to_geojson_dicts(items, source_crs)
 
 
-async def restore_items(session: AsyncSession, plan: Plan, features: list[dict], source_crs: str | None) -> None:
+def restore_items(plan: Plan, features: list[dict], source_crs: str | None) -> None:
     """Undo's counterpart to a delete -- recreates specific items (same id,
     geometry, type, species, score, rationale) from their pre-delete GeoJSON
     snapshots. Validated like a fresh edit (type/geometry match, inside the
@@ -277,25 +255,24 @@ async def restore_items(session: AsyncSession, plan: Plan, features: list[dict],
         _assert_planting_type_matches_geometry(feature["properties"]["planting_type"], geometry)
     _assert_all_within_territory(geometries, plan.project)
 
-    rows = [
-        {
-            "id": feature["properties"]["id"],
-            "plan_id": plan.id,
-            "geometry": shape_to_db(geometry),
-            "planting_type": feature["properties"]["planting_type"],
-            "species": feature["properties"].get("species", "default"),
-            "score": feature["properties"].get("score", 0.0),
-            "rationale": feature["properties"].get("rationale", ""),
+    restored = [
+        PlantingItemRow(
+            id=feature["properties"]["id"],
+            plan_id=plan.id,
+            geometry=shape_to_db(geometry),
+            planting_type=feature["properties"]["planting_type"],
+            species=feature["properties"].get("species", "default"),
+            score=feature["properties"].get("score", 0.0),
+            rationale=feature["properties"].get("rationale", ""),
             # Undo puts the item back exactly as it was -- a generated item stays "generated".
-            "is_manual_edit": bool(feature["properties"].get("is_manual_edit", False)),
-        }
+            is_manual_edit=bool(feature["properties"].get("is_manual_edit", False)),
+            plan=plan,
+        )
         for feature, geometry in zip(features, geometries)
     ]
-    if rows:
-        await session.execute(insert(PlantingItemRow), rows)
-    plan.item_count += len(rows)
+    plan.items = plan.items + restored
+    plan.item_count += len(restored)
     plan.has_manual_edits = True
-    await session.commit()
 
 
 _VIOLATION_AREA_TOLERANCE_M2 = 1e-6

@@ -5,11 +5,9 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
-from sqlalchemy import select
 
-from backend.app.api.deps import PlanDep, ProjectDep, SessionDep, get_project_or_404
+from backend.app.api.deps import PlanDep, ProjectDep, get_project_or_404
 from backend.app.db.models import Plan
-from backend.app.db.session import SessionLocal
 from backend.app.schemas.plan import GenerateJobOut, GenerateJobStatus, GenerateRequest, PlanOut, PlanSummary
 from backend.app.services import generation_jobs
 from backend.app.services.geo_io import planting_items_to_feature_collection
@@ -42,28 +40,24 @@ async def _run_generate_job(
     tree_spacing_m: float | None,
     shrub_spacing_m: float | None,
 ) -> None:
-    """Runs on the event loop after POST /generate has already returned --
-    the request's own DB session is closed by then, so this opens a fresh one
-    rather than reusing it."""
-    async with SessionLocal() as session:
-        try:
-            project = await get_project_or_404(project_id, session)
-            plan = await generate_plan(
-                session,
-                project,
-                planting_types=planting_types,
-                scoring_mode=scoring_mode,
-                tree_spacing_m=tree_spacing_m,
-                shrub_spacing_m=shrub_spacing_m,
-            )
-            generation_jobs.mark_done(job_id, plan.id)
-        except (MissingTerritoryError, TooManyCandidatesError) as exc:
-            generation_jobs.mark_error(job_id, str(exc))
-        except HTTPException as exc:
-            generation_jobs.mark_error(job_id, str(exc.detail))
-        except Exception:
-            logger.exception("Background plan generation failed (job_id=%s, project_id=%s)", job_id, project_id)
-            generation_jobs.mark_error(job_id, "Не удалось сгенерировать план — внутренняя ошибка сервера.")
+    """Runs on the event loop after POST /generate has already returned."""
+    try:
+        project = get_project_or_404(project_id)
+        plan = await generate_plan(
+            project,
+            planting_types=planting_types,
+            scoring_mode=scoring_mode,
+            tree_spacing_m=tree_spacing_m,
+            shrub_spacing_m=shrub_spacing_m,
+        )
+        generation_jobs.mark_done(job_id, plan.id)
+    except (MissingTerritoryError, TooManyCandidatesError) as exc:
+        generation_jobs.mark_error(job_id, str(exc))
+    except HTTPException as exc:
+        generation_jobs.mark_error(job_id, str(exc.detail))
+    except Exception:
+        logger.exception("Background plan generation failed (job_id=%s, project_id=%s)", job_id, project_id)
+        generation_jobs.mark_error(job_id, "Не удалось сгенерировать план — внутренняя ошибка сервера.")
 
 
 @router.post("/generate", response_model=GenerateJobOut, status_code=202)
@@ -88,8 +82,7 @@ async def generate(request: GenerateRequest, project: ProjectDep) -> GenerateJob
 async def generate_status(project_id: str, job_id: str) -> GenerateJobStatus:
     # No project lookup here on purpose -- this route gets polled every
     # ~second for however long generation takes, and job_id is an
-    # unguessable random id that already fully identifies the job without
-    # needing to re-load (and re-selectinload) the project on every poll.
+    # unguessable random id that already fully identifies the job.
     job = generation_jobs.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Задача генерации не найдена — возможно, сервер перезапускался.")
@@ -97,18 +90,16 @@ async def generate_status(project_id: str, job_id: str) -> GenerateJobStatus:
 
 
 @router.get("/plans", response_model=list[PlanSummary])
-async def list_plans(project: ProjectDep, session: SessionDep) -> list[PlanSummary]:
+async def list_plans(project: ProjectDep) -> list[PlanSummary]:
     """Every past generation for this project (heuristic and ml alike), not
     just whichever one was generated most recently. Reads Plan.item_count
     (a snapshot written by generate_plan/edit_service) rather than counting
-    live planting_items rows -- most plans in the list have had those rows
-    pruned back to a recipe (see pipeline_service.Plan docstring), so a
-    COUNT/join here would undercount everything but the current plan.
+    live items, most plans in the list have had those pruned back to a
+    recipe (see pipeline_service.Plan docstring).
     """
-    result = await session.execute(select(Plan).where(Plan.project_id == project.id).order_by(Plan.created_at.desc()))
     return [
         PlanSummary(plan_id=plan.id, scoring_mode=plan.scoring_mode, created_at=plan.created_at, is_current=plan.is_current, item_count=plan.item_count)
-        for plan in result.scalars()
+        for plan in sorted(project.plans, key=lambda p: p.created_at, reverse=True)
     ]
 
 
@@ -121,18 +112,18 @@ async def get_plan(plan: PlanDep) -> PlanOut:
 
 
 @router.delete("/plans/{plan_id}", status_code=204)
-async def delete_plan_route(project_id: str, plan_id: str, session: SessionDep) -> None:
+async def delete_plan_route(project_id: str, plan_id: str) -> None:
     """Removes one plan from history permanently -- no undo, unlike the
     item-level edits in routes_edit.py. Doesn't use PlanDep/get_plan_or_404
     on purpose: that dependency transparently rematerializes a pruned plan
     (ensure_materialized) before handing it back, which would mean
     recomputing potentially hundreds of thousands of rows just to delete them
     a moment later -- a plain lookup is all a delete needs."""
-    result = await session.execute(select(Plan).where(Plan.id == plan_id, Plan.project_id == project_id))
-    plan = result.scalar_one_or_none()
+    project = get_project_or_404(project_id)
+    plan = next((p for p in project.plans if p.id == plan_id), None)
     if plan is None:
         raise HTTPException(status_code=404, detail="План не найден в этом проекте.")
     try:
-        await delete_plan(session, plan)
+        delete_plan(project, plan)
     except CurrentPlanDeletionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

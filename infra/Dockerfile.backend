@@ -59,10 +59,6 @@ COPY backend ./backend
 COPY geo_engine ./geo_engine
 COPY ml_scoring ./ml_scoring
 COPY scripts ./scripts
-# Alembic migrations live under backend/app/db/migrations (already copied
-# above) -- alembic.ini itself is at the repo root, and db/session.py's
-# init_db() needs it at startup to run `alembic upgrade head`.
-COPY alembic.ini ./
 
 RUN pip install --no-cache-dir -e . --no-deps
 

@@ -16,19 +16,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import tempfile
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from geo_engine.compliance import explain_items, report_payload, unverified_sources, write_trace_csv
-from geo_engine.io.dwg_convert import available_backend, convert_dwg_to_dxf
 from geo_engine.io.dxf_reader import (
     COMBINED_LAYER_MAP,
-    _looks_like_xref_dir,
-    dxf_bundle_paths,
+    BundleResolutionError,
     read_document,
     read_dxf_bundle,
+    resolve_bundle_inputs,
 )
 from geo_engine.io.dxf_writer import RESULT_LAYER_PREFIX, write_dxf
 from geo_engine.norms import load_norms
@@ -47,62 +48,36 @@ from ml_scoring.ml_scorer import MLScorer, ModelNotTrainedError
 PLANTING_TYPES = ("tree", "shrub", "lawn")
 
 
-def _convert_if_needed(path: Path, workdir: Path) -> Path:
-    if path.suffix.lower() != ".dwg":
-        return path
-    if available_backend() is None:
-        raise SystemExit(
-            f"Файл {path.name} в формате DWG, но конвертер не найден на PATH.\n"
-            "Установите LibreDWG (brew install libredwg, либо сборка из исходников — "
-            "рецепт в geo_engine/io/dwg_convert.py) или ODA File Converter."
-        )
-    return convert_dwg_to_dxf(path, workdir)
-
-
 def resolve_inputs(source: Path, workdir: Path) -> tuple[Path, list[Path]]:
     """(главный чертёж, все файлы бандла) — с конвертацией DWG при необходимости.
 
-    Каталог разбирается так же, как устроены реальные поставки: чертежи в корне
-    каталога — главные, всё из Xrefs/ — внешние ссылки к ним.
+    Тонкая обёртка над `dxf_reader.resolve_bundle_inputs()` — тем же кодом, что
+    и веб-загрузка: рекурсивный обход папки проекта (сети по подпапкам заказов
+    на съёмку, не только Xrefs/ссылки), подсказка со списком подпапок, когда
+    чертежа нет прямо в корне. `BundleResolutionError` — единственная точка,
+    где CLI переводит это в `SystemExit`; предупреждения о пропущенных файлах
+    печатаются здесь же, а не проглатываются.
     """
-    if source.is_dir():
-        mains = sorted(p for p in source.iterdir() if p.suffix.lower() in (".dxf", ".dwg"))
-        if not mains:
-            raise SystemExit(f"В каталоге {source} нет ни одного .dxf/.dwg файла.")
-        # Самый крупный файл в корне — почти всегда и есть главный чертёж, а не
-        # вспомогательная врезка; выбор всё равно влияет только на то, в копию
-        # какого документа пишется результат.
-        main = max(mains, key=lambda p: p.stat().st_size)
-        # Папка внешних ссылок называется по-разному у каждого бюро
-        # (`Xrefs`, `00_Ссылки`, `Внешние ссылки`, `xref_ИТП`) — берутся все
-        # подходящие, см. dxf_reader.XREF_DIR_MARKERS.
-        xrefs = []
-        for xref_dir in sorted(p for p in source.iterdir() if p.is_dir() and _looks_like_xref_dir(p.name)):
-            xrefs.extend(sorted(p for p in xref_dir.iterdir() if p.suffix.lower() in (".dxf", ".dwg")))
-        converted_main = _convert_if_needed(main, workdir)
-        converted = [converted_main]
-        for path in xrefs:
-            try:
-                converted.append(_convert_if_needed(path, workdir))
-            except RuntimeError as error:
-                # Один нечитаемый xref не должен валить весь прогон — но и молча
-                # пропасть он не должен, иначе потерянная граница участка
-                # выглядит как отсутствующая.
-                print(f"  ! пропущен {path.name}: {error}", file=sys.stderr)
-        return converted_main, converted
+    try:
+        main, bundle, warnings = resolve_bundle_inputs(source, workdir)
+    except BundleResolutionError as error:
+        raise SystemExit(str(error)) from error
+    for warning in warnings:
+        print(f"  ! {warning}", file=sys.stderr)
+    return main, bundle
 
-    converted = _convert_if_needed(source, workdir)
-    if source.suffix.lower() == ".dwg":
-        # У сконвертированного файла нет соседней Xrefs/ — берём её у оригинала.
-        siblings = dxf_bundle_paths(source)
-        bundle = [converted]
-        for path in siblings[1:]:
-            try:
-                bundle.append(_convert_if_needed(path, workdir))
-            except RuntimeError as error:
-                print(f"  ! пропущен {path.name}: {error}", file=sys.stderr)
-        return converted, bundle
-    return converted, dxf_bundle_paths(converted)
+
+def _open_and_count(path: Path) -> tuple[Path, int | None, str | None]:
+    """Opens one bundle file and counts its modelspace entities, or reports
+    why it couldn't. Module-level and picklable so it can run in a worker
+    process (see pick_base_drawing) -- returns the failure as data rather
+    than raising, since a worker process has no way to call back into the
+    caller's own stderr-printing loop."""
+    try:
+        doc = read_document(path)
+    except Exception as error:  # noqa: BLE001 — годится любой открывающийся
+        return path, None, type(error).__name__
+    return path, sum(1 for _ in doc.modelspace()), None
 
 
 def pick_base_drawing(candidates: list[Path]) -> Path | None:
@@ -118,19 +93,38 @@ def pick_base_drawing(candidates: list[Path]) -> Path | None:
     ошибок — внутри испорченная юникод-escape-последовательность вида
     "backslash-U-plus", на которой падает декодер ezdxf. Остальные файлы бандла при этом читаются, и план по
     ним строится полностью.
+
+    Каждое открытие независимо от остальных — то же самое чтение, что уже
+    параллелится в `read_dxf_bundle`, просто здесь бандл перечитывается
+    заново только ради подсчёта сущностей. Раньше это был последовательный
+    цикл — замерено на реальном бандле (33 файла, «1. Олимпийская деревня»):
+    81.2с, самый большой необъяснённый кусок времени всего CLI-прогона (см.
+    docs/worklog.md), при том что параллельное чтение того же бандла в
+    read_dxf_bundle заняло 61с. `ProcessPoolExecutor.map` возвращает
+    результаты в порядке `ordered`, не в порядке завершения — порядок
+    перебора (и, значит, какой файл выигрывает при равном числе сущностей)
+    остаётся ровно таким же, как в последовательной версии.
     """
+    ordered = sorted(set(candidates), key=lambda p: p.stat().st_size, reverse=True)
+    if not ordered:
+        return None
+
+    if len(ordered) > 1:
+        worker_count = min(len(ordered), os.cpu_count() or 1)
+        with ProcessPoolExecutor(max_workers=worker_count) as pool:
+            results = list(pool.map(_open_and_count, ordered))
+    else:
+        results = [_open_and_count(p) for p in ordered]
+
     best, best_count = None, -1
-    for path in sorted(set(candidates), key=lambda p: p.stat().st_size, reverse=True):
-        try:
-            doc = read_document(path)
-        except Exception as error:  # noqa: BLE001 — годится любой открывающийся
-            print(f"  ! как основу не использовать {path.name}: {type(error).__name__}", file=sys.stderr)
+    for path, count, error_name in results:
+        if count is None:
+            print(f"  ! как основу не использовать {path.name}: {error_name}", file=sys.stderr)
             continue
         # Не первый открывшийся, а самый содержательный: у бандла бывают
         # файлы-заглушки в пару объектов, и копия такой заглушки со слоем
         # результата формально проходит, но эксперт открывает её и не видит
         # своей подосновы — ровно то, ради чего результат и пишется поверх.
-        count = sum(1 for _ in doc.modelspace())
         if count > best_count:
             best, best_count = path, count
     return best

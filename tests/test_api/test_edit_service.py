@@ -1,14 +1,11 @@
-"""Unit tests for edit_service.py that don't need a real PostGIS connection:
-violation_mask/from_wgs84 (pure functions), the planting_type/geometry
-mismatch guard, and the id-based batch edits (delete/retype/move/restore),
-exercised against transient (un-persisted) ORM objects with a fake
-AsyncSession standing in for a real one -- edit_service only ever calls
-add/commit/refresh/delete/execute on it.
+"""Unit tests for edit_service.py: violation_mask/from_wgs84 (pure
+functions), the planting_type/geometry mismatch guard, and the id-based
+batch edits (delete/retype/move/restore), exercised against plain in-memory
+records (backend.app.db.models) -- there's no database at all to stand in
+for.
 """
 
 from __future__ import annotations
-
-import asyncio
 
 import numpy as np
 import pytest
@@ -120,27 +117,6 @@ def test_batch_snapshot_reprojection_matches_the_single_item_path():
         assert np.allclose(b_coords, s_coords, atol=1e-9)
 
 
-class _FakeAsyncSession:
-    """Stands in for a SQLAlchemy AsyncSession so these tests don't need a
-    real PostGIS connection -- edit_service only ever calls
-    add/commit/refresh/delete/execute on the session."""
-
-    def add(self, obj):
-        pass
-
-    async def commit(self):
-        pass
-
-    async def refresh(self, obj):
-        pass
-
-    async def delete(self, obj):
-        pass
-
-    async def execute(self, *args, **kwargs):
-        pass
-
-
 def _point_item(planting_type: str = "shrub") -> PlantingItemRow:
     item = PlantingItemRow(
         id="item-point",
@@ -170,9 +146,7 @@ class TestApplyItemPatch:
         item = _point_item(planting_type="shrub")
 
         with pytest.raises(PlantingTypeGeometryMismatchError):
-            asyncio.run(
-                apply_item_patch(session=_FakeAsyncSession(), item=item, geometry=None, planting_type="lawn", species=None, source_crs=None)
-            )
+            apply_item_patch(item=item, geometry=None, planting_type="lawn", species=None, source_crs=None)
 
         assert item.planting_type == "shrub"
 
@@ -180,9 +154,7 @@ class TestApplyItemPatch:
         item = _polygon_item(planting_type="lawn")
 
         with pytest.raises(PlantingTypeGeometryMismatchError):
-            asyncio.run(
-                apply_item_patch(session=_FakeAsyncSession(), item=item, geometry=None, planting_type="tree", species=None, source_crs=None)
-            )
+            apply_item_patch(item=item, geometry=None, planting_type="tree", species=None, source_crs=None)
 
         assert item.planting_type == "lawn"
 
@@ -191,18 +163,12 @@ class TestApplyItemPatch:
         point_geojson = mapping(Point(1, 1))
 
         with pytest.raises(PlantingTypeGeometryMismatchError):
-            asyncio.run(
-                apply_item_patch(
-                    session=_FakeAsyncSession(), item=item, geometry=point_geojson, planting_type=None, species=None, source_crs=None
-                )
-            )
+            apply_item_patch(item=item, geometry=point_geojson, planting_type=None, species=None, source_crs=None)
 
     def test_retyping_point_item_between_tree_and_shrub_is_allowed(self):
         item = _point_item(planting_type="shrub")
 
-        updated = asyncio.run(
-            apply_item_patch(session=_FakeAsyncSession(), item=item, geometry=None, planting_type="tree", species=None, source_crs=None)
-        )
+        updated = apply_item_patch(item=item, geometry=None, planting_type="tree", species=None, source_crs=None)
 
         assert updated.planting_type == "tree"
         assert item.plan.has_manual_edits is True
@@ -232,17 +198,13 @@ class TestApplyItemPatchTerritoryBoundary:
         outside_point = mapping(Point(50, 50))
 
         with pytest.raises(OutOfTerritoryError):
-            asyncio.run(
-                apply_item_patch(session=_FakeAsyncSession(), item=item, geometry=outside_point, planting_type=None, species=None, source_crs=None)
-            )
+            apply_item_patch(item=item, geometry=outside_point, planting_type=None, species=None, source_crs=None)
 
     def test_moving_a_point_within_the_territory_is_allowed(self):
         item = _item_in_territory(territory=SQUARE, point=Point(1, 1))
         inside_point = mapping(Point(8, 8))
 
-        updated = asyncio.run(
-            apply_item_patch(session=_FakeAsyncSession(), item=item, geometry=inside_point, planting_type=None, species=None, source_crs=None)
-        )
+        updated = apply_item_patch(item=item, geometry=inside_point, planting_type=None, species=None, source_crs=None)
 
         assert db_to_shape(updated.geometry).equals(Point(8, 8))
 
@@ -267,7 +229,7 @@ class TestRestoreItems:
         snapshot = planting_item_to_geojson_feature(item, None).model_dump()
         plan.item_count = 5
 
-        asyncio.run(restore_items(session=_FakeAsyncSession(), plan=plan, features=[snapshot], source_crs=None))
+        restore_items(plan=plan, features=[snapshot], source_crs=None)
 
         assert plan.item_count == 6
         assert plan.has_manual_edits is True
@@ -275,24 +237,16 @@ class TestRestoreItems:
     def test_restored_rows_keep_the_snapshots_own_manual_edit_flag(self):
         """Undoing a delete puts items back exactly as they were -- a generated
         item must not come back marked as a manual edit."""
-
-        class RecordingSession(_FakeAsyncSession):
-            inserted: list[dict] = []
-
-            async def execute(self, statement, rows=None):
-                self.inserted.extend(rows or [])
-
         plan = _plan_with_territory(BIG_TERRITORY)
         plan.item_count = 0
         generated = planting_item_to_geojson_feature(_row("gen", Point(1, 1), "tree"), None).model_dump()
         edited_row = _row("edited", Point(2, 2), "tree")
         edited_row.is_manual_edit = True
         edited = planting_item_to_geojson_feature(edited_row, None).model_dump()
-        session = RecordingSession()
 
-        asyncio.run(restore_items(session=session, plan=plan, features=[generated, edited], source_crs=None))
+        restore_items(plan=plan, features=[generated, edited], source_crs=None)
 
-        assert {row["id"]: row["is_manual_edit"] for row in session.inserted} == {"gen": False, "edited": True}
+        assert {item.id: item.is_manual_edit for item in plan.items} == {"gen": False, "edited": True}
 
     def test_rejects_a_snapshot_with_mismatched_type_and_geometry(self):
         plan = _plan_with_territory(BIG_TERRITORY)
@@ -301,7 +255,7 @@ class TestRestoreItems:
         snapshot["properties"]["planting_type"] = "lawn"  # Point geometry, lawn type -- mismatch
 
         with pytest.raises(PlantingTypeGeometryMismatchError):
-            asyncio.run(restore_items(session=_FakeAsyncSession(), plan=plan, features=[snapshot], source_crs=None))
+            restore_items(plan=plan, features=[snapshot], source_crs=None)
 
     def test_rejects_a_snapshot_positioned_outside_the_territory(self):
         plan = _plan_with_territory(SQUARE)  # tight territory, [0,10]x[0,10]
@@ -312,7 +266,7 @@ class TestRestoreItems:
         }
 
         with pytest.raises(OutOfTerritoryError):
-            asyncio.run(restore_items(session=_FakeAsyncSession(), plan=plan, features=[snapshot], source_crs=None))
+            restore_items(plan=plan, features=[snapshot], source_crs=None)
 
     def test_restoring_a_lawn_touching_the_territory_boundary_survives_a_real_crs_round_trip(self):
         """Reproduces a live bug: delete_items snapshots an item's geometry
@@ -332,7 +286,7 @@ class TestRestoreItems:
         item = _row("lawn-1", lawn, "lawn")
         snapshot = planting_item_to_geojson_feature(item, "EPSG:32637").model_dump()
 
-        asyncio.run(restore_items(session=_FakeAsyncSession(), plan=plan, features=[snapshot], source_crs="EPSG:32637"))
+        restore_items(plan=plan, features=[snapshot], source_crs="EPSG:32637")
 
         assert plan.item_count == 1
 
@@ -348,7 +302,7 @@ class TestRestoreItems:
         snapshot = planting_item_to_geojson_feature(item, "EPSG:32637").model_dump()
 
         with pytest.raises(OutOfTerritoryError):
-            asyncio.run(restore_items(session=_FakeAsyncSession(), plan=plan, features=[snapshot], source_crs="EPSG:32637"))
+            restore_items(plan=plan, features=[snapshot], source_crs="EPSG:32637")
 
 
 def _plan_with_items(territory: Polygon, items: list[PlantingItemRow], project_id: str = "project-1") -> Plan:
@@ -371,7 +325,7 @@ class TestBatchEditsById:
     def test_delete_items_returns_snapshots_of_exactly_the_requested_ids(self):
         plan = _plan_with_items(BIG_TERRITORY, [_row("a", Point(1, 1), "tree"), _row("b", Point(2, 2), "shrub"), _row("c", Point(3, 3), "tree")])
 
-        snapshots = asyncio.run(delete_items(session=_FakeAsyncSession(), plan=plan, ids=["a", "c", "a"], source_crs=None))
+        snapshots = delete_items(plan=plan, ids=["a", "c", "a"], source_crs=None)
 
         assert [s["properties"]["id"] for s in snapshots] == ["a", "c"]  # duplicates collapsed, order kept
         assert plan.item_count == 1
@@ -381,7 +335,7 @@ class TestBatchEditsById:
         plan = _plan_with_items(BIG_TERRITORY, [_row("a", Point(1, 1), "tree")])
 
         with pytest.raises(ItemsNotFoundError):
-            asyncio.run(move_items(session=_FakeAsyncSession(), plan=plan, ids=["a", "gone"], from_point=(0, 0), to_point=(1, 1), source_crs=None))
+            move_items(plan=plan, ids=["a", "gone"], from_point=(0, 0), to_point=(1, 1), source_crs=None)
 
         assert db_to_shape(plan.items[0].geometry).equals(Point(1, 1))
 
@@ -389,9 +343,7 @@ class TestBatchEditsById:
         lawn = _row("lawn", box(20, 20, 30, 30), "lawn")
         plan = _plan_with_items(BIG_TERRITORY, [_row("a", Point(1, 1), "shrub"), _row("b", Point(2, 2), "tree"), lawn])
 
-        previous, skipped = asyncio.run(
-            retype_items(session=_FakeAsyncSession(), plan=plan, changes=[("a", "tree"), ("b", "tree"), ("lawn", "tree")], source_crs=None)
-        )
+        previous, skipped = retype_items(plan=plan, changes=[("a", "tree"), ("b", "tree"), ("lawn", "tree")], source_crs=None)
 
         assert [p["properties"]["id"] for p in previous] == ["a"]  # "b" already a tree -> not a change
         assert previous[0]["properties"]["planting_type"] == "shrub"  # snapshot holds the pre-change type
@@ -401,14 +353,14 @@ class TestBatchEditsById:
     def test_retype_items_restores_each_items_own_previous_type(self):
         plan = _plan_with_items(BIG_TERRITORY, [_row("a", Point(1, 1), "tree"), _row("b", Point(2, 2), "tree")])
 
-        asyncio.run(retype_items(session=_FakeAsyncSession(), plan=plan, changes=[("a", "shrub"), ("b", "tree")], source_crs=None))
+        retype_items(plan=plan, changes=[("a", "shrub"), ("b", "tree")], source_crs=None)
 
         assert [i.planting_type for i in plan.items] == ["shrub", "tree"]
 
     def test_move_items_translates_only_the_given_ids_and_its_inverse_undoes_it(self):
         plan = _plan_with_items(BIG_TERRITORY, [_row("a", Point(1, 1), "tree"), _row("b", Point(50, 50), "tree")])
 
-        moved = asyncio.run(move_items(session=_FakeAsyncSession(), plan=plan, ids=["a"], from_point=(0, 0), to_point=(3, 4), source_crs=None))
+        moved = move_items(plan=plan, ids=["a"], from_point=(0, 0), to_point=(3, 4), source_crs=None)
         assert db_to_shape(plan.items[0].geometry).equals(Point(4, 5))
         assert db_to_shape(plan.items[1].geometry).equals(Point(50, 50))
         # Returns the moved items' post-move snapshots -- the frontend applies
@@ -417,14 +369,14 @@ class TestBatchEditsById:
         assert moved[0]["properties"]["id"] == "a"
         assert tuple(moved[0]["geometry"]["coordinates"]) == (4.0, 5.0)
 
-        asyncio.run(move_items(session=_FakeAsyncSession(), plan=plan, ids=["a"], from_point=(3, 4), to_point=(0, 0), source_crs=None))
+        move_items(plan=plan, ids=["a"], from_point=(3, 4), to_point=(0, 0), source_crs=None)
         assert db_to_shape(plan.items[0].geometry).equals(Point(1, 1))
 
     def test_move_items_is_all_or_nothing_at_the_territory_boundary(self):
         plan = _plan_with_items(SQUARE, [_row("a", Point(1, 1), "tree"), _row("b", Point(9, 9), "tree")])
 
         with pytest.raises(OutOfTerritoryError):
-            asyncio.run(move_items(session=_FakeAsyncSession(), plan=plan, ids=["a", "b"], from_point=(0, 0), to_point=(2, 0), source_crs=None))
+            move_items(plan=plan, ids=["a", "b"], from_point=(0, 0), to_point=(2, 0), source_crs=None)
 
         assert db_to_shape(plan.items[0].geometry).equals(Point(1, 1))  # "a" would still fit, but nothing moved
 
@@ -434,7 +386,7 @@ class TestBatchEditsById:
         snapshot = planting_item_to_geojson_feature(item, None).model_dump()
 
         with pytest.raises(ItemsAlreadyExistError):
-            asyncio.run(restore_items(session=_FakeAsyncSession(), plan=plan, features=[snapshot], source_crs=None))
+            restore_items(plan=plan, features=[snapshot], source_crs=None)
 
 
 class TestValidateItems:
@@ -503,7 +455,7 @@ def test_territory_is_looked_up_once_per_project(monkeypatch):
 
     monkeypatch.setattr(exclusion_cache, "layers_to_domain", counting_layers_to_domain)
 
-    asyncio.run(move_items(session=_FakeAsyncSession(), plan=plan, ids=["a"], from_point=(0, 0), to_point=(1, 1), source_crs=None))
-    asyncio.run(move_items(session=_FakeAsyncSession(), plan=plan, ids=["a"], from_point=(1, 1), to_point=(2, 2), source_crs=None))
+    move_items(plan=plan, ids=["a"], from_point=(0, 0), to_point=(1, 1), source_crs=None)
+    move_items(plan=plan, ids=["a"], from_point=(1, 1), to_point=(2, 2), source_crs=None)
 
     assert len(calls) == 1

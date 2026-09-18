@@ -8,6 +8,7 @@ import numpy as np
 import shapely
 from shapely.geometry import Point
 from shapely.geometry.base import BaseGeometry
+from shapely.strtree import STRtree
 
 from geo_engine.model import PlantingCandidate, PlantingType, Zone
 from geo_engine.norms import PlantingNorms
@@ -23,11 +24,41 @@ def _iter_polygons(geom: BaseGeometry):
             yield from _iter_polygons(part)
 
 
-def _zoning_at(point_or_poly: BaseGeometry, zoning_zones: list[Zone]) -> str | None:
-    for zone in zoning_zones:
-        if zone.zone_type == "zoning" and zone.geometry.intersects(point_or_poly):
-            return zone.attrs.get("zoning_category")
-    return None
+class ZoningIndex:
+    """A spatial index over just the `zoning`-typed zones, built once per
+    generate_candidates() call rather than re-filtering/re-scanning the
+    project's whole zones list for every candidate.
+
+    `_zoning_at` used to loop `for zone in zoning_zones: if zone.zone_type
+    == "zoning" ...` for every single candidate, and `zoning_zones` is the
+    project's *entire* zones list, not pre-filtered -- fine on the modest
+    zone counts this was written and tested against, but real Mosgeotrest
+    deliveries carry hundreds of thousands of zones of every other type
+    (existing_greenery, road, building, and a large "unknown" bucket -- no
+    DXF layer map has ever produced zone_type="zoning" at all). Confirmed
+    live: 331,140 zones x ~8,000 raw tree candidates on "1. Олимпийская
+    деревня" took 282 seconds in generate_candidates alone, almost entirely
+    this loop re-scanning the same 331K-item list per candidate and finding
+    nothing every time. The fix is the same shape as
+    ml_scoring.features.build_existing_greenery_index: filter once, index
+    once, O(log n) lookup per candidate instead of O(zones).
+    """
+
+    def __init__(self, zoning_zones: list[Zone] | None):
+        self._zones = [z for z in (zoning_zones or []) if z.zone_type == "zoning"]
+        self._tree = STRtree([z.geometry for z in self._zones]) if self._zones else None
+
+    def category_at(self, point_or_poly: BaseGeometry) -> str | None:
+        if self._tree is None:
+            return None
+        # query() is a bbox pre-filter (fast, may over-match); intersects()
+        # confirms the actual geometry -- the standard two-step STRtree
+        # pattern (see also compliance.py's query_nearest usage).
+        for idx in self._tree.query(point_or_poly):
+            zone = self._zones[int(idx)]
+            if zone.geometry.intersects(point_or_poly):
+                return zone.attrs.get("zoning_category")
+        return None
 
 
 def _clearance(geom: BaseGeometry, exclusion_zone: BaseGeometry | None) -> float:
@@ -104,7 +135,7 @@ def generate_point_candidates(
     bottleneck (measured: minutes, vs. a couple of seconds vectorized).
     """
     spacing = norms.spacing_for(planting_type).min_distance_m
-    zoning_zones = zoning_zones or []
+    zoning_index = ZoningIndex(zoning_zones)
     candidates: list[PlantingCandidate] = []
     rng = np.random.default_rng(seed)
 
@@ -145,7 +176,7 @@ def generate_point_candidates(
                     geometry=point,
                     planting_type=planting_type,
                     clearance_m=float(clearance),
-                    zoning=_zoning_at(point, zoning_zones),
+                    zoning=zoning_index.category_at(point),
                 )
             )
     return candidates
@@ -160,7 +191,7 @@ def generate_area_candidates(
 ) -> list[PlantingCandidate]:
     """Each sub-polygon of buildable_area becomes one whole-area candidate,
     for area-planted types (lawn)."""
-    zoning_zones = zoning_zones or []
+    zoning_index = ZoningIndex(zoning_zones)
     candidates: list[PlantingCandidate] = []
     min_area = norms.min_candidate_area_m2.get(planting_type, 0.0)
 
@@ -173,7 +204,7 @@ def generate_area_candidates(
                 planting_type=planting_type,
                 clearance_m=_clearance(polygon, exclusion_zone),
                 area_m2=polygon.area,
-                zoning=_zoning_at(polygon, zoning_zones),
+                zoning=zoning_index.category_at(polygon),
             )
         )
     return candidates

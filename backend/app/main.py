@@ -1,28 +1,21 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
-from backend.app.api import routes_assistant, routes_config, routes_edit, routes_export, routes_generate, routes_projects
+from backend.app.api import (
+    routes_assistant,
+    routes_compliance,
+    routes_config,
+    routes_edit,
+    routes_export,
+    routes_generate,
+    routes_projects,
+)
 from backend.app.core.config import settings
-from backend.app.db.session import init_db
 
-
-@asynccontextmanager
-async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
-    # Applies any pending Alembic migrations on startup (backend/app/db/migrations)
-    # -- fine for this scale/deployment; a real multi-instance rollout would
-    # run `alembic upgrade head` as its own deploy step instead, so N
-    # replicas starting at once don't race to apply the same migration.
-    await init_db()
-    yield
-
-
-app = FastAPI(title="GreenProject API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="GreenProject API", version="0.1.0")
 
 # A real-scale plan's GeoJSON response is tens of MB uncompressed (measured:
 # ~35MB for 100k items) -- gzip gets that down to roughly an eighth
@@ -52,3 +45,4 @@ app.include_router(routes_edit.router)
 app.include_router(routes_export.router)
 app.include_router(routes_config.router)
 app.include_router(routes_assistant.router)
+app.include_router(routes_compliance.router)

@@ -24,8 +24,12 @@ export interface ProjectOut {
   id: string;
   name: string;
   source_crs: string | null;
+  /** True only when source_crs came from real evidence (auto-detected
+   * geographic coordinates in the uploaded file) -- never for a value the
+   * user typed in, even a plausible one, and never for DXF/DWG/ZIP, which
+   * carries no CRS metadata at all. See backend's Project.crs_verified. */
+  crs_verified: boolean;
   created_at: string;
-  layers: GeoJSONFeatureCollection;
 }
 
 export interface PlanOut {
@@ -116,6 +120,51 @@ export async function uploadProject(name: string, file: File, sourceCrs?: string
 
 export async function getProject(projectId: string): Promise<ProjectOut> {
   return request(`/api/projects/${projectId}`);
+}
+
+/** The full vector layer geometry -- split out of ProjectOut and fetched
+ * lazily (only by ThreeDView, on the first toggle into 3D) rather than on
+ * every project open. See backend/app/schemas/project.py::ProjectOut's own
+ * docstring: on a real 371,685-layer project this alone is a 170MB, 60+
+ * second response, and most sessions never open 3D. */
+export async function getProjectLayers(projectId: string): Promise<GeoJSONFeatureCollection> {
+  return request(`/api/projects/${projectId}/layers`);
+}
+
+export interface LayersRasterGroup {
+  key: string;
+  label: string;
+  color: string;
+  count: number;
+  /** Built client-side (project id + group key are all the backend route
+   * needs) rather than returned by the API -- one less thing the response
+   * shape has to carry per group. */
+  url: string;
+}
+
+export interface LayersRaster {
+  /** [[south, west], [north, east]] -- react-leaflet's <ImageOverlay
+   * bounds=.../> shape directly. null for a project with no layers loaded. */
+  bounds: [[number, number], [number, number]] | null;
+  groups: LayersRasterGroup[];
+}
+
+/** The loaded source drawing, rendered server-side as one PNG per legend
+ * group instead of GeoJSON features -- see backend/app/services/layer_raster.py's
+ * docstring for why: raw layers were never interactive on the map (only
+ * plan.features is), so paying a DOM node per object bought nothing and
+ * broke down completely at real scale (371K+ objects on one street). */
+export async function getLayersRaster(projectId: string): Promise<LayersRaster> {
+  const raw = await request<{ bounds: [[number, number], [number, number]] | null; groups: Omit<LayersRasterGroup, "url">[] }>(
+    `/api/projects/${projectId}/layers-raster`
+  );
+  return {
+    bounds: raw.bounds,
+    groups: raw.groups.map((g) => ({
+      ...g,
+      url: `${API_URL}/api/projects/${projectId}/layers-raster/image?group=${encodeURIComponent(g.key)}`,
+    })),
+  };
 }
 
 export interface GenerateJobStatus {
@@ -328,6 +377,49 @@ export interface PlantingNorms {
 
 export async function getPlantingNorms(): Promise<PlantingNorms> {
   return request("/api/config/planting-norms");
+}
+
+// Обоснование по нормативам (geo_engine/compliance.py via
+// backend/app/api/routes_compliance.py) -- "почему здесь можно сажать" со
+// ссылкой на акт и пункт, требование ТЗ, не бонус. Синхронные эндпоинты
+// (не job/poll, как export-dxf): explain_items -- один векторизованный
+// STRtree-проход, а не многоминутная запись DXF.
+
+export interface ComplianceCheck {
+  object_type: string;
+  required_m: number;
+  actual_m: number;
+  satisfied: boolean;
+  citation: string;
+  table_row: string;
+  verified: boolean;
+}
+
+export interface ItemCompliance {
+  item_id: string;
+  planting_type: PlantingType;
+  species: string;
+  compliant: boolean;
+  binding_constraint: string | null;
+  summary: string;
+  checks: ComplianceCheck[];
+}
+
+/** Обоснование для конкретных посадок -- то, что панель "Почему здесь?"
+ * запрашивает для одной выделенной точки, а не для всего плана целиком. */
+export async function getItemsCompliance(projectId: string, planId: string, ids: string[]): Promise<ItemCompliance[]> {
+  const { items } = await postJson<{ items: ItemCompliance[] }>(
+    `/api/projects/${projectId}/plans/${planId}/compliance/items`,
+    { ids }
+  );
+  return items;
+}
+
+/** Прямая ссылка на скачивание полного отчёта по плану -- вызывающий код
+ * просто кликает по ней (тот же приём, что и у exportDxf), файл льётся из
+ * ответа сервера напрямую в браузер, не через JS. */
+export function complianceReportUrl(projectId: string, planId: string, format: "json" | "csv"): string {
+  return `${API_URL}/api/projects/${projectId}/plans/${planId}/compliance-report.${format}`;
 }
 
 // Юна -- the in-app chat assistant (components/AssistantChat.tsx). The

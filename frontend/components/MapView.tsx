@@ -2,12 +2,12 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import "leaflet/dist/leaflet.css";
-import { AttributionControl, MapContainer, Rectangle, TileLayer, GeoJSON, useMap, useMapEvents } from "react-leaflet";
+import { AttributionControl, ImageOverlay, MapContainer, Rectangle, TileLayer, GeoJSON, useMap, useMapEvents } from "react-leaflet";
 import L, { type Layer, type PathOptions } from "leaflet";
 import type { Feature } from "geojson";
 
-import type { GeoJSONFeature, GeoJSONFeatureCollection, LngLat } from "@/lib/api";
-import { isZoningFeature, layerGroupColor, layerGroupKey, plantingColor } from "@/lib/mapStyle";
+import type { GeoJSONFeatureCollection, LayersRaster, LngLat } from "@/lib/api";
+import { plantingColor } from "@/lib/mapStyle";
 import { boundsOfItems, itemsInBox, type LatLngBox, type PlanIndex } from "@/lib/planIndex";
 
 // Selection is blue on purpose: red means "violates a setback norm", and an
@@ -31,16 +31,6 @@ const LIVE_MOVE_PREVIEW_LIMIT = 2000;
 // dedicated pane above markerPane fixes that; pointerEvents:none keeps it
 // purely visual so it never intercepts the press that starts a gesture.
 const SELECTION_PANE = "selectionOverlay";
-
-function layerStyle(feature?: Feature): PathOptions {
-  const key = layerGroupKey((feature ?? { type: "Feature", properties: {} }) as unknown as GeoJSONFeature);
-  const color = layerGroupColor(key);
-  if (key === "utility") return { color, weight: 2 };
-  // fillOpacity used to be 0.15 -- barely visible against the basemap,
-  // which is exactly why the legend (ControlPanel.tsx) exists now: colors
-  // have to actually read as distinct fills, not just a faint tint.
-  return { color, weight: 1, fillOpacity: 0.45 };
-}
 
 function areaStyle(type: string, selected: boolean, violation: boolean): PathOptions {
   const base = plantingColor(type);
@@ -78,35 +68,44 @@ function planItemIcon(type: string): L.DivIcon {
   return icon;
 }
 
-function bindPopup(feature: Feature, layer: Layer) {
-  const props = feature.properties as Record<string, unknown> | undefined;
-  if (!props) return;
-  const lines = Object.entries(props)
-    .map(([key, value]) => `<b>${key}</b>: ${String(value)}`)
-    .join("<br/>");
-  layer.bindPopup(lines);
-}
-
 /** Zooms/pans to fit the loaded data — only when a different project or
  * plan is opened (`fitKey`), not after every edit of the same plan, which
  * would yank the view away from wherever the user zoomed in to edit. */
-function FitBounds({ fitKey, layers, plan }: { fitKey: string; layers?: GeoJSONFeatureCollection; plan?: GeoJSONFeatureCollection }) {
+function FitBounds({
+  fitKey,
+  layersBounds,
+  plan,
+}: {
+  fitKey: string;
+  layersBounds?: [[number, number], [number, number]] | null;
+  plan?: GeoJSONFeatureCollection;
+}) {
   const map = useMap();
-  const dataRef = useRef({ layers, plan });
-  dataRef.current = { layers, plan };
+  const dataRef = useRef({ layersBounds, plan });
+  dataRef.current = { layersBounds, plan };
 
   useEffect(() => {
-    const collections = [dataRef.current.layers, dataRef.current.plan].filter(Boolean) as GeoJSONFeatureCollection[];
-    if (collections.length === 0) return;
-
     const bounds = L.latLngBounds([]);
-    for (const collection of collections) {
+    if (dataRef.current.layersBounds) bounds.extend(dataRef.current.layersBounds);
+    if (dataRef.current.plan) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const layerBounds = L.geoJSON(collection as any).getBounds();
-      if (layerBounds.isValid()) bounds.extend(layerBounds);
+      const planBounds = L.geoJSON(dataRef.current.plan as any).getBounds();
+      if (planBounds.isValid()) bounds.extend(planBounds);
     }
     if (bounds.isValid()) map.fitBounds(bounds, { padding: [20, 20] });
-  }, [fitKey, map]);
+    // `layersBounds` itself isn't a dep (an edit shouldn't yank the view --
+    // see this function's own doc comment), but its *presence* has to be:
+    // layersRaster is fetched separately from and later than the project
+    // that sets `fitKey` (see useProjectSession.ts's restore/upload flow),
+    // so on a fresh load this effect's first run reliably finds
+    // layersBounds still null -- fits to nothing, map stays at the default
+    // Moscow-wide view -- and without this, nothing ever re-fits once the
+    // real bounds arrive a moment later (fitKey/map don't change again).
+    // Found live: the raster layers were mounted at the correct place all
+    // along, just a few pixels wide at the default zoom -- indistinguishable
+    // from "not there" without measuring. Same reasoning for `plan`.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fitKey, map, Boolean(layersBounds), Boolean(plan)]);
 
   return null;
 }
@@ -544,30 +543,80 @@ function SelectionController(props: SelectionControllerProps) {
 // A viewport-height of extra padding on each side, so a small pan doesn't
 // visibly pop markers in right at the map's edge.
 const VIEWPORT_PADDING_RATIO = 0.5;
-// Caps how many DOM markers a single dense viewport can force into
-// existence at once -- past this, individual markers stop being useful
-// anyway (they'd overlap into an unreadable smear), so a "zoom in" hint
-// takes over instead of paying the mount cost.
-const MAX_VISIBLE_MARKERS = 4000;
 
-/** Renders point plan items (tree/shrub) as real Leaflet markers, but only
- * for whichever ones currently fall inside the (padded) viewport -- a
- * real-scale plan can hold hundreds of thousands of items, and mounting one
- * DOM marker per item regardless of what's actually on screen doesn't scale
- * (see CLAUDE.md's rendering performance notes). Lawn polygons aren't
- * virtualized (they stay in the ordinary <GeoJSON> layer in MapView below):
- * there's normally only a handful of them, and "on screen" isn't a single
- * coordinate check for an area the way it is for a point.
+// Cluster grid cell size, in screen pixels -- roughly a cluster bubble's own
+// footprint, so neighbouring bubbles don't visually overlap. Bucketing is
+// done in degrees, not by calling Leaflet's per-point pixel projection
+// (map.latLngToContainerPoint) for every candidate: at a real plan's scale
+// (hundreds of thousands of points can be "in view" at once when zoomed out
+// to see a whole territory), that per-point API call is real, avoidable
+// cost. Web Mercator's pixels-per-degree-of-longitude is constant at a
+// given zoom regardless of latitude (256 * 2^zoom / 360) -- converting the
+// desired pixel cell size to a degree cell size is therefore one division,
+// and reusing that same degree size for latitude too is a deliberate
+// approximation (exact for longitude, off by cos(latitude) for latitude) --
+// fine at this project's scale (a single street/district, a sliver of
+// latitude), same tolerance this codebase already accepts elsewhere for
+// non-geodesic math at small scale (see plan3d.ts's own equirectangular
+// projection).
+const CLUSTER_CELL_PX = 56;
+
+function clusterCellSizeDeg(zoom: number): number {
+  return (360 * CLUSTER_CELL_PX) / (256 * Math.pow(2, zoom));
+}
+
+function clusterBubbleSizePx(count: number): number {
+  if (count < 10) return 28;
+  if (count < 100) return 36;
+  if (count < 1000) return 46;
+  return 56;
+}
+
+function clusterDivIcon(count: number): L.DivIcon {
+  const size = clusterBubbleSizePx(count);
+  const label = count > 9999 ? "9999+" : count.toLocaleString("ru-RU");
+  return L.divIcon({
+    className: "gp-cluster-marker",
+    html: `<span class="gp-cluster-bubble" style="width:${size}px;height:${size}px">${label}</span>`,
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+  });
+}
+
+interface MountedCluster {
+  marker: L.Marker;
+  count: number;
+}
+
+/** Renders point plan items (tree/shrub) as real Leaflet markers when
+ * they're spaced out enough to be individually useful, and as cluster
+ * bubbles (a count, not real geometry) when several fall into the same
+ * screen-pixel cell at the current zoom -- a real-scale plan can hold
+ * hundreds of thousands of items, and at any zoom where they'd render as an
+ * unreadable smear of overlapping dots anyway, a handful of cluster bubbles
+ * both reads better *and* costs a bounded number of DOM nodes regardless of
+ * how many points are actually behind them (cell count is bounded by
+ * viewport-pixels / CLUSTER_CELL_PX, not by plan size). Lawn polygons aren't
+ * part of this: they stay in the ordinary <GeoJSON> layer in MapView below
+ * (normally only a handful per plan, and "on screen" isn't a single
+ * coordinate the way it is for a point).
  *
- * Markers are created/destroyed imperatively on `moveend`/`zoomend` and
- * whenever the plan itself changes, through the *same* `registerLayer`
- * bookkeeping the always-mounted lawn layer already uses below -- so
- * selecting, dragging, and violation/selection highlighting work
- * identically whether a given item happens to be virtualized in right now
- * or not; SelectionController's hit-testing only ever looks at whatever DOM
- * element is actually under the pointer, never caring how it got there.
+ * Only cells with exactly one point render a real, selectable/draggable
+ * marker -- clusters are deliberately not wired into `registerLayer`'s id
+ * registry (no `data-item-id`), so SelectionController's hit-testing simply
+ * never finds one: a press on a cluster bubble falls through as an ordinary
+ * map click/pan, and this component's own click handler on the bubble zooms
+ * to its contents' bounds instead. Editing a group therefore always means
+ * zooming in until it dissolves into real markers first -- deliberately
+ * simpler and harder to fat-finger than resolving a cluster into hundreds of
+ * ids for a single gesture.
+ *
+ * Real markers are created/destroyed and resynced through the *same*
+ * `registerLayer` bookkeeping the always-mounted lawn layer uses below, same
+ * as before clustering existed -- selection/violation highlighting doesn't
+ * know or care whether a marker happens to be clustered away right now.
  */
-function VirtualizedMarkers({
+function ClusteredMarkers({
   planIndex,
   planRevision,
   registerLayer,
@@ -578,9 +627,8 @@ function VirtualizedMarkers({
 }) {
   const map = useMap();
   const groupRef = useRef<L.LayerGroup | null>(null);
-  const mountedRef = useRef(new Map<string, L.Marker>());
-  const [visibleCount, setVisibleCount] = useState(0);
-  const [overflow, setOverflow] = useState(false);
+  const markersRef = useRef(new Map<string, L.Marker>());
+  const clustersRef = useRef(new Map<string, MountedCluster>());
 
   if (!groupRef.current) groupRef.current = L.layerGroup();
 
@@ -595,43 +643,48 @@ function VirtualizedMarkers({
 
   const recompute = useCallback(() => {
     const group = groupRef.current;
-    const mounted = mountedRef.current;
+    const markers = markersRef.current;
+    const clusters = clustersRef.current;
     if (!group) return;
     if (!planIndex) {
-      mounted.forEach((marker) => marker.remove());
-      mounted.clear();
-      setOverflow(false);
-      setVisibleCount(0);
+      markers.forEach((marker) => marker.remove());
+      markers.clear();
+      clusters.forEach(({ marker }) => marker.remove());
+      clusters.clear();
       return;
     }
 
     const bounds = map.getBounds().pad(VIEWPORT_PADDING_RATIO);
-    const visible: string[] = [];
+    const cellDeg = clusterCellSizeDeg(map.getZoom());
+
+    // cellKey -> ids of every visible point that lands in that cell.
+    const buckets = new Map<string, string[]>();
     planIndex.forEach((item) => {
-      if (item.isPoint && bounds.contains([item.minLat, item.minLng])) visible.push(item.id);
+      if (!item.isPoint || !bounds.contains([item.minLat, item.minLng])) return;
+      const key = `${Math.floor(item.minLat / cellDeg)}:${Math.floor(item.minLng / cellDeg)}`;
+      const bucket = buckets.get(key);
+      if (bucket) bucket.push(item.id);
+      else buckets.set(key, [item.id]);
     });
 
-    if (visible.length > MAX_VISIBLE_MARKERS) {
-      mounted.forEach((marker) => marker.remove());
-      mounted.clear();
-      setOverflow(true);
-      setVisibleCount(visible.length);
-      return;
-    }
-    setOverflow(false);
-    setVisibleCount(visible.length);
+    const nextSingles = new Set<string>();
+    const nextClusters = new Map<string, string[]>();
+    buckets.forEach((ids, key) => {
+      if (ids.length === 1) nextSingles.add(ids[0]);
+      else nextClusters.set(key, ids);
+    });
 
-    const visibleSet = new Set(visible);
-    mounted.forEach((marker, id) => {
-      if (!visibleSet.has(id)) {
+    // Real markers -- same resync logic this had before clustering existed.
+    markers.forEach((marker, id) => {
+      if (!nextSingles.has(id)) {
         marker.remove();
-        mounted.delete(id);
+        markers.delete(id);
       }
     });
-    for (const id of visible) {
+    nextSingles.forEach((id) => {
       const item = planIndex.get(id);
-      if (!item) continue;
-      const existing = mounted.get(id);
+      if (!item) return;
+      const existing = markers.get(id);
       if (existing) {
         // Resync an already-mounted marker to the plan's actual data --
         // not just an optimization, this is load-bearing: a live drag
@@ -646,13 +699,49 @@ function VirtualizedMarkers({
         const target = L.latLng(item.minLat, item.minLng);
         if (!existing.getLatLng().equals(target)) existing.setLatLng(target);
         if (existing.options.icon !== iconCache.get(item.type)) existing.setIcon(planItemIcon(item.type));
-        continue;
+        return;
       }
       const marker = L.marker([item.minLat, item.minLng], { icon: planItemIcon(item.type), keyboard: false });
       registerLayer(id, item.type, marker);
       marker.addTo(group);
-      mounted.set(id, marker);
-    }
+      markers.set(id, marker);
+    });
+
+    // Cluster bubbles -- cell keys are only stable within one zoom level
+    // (cellDeg changes with zoom), so a zoom change naturally retires every
+    // old bubble and mints fresh ones; a plain pan re-keys nothing.
+    clusters.forEach(({ marker }, key) => {
+      if (!nextClusters.has(key)) {
+        marker.remove();
+        clusters.delete(key);
+      }
+    });
+    nextClusters.forEach((ids, key) => {
+      const existing = clusters.get(key);
+      if (existing) {
+        // An edit (delete/move into or out of this cell) can change the
+        // count under an otherwise-stable key -- re-render the bubble's
+        // label/size when that happens, same "don't trust a stale visual"
+        // reasoning as the real-marker resync above.
+        if (existing.count !== ids.length) {
+          existing.marker.setIcon(clusterDivIcon(ids.length));
+          existing.count = ids.length;
+        }
+        return;
+      }
+      const [cellLat, cellLng] = key.split(":").map(Number);
+      const marker = L.marker([(cellLat + 0.5) * cellDeg, (cellLng + 0.5) * cellDeg], {
+        icon: clusterDivIcon(ids.length),
+        keyboard: false,
+        interactive: true,
+      });
+      marker.on("click", () => {
+        const box = boundsOfItems(planIndex, ids);
+        if (box) map.fitBounds([[box.minLat, box.minLng], [box.maxLat, box.maxLng]], { padding: [40, 40] });
+      });
+      marker.addTo(group);
+      clusters.set(key, { marker, count: ids.length });
+    });
   }, [map, planIndex, registerLayer]);
 
   useEffect(() => {
@@ -669,38 +758,46 @@ function VirtualizedMarkers({
 
   useEffect(() => {
     return () => {
-      mountedRef.current.forEach((marker) => marker.remove());
-      mountedRef.current.clear();
+      markersRef.current.forEach((marker) => marker.remove());
+      markersRef.current.clear();
+      clustersRef.current.forEach(({ marker }) => marker.remove());
+      clustersRef.current.clear();
     };
   }, []);
 
   useMapEvents({ moveend: recompute, zoomend: recompute });
 
-  if (!overflow) return null;
-  return (
-    <div className="pointer-events-none absolute inset-x-0 top-3 z-[1000] flex justify-center">
-      <div className="rounded-full border border-stone-200 bg-white/95 px-3 py-1.5 text-xs text-stone-700 shadow">
-        В кадре {visibleCount.toLocaleString("ru-RU")} объектов — приблизьте карту, чтобы увидеть и редактировать их
-      </div>
-    </div>
-  );
+  return null;
 }
 
 export interface MapViewProps {
-  layers?: GeoJSONFeatureCollection;
+  /** The loaded source drawing, already rendered server-side into one PNG
+   * per legend group -- see layer_raster.py's docstring for why this is
+   * pixels, not GeoJSON features, by the time it reaches the map. */
+  layersRaster?: LayersRaster | null;
+  /** Whether project.source_crs is trustworthy enough to show a real
+   * OpenStreetMap basemap under the plan -- see backend's
+   * Project.crs_verified for exactly what "trustworthy" means here (auto-
+   * detected from the uploaded file's own coordinates, never a typed-in
+   * guess). Undefined/false shows a neutral CAD-style grid instead, so an
+   * unverifiable CRS reads as "we don't know where this is" rather than
+   * quietly repeating the Kenya-map bug (see CLAUDE.md) with more
+   * confidence than the data actually earns. */
+  crsVerified?: boolean;
   plan?: GeoJSONFeatureCollection;
   planIndex?: PlanIndex;
-  /** Identify which upload/plan `layers`/`plan` came from — react-leaflet's
-   * <GeoJSON> does not reactively re-diff its `data` prop, so the layers
-   * below remount on a key tied to the actual data identity. `planRevision`
+  /** Identify which upload/plan `plan` came from — react-leaflet's
+   * <GeoJSON> does not reactively re-diff its `data` prop, so the plan layer
+   * below remounts on a key tied to the actual data identity. `planRevision`
    * bumps on every reload of the same plan (after an edit), so the edit
    * actually shows up. */
   layersKey?: string;
   planId?: string;
   planRevision?: number;
-  /** Source-layer types (see lib/mapStyle.ts::layerGroupKey) currently
-   * hidden via the panel's per-type toggles -- replaces a single blanket
-   * "show layers" flag so buildings/greenery/etc. can be shown independently. */
+  /** Source-layer group keys (see layer_raster.py::layer_group_key, mirrored
+   * from lib/mapStyle.ts::layerGroupKey) currently hidden via the panel's
+   * per-type toggles -- replaces a single blanket "show layers" flag so
+   * buildings/greenery/etc. can be shown independently. */
   hiddenLayerTypes?: ReadonlySet<string>;
   showPlan?: boolean;
   center?: [number, number];
@@ -725,7 +822,8 @@ export interface MapViewProps {
 }
 
 export default function MapView({
-  layers,
+  layersRaster,
+  crsVerified,
   plan,
   planIndex,
   layersKey,
@@ -789,53 +887,32 @@ export default function MapView({
   }
 
   // Lawn polygons only -- point items (tree/shrub) are handled by
-  // VirtualizedMarkers below instead, which mounts only whichever ones are
-  // actually in view (see its own docstring). Every lawn a plan has always
-  // comes back planting_type="lawn"/geometry.type!=="Point" together (see
-  // the planting_type<->geometry contract in CLAUDE.md), so this filter is
-  // exactly "everything virtualization doesn't already cover".
+  // ClusteredMarkers below instead, which mounts only whichever ones are
+  // actually in view, individually or as cluster bubbles (see its own
+  // docstring). Every lawn a plan has always comes back
+  // planting_type="lawn"/geometry.type!=="Point" together (see the
+  // planting_type<->geometry contract in CLAUDE.md), so this filter is
+  // exactly "everything ClusteredMarkers doesn't already cover".
   const areaFeatures = useMemo(
     () => (plan ? { ...plan, features: plan.features.filter((f) => f.geometry.type !== "Point") } : undefined),
     [plan]
   );
 
-  // Only the currently-toggled-on source layer types (see ControlPanel.tsx's
-  // per-type legend) -- filtered client-side rather than asking the backend
-  // for less, since these are the same few dozen/hundred zone features
-  // either way, not something worth a network round trip over.
-  const visibleLayers = useMemo(() => {
-    if (!layers) return undefined;
-    if (!hiddenLayerTypes || hiddenLayerTypes.size === 0) return layers;
-    return { ...layers, features: layers.features.filter((f) => !hiddenLayerTypes.has(layerGroupKey(f))) };
-  }, [layers, hiddenLayerTypes]);
-  // <GeoJSON> doesn't reactively re-diff `data` (see layersKey's own
-  // docstring) -- toggling a layer type needs the same key-bump remount
-  // trick, keyed on which types are hidden right now.
-  const hiddenLayersSignature = hiddenLayerTypes ? [...hiddenLayerTypes].sort().join(",") : "";
+  // Only the currently-toggled-on source layer groups (see ControlPanel.tsx's
+  // per-type legend) -- each group is already its own PNG, so "hidden" just
+  // means "don't mount that <ImageOverlay>", no client-side feature filtering.
+  const visibleRasterGroups = useMemo(() => {
+    if (!layersRaster) return [];
+    if (!hiddenLayerTypes || hiddenLayerTypes.size === 0) return layersRaster.groups;
+    return layersRaster.groups.filter((g) => !hiddenLayerTypes.has(g.key));
+  }, [layersRaster, hiddenLayerTypes]);
 
-  // The overall extent of everything loaded (not just the currently-visible
-  // subset) -- a stable reference rectangle so a user toggling individual
-  // layers on/off (or looking at an irregular real territory instead of a
-  // synthetic square) can still see "this is the whole working area".
-  // Excludes zoning features on purpose (any zoning_category): unlike every
-  // other layer, a real zoning polygon's authentic shape can span a whole
-  // neighborhood (its own boundary follows real streets/blocks, so it isn't
-  // clipped down to the project's own scale the way roads/buildings are --
-  // see data/README.md's real_moscow_courtyard.geojson notes) -- including
-  // it here would balloon this rectangle out to that same neighborhood
-  // instead of framing the actual site.
-  const extentBounds = useMemo(() => {
-    if (!layers) return null;
-    const boundedFeatures = layers.features.filter((f) => !isZoningFeature(f));
-    if (boundedFeatures.length === 0) return null;
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const bounds = L.geoJSON({ type: "FeatureCollection", features: boundedFeatures } as any).getBounds();
-      return bounds.isValid() ? bounds : null;
-    } catch {
-      return null;
-    }
-  }, [layers]);
+  // The overall extent of everything loaded, straight from the raster
+  // endpoint's own bounds (it already excludes zoning for the same reason
+  // extentBounds used to compute this client-side: a real zoning polygon's
+  // shape can span a whole neighborhood, and letting it set the frame would
+  // zoom the actual site down to a speck -- see layer_raster.py).
+  const extentBounds = layersRaster?.bounds ?? null;
 
   useEffect(() => {
     const previous = appliedRef.current;
@@ -857,17 +934,31 @@ export default function MapView({
   }, [selectedIds, violationIds]);
 
   return (
-    <MapContainer center={center} zoom={zoom} className="h-full w-full" attributionControl={false}>
+    <MapContainer
+      center={center}
+      zoom={zoom}
+      // 19 is roughly where OSM's own tiles stop getting sharper; the plan
+      // itself is vector (real markers, not tiles) and benefits from going
+      // deeper than that -- planting_norms.yaml allows spacing as tight as
+      // 0.3m, which at zoom 19 is still sub-pixel at Moscow's latitude and
+      // needs a couple more zoom levels to actually separate on screen.
+      maxZoom={21}
+      className={`h-full w-full ${crsVerified ? "" : "gp-neutral-map-bg"}`}
+      attributionControl={false}
+    >
       {/* prefix={false} drops the "Leaflet" credit -- just a courtesy line,
           not a license requirement (Leaflet is BSD-2-Clause). The OSM
           copyright below stays: that one *is* required by OpenStreetMap's
           tile usage policy for using their tiles at all. */}
       <AttributionControl prefix={false} />
-      <TileLayer
-        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-      />
-      <FitBounds fitKey={`${layersKey ?? ""}:${planId ?? ""}`} layers={layers} plan={plan} />
+      {crsVerified && (
+        <TileLayer
+          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          maxNativeZoom={19}
+        />
+      )}
+      <FitBounds fitKey={`${layersKey ?? ""}:${planId ?? ""}`} layersBounds={extentBounds} plan={plan} />
       <InvalidateSizeOnChange trigger={sidebarOpen} />
       {extentBounds && (
         <Rectangle
@@ -876,15 +967,15 @@ export default function MapView({
           interactive={false}
         />
       )}
-      {visibleLayers && visibleLayers.features.length > 0 && (
-        <GeoJSON
-          key={`${layersKey ?? "layers"}:${hiddenLayersSignature}`}
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          data={visibleLayers as any}
-          style={layerStyle}
-          onEachFeature={bindPopup}
-        />
-      )}
+      {/* The source drawing itself -- one flat PNG per legend group, all
+          sharing `extentBounds` so they stack in register regardless of how
+          many objects any one group holds (see layer_raster.py). Not
+          interactive: nothing here was ever clickable (only plan.features
+          is), so there's no hit-testing to wire up. */}
+      {extentBounds &&
+        visibleRasterGroups.map((group) => (
+          <ImageOverlay key={`${layersKey ?? "layers"}:${group.key}`} url={group.url} bounds={extentBounds} />
+        ))}
       {areaFeatures && showPlan && (
         <GeoJSON
           key={`${planId ?? "plan"}:${planRevision}`}
@@ -894,7 +985,7 @@ export default function MapView({
           onEachFeature={registerPlanFeature}
         />
       )}
-      {showPlan && <VirtualizedMarkers planIndex={planIndex} planRevision={planRevision} registerLayer={registerLayer} />}
+      {showPlan && <ClusteredMarkers planIndex={planIndex} planRevision={planRevision} registerLayer={registerLayer} />}
       <SelectionController
         selectMode={selectMode}
         editsLocked={editsLocked}
