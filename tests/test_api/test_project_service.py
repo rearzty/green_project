@@ -15,6 +15,7 @@ import ezdxf
 import pytest
 
 from backend.app.services.project_service import UnsupportedFileTypeError, parse_territory_file
+from geo_engine.io.dwg_convert import available_backend
 
 
 def _drawing(path: Path) -> None:
@@ -48,14 +49,43 @@ def _zip_dir(source_dir: Path, zip_path: Path, wrap_in_subfolder: bool = False) 
 
 
 class TestDwgUpload:
+    @pytest.mark.skipif(
+        available_backend() is not None,
+        reason="проверяется ветка «конвертера нет», а в этом окружении он есть",
+    )
     def test_a_lone_dwg_fails_cleanly_without_a_converter(self, tmp_path):
-        """No LibreDWG/ODA on PATH in this environment (dev machines and CI
-        alike don't have it installed by default) -- must not surface as a
-        raw traceback, it's an entirely expected, user-facing situation."""
+        """No LibreDWG/ODA on PATH -- must not surface as a raw traceback, it's
+        an entirely expected, user-facing situation.
+
+        Пропускается там, где конвертер установлен. Изначально тест исходил из
+        того, что его нет «ни на машинах разработки, ни в CI» — на момент
+        написания так и было, но `infra/Dockerfile.backend` с тех пор собирает
+        LibreDWG прямо в образ, и в нём тест падал не из-за дефекта, а из-за
+        того, что проверяемая ветка кода просто недостижима. Это стык двух
+        веток, а не регрессия: одна добавила конвертер в образ, вторая —
+        тест на его отсутствие.
+        """
         dwg = tmp_path / "site.dwg"
         dwg.write_bytes(b"not a real dwg, just needs the right suffix to reach the converter check")
 
         with pytest.raises(UnsupportedFileTypeError, match="конвертер не найден"):
+            parse_territory_file(dwg, tmp_path / "work")
+
+    @pytest.mark.skipif(
+        available_backend() is None,
+        reason="нужен установленный конвертер DWG",
+    )
+    def test_a_corrupt_dwg_fails_cleanly_with_a_converter(self, tmp_path):
+        """Обратная ветка: конвертер есть, но файл не DWG.
+
+        Без неё в окружении с конвертером (то есть в собранном образе backend)
+        обработка битого DWG не проверялась вообще — а именно там она и
+        работает на живых загрузках.
+        """
+        dwg = tmp_path / "site.dwg"
+        dwg.write_bytes(b"not a real dwg, just needs the right suffix to reach the converter check")
+
+        with pytest.raises(UnsupportedFileTypeError):
             parse_territory_file(dwg, tmp_path / "work")
 
 
