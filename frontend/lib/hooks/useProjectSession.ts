@@ -131,7 +131,7 @@ export function useProjectSession() {
    * -- no local mutation, no refetch. Used after a rejected edit: nothing
    * changed locally (the action never got to applyLocalEdit), so this only
    * needs to undo a live drag-preview's raw DOM position (see
-   * MapView.tsx::VirtualizedMarkers), not fix any actual data. */
+   * MapView.tsx::ClusteredMarkers), not fix any actual data. */
   function bumpPlanRevision() {
     setPlanRevision((r) => r + 1);
   }

@@ -23,6 +23,9 @@ class ProjectOut(BaseModel):
     id: str
     name: str
     source_crs: str | None
+    # See Project.crs_verified's own docstring -- the map uses this to
+    # decide whether a real OpenStreetMap basemap under the plan is honest.
+    crs_verified: bool
     created_at: datetime
 
 
