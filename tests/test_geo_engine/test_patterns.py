@@ -212,7 +212,7 @@ class TestPlannerPatterns:
         return [(1.0, "тест") for _ in candidates]
 
     def test_auto_produces_rows_and_marks_them(self, norms, catalogue):
-        from geo_engine.planner import ROW_RATIONALE_PREFIX, plan_items
+        from geo_engine.planner import ACCENT_RATIONALE_PREFIX, ROW_RATIONALE_PREFIX, plan_items
 
         territory, zones = self._scene()
 
@@ -221,9 +221,16 @@ class TestPlannerPatterns:
             species_overrides={"tree": "Липа мелколистная"}, pattern="auto", catalogue=catalogue,
         )
         in_rows = [i for i in items if i.rationale.startswith(ROW_RATIONALE_PREFIX)]
+        accents = [i for i in items if i.rationale.startswith(ACCENT_RATIONALE_PREFIX)]
 
         assert in_rows, "вдоль проезда должна появиться рядовая посадка"
-        assert len(in_rows) < len(items), "остальная площадь по-прежнему заполняется россыпью"
+        # Раньше здесь проверялось «остальная площадь заполняется россыпью».
+        # Это поведение убрано намеренно: досыпка возвращала равномерный крап и
+        # давала одиночные деревья в случайных щелях, которые на чертеже
+        # читались промахами, а не замыслом. Теперь сверх ряда идут солитеры —
+        # в местах, где вокруг дерева реально есть свободное пространство.
+        assert accents, "на открытой площадке должно найтись место под солитер"
+        assert len(in_rows) + len(accents) == len(items), "россыпи в auto быть не должно"
 
     def test_scatter_reproduces_the_previous_behaviour(self, norms, catalogue):
         from geo_engine.planner import ROW_RATIONALE_PREFIX, plan_items

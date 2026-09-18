@@ -23,10 +23,12 @@ from geo_engine.candidates import generate_candidates
 from geo_engine.model import PlantingItem, Utility, Zone
 from geo_engine.norms import PlantingNorms
 from geo_engine.patterns import (
+    ACCENT_PLANTING_TYPES,
     GROUP_PITCH_M,
     GROUP_PLANTING_TYPES,
     GROUP_RADIUS_M,
     ROW_PLANTING_TYPES,
+    accent_positions,
     collect_row_guides,
     fill_group,
     group_positions,
@@ -51,13 +53,14 @@ CROWN_SPACING_TYPES = ("tree",)
 # свободные группы во дворе. "scatter" — только россыпь, прежнее поведение,
 # оставлено как способ воспроизвести старый результат и как запасной путь для
 # площадок без единого линейного ориентира.
-PLACEMENT_PATTERNS = ("auto", "scatter", "row", "group")
+PLACEMENT_PATTERNS = ("auto", "scatter", "row", "group", "accent")
 
 # По этой приставке в rationale CLI и отчёт отличают рядовую посадку от
 # россыпи. Обоснование выбора места у них разное, и смешивать их в отчёте
 # значило бы потерять единственный признак, по которому видно схему.
 ROW_RATIONALE_PREFIX = "Рядовая посадка вдоль линейного ориентира."
 GROUP_RATIONALE_PREFIX = "Групповая посадка (куртина)."
+ACCENT_RATIONALE_PREFIX = "Солитер (акцент): свободно стоящее дерево."
 
 # Интервал внутри куртины. 743-ПП, табл. 3.6.2: «групповая посадка
 # кустарников — 0,3 м». Берётся 0,5 м, а не 0,3: таблица даёт ориентир для
@@ -78,6 +81,12 @@ IN_GROUP_PITCH_M = 0.5
 # r/cos(π/N) заведомо содержит окружность радиуса r. N = 4·quad_segs.
 _CLEARANCE_QUAD_SEGS = 32
 _CLEARANCE_INFLATION = 1.0 / math.cos(math.pi / (4 * _CLEARANCE_QUAD_SEGS))
+
+# Допуск при сравнении расстояний между уже поставленными посадками. Тот же
+# порядок, что и _TOLERANCE_M в compliance.py, и по той же причине: координаты
+# приходят из буферов и эквидистант, поэтому посадка, стоящая ровно на своём
+# пределе, оказывается в наносекундах по ту или другую сторону от него.
+_CLEARANCE_EPS_M = 1e-3
 
 
 def _fit_row_species(
@@ -159,6 +168,75 @@ def _palette_pick(palette: list[Species], index: int) -> Species | None:
     return palette[index % len(palette)]
 
 
+def _species_capacity(
+    species: Species,
+    planting_type: str,
+    zones: list[Zone],
+    territory: BaseGeometry,
+    utilities: list[Utility],
+    norms: PlantingNorms,
+    keep_spacing_for: Collection[str],
+    catalogue: SpeciesCatalogue,
+) -> tuple[BaseGeometry, list[tuple]]:
+    """Что эта порода может на этой площадке: допустимая площадь и места под
+    солитер.
+
+    Один и тот же расчёт обслуживает и отбор палитры («породу, которой негде
+    стоять вообще, в план не берём»), и выбор породы акцента — считать его
+    дважды незачем.
+    """
+    type_norms = norms
+    if planting_type not in keep_spacing_for:
+        type_norms = norms_for_species(norms, planting_type, species, catalogue)
+    exclusion = build_exclusion_zone(
+        utilities, zones, planting_type, type_norms, species, catalogue.crown_reference_diameter_m
+    )
+    buildable = buildable_area(
+        territory, exclusion, zones, territory_margin_m=type_norms.territory_margin_for(planting_type)
+    )
+    interval = type_norms.spacing_for(planting_type).min_distance_m
+    return buildable, accent_positions(buildable, interval)
+
+
+def _pick_accent_species(
+    capacity: dict[str, tuple[BaseGeometry, list[tuple]]],
+    catalogue: SpeciesCatalogue,
+    besides: Species | None,
+) -> Species | None:
+    """Порода для солитеров: самая широкая крона из тех, которым тут реально
+    есть где встать свободно, и по возможности не та, что стоит в ряду.
+
+    Выбирается из КАТАЛОГА, а не из палитры, и это осознанно. Палитра — это
+    набор для масс: ряд и группы. Акцент по определению исключение — одно
+    дерево, выбранное под конкретную точку, а не вытянутое из заранее
+    заготовленного набора. Так и работает проектировщик.
+
+    Замер, который эту развилку и вскрыл: на эталонной улице у липы, клёна и
+    дуба ноль мест под свободно стоящее дерево, у берёзы 18, у рябины 44. В
+    палитру по жребию попали липа и дуб — то есть при выборе «из палитры»
+    акцентов не было бы вовсе, хотя рябина подходит этой улице идеально.
+
+    Широкая крона предпочтительнее при прочих равных: солитер должен быть
+    заметен, в этом весь смысл. «Не та, что в ряду» — чтобы акцент читался как
+    другое событие, а не как продолжение аллеи.
+    """
+    with_room = [
+        (name, spots) for name, (_, spots) in capacity.items() if spots
+    ]
+    if not with_room:
+        return None
+
+    def rank(entry: tuple[str, list]) -> tuple:
+        name, spots = entry
+        species = catalogue.get(name)
+        diameter = (species.crown_diameter_m or 0.0) if species else 0.0
+        different = besides is None or name != besides.name
+        return (different, diameter, len(spots))
+
+    best_name, _ = max(with_room, key=rank)
+    return catalogue.get(best_name)
+
+
 def _limit_by_density(
     items: list[PlantingItem], area_m2: float, density_per_ha: float | None
 ) -> list[PlantingItem]:
@@ -193,6 +271,7 @@ def choose_species_palette(
     planting_type: str,
     catalogue: SpeciesCatalogue | None = None,
     count: int = 3,
+    fits: Callable[[Species], bool] | None = None,
 ) -> list[Species]:
     """Несколько пород на один тип посадки — палитра плана.
 
@@ -203,11 +282,31 @@ def choose_species_palette(
     Порядок детерминирован от `plan_key`: первая порода палитры идёт в ряд,
     остальные — по куртинам. Тот же сид, что и у выбора одной породы, чтобы
     план оставался чистой функцией от рецепта.
+
+    `fits` — необязательный отбор «эта порода вообще помещается на площадке».
+    Без него поведение прежнее (жребий по всему каталогу), см. тело функции о
+    том, почему одного жребия оказалось мало.
     """
     catalogue = catalogue or load_catalogue()
     pool = catalogue.for_type(planting_type)
     if not pool:
         return []
+    if fits is not None:
+        # Породы, которым на этой площадке негде стоять, в палитру не попадают.
+        # Раньше набор был чистым жребием, и это давало два видимых дефекта
+        # сразу: в палитру заходили широкие кроны, которым на плотной улице
+        # места нет, а породе, которая там уместна, места в палитре не
+        # доставалось. Замерено на эталонной улице — у липы, клёна и дуба ноль
+        # мест под свободно стоящее дерево, у рябины сорок четыре; в палитру
+        # по жребию попали как раз липа и дуб.
+        #
+        # Это ровно тот же принцип, по которому породу ряда уже выбирает
+        # площадка, а не сид (см. _fit_row_species). Сид по-прежнему решает,
+        # КАКИЕ из пригодных взять и в каком порядке, поэтому план остаётся
+        # чистой функцией от рецепта.
+        suitable = [species for species in pool if fits(species)]
+        if suitable:
+            pool = suitable
     rng = random.Random(zlib.crc32(f"{plan_key}:{planting_type}:species".encode()))
     shuffled = list(pool)
     rng.shuffle(shuffled)
@@ -318,7 +417,41 @@ def plan_items(
 
     for planting_type in planting_types:
         override = species_overrides.get(planting_type)
-        palette = choose_species_palette(plan_key, planting_type, catalogue)
+
+        # Один проход по каталогу на тип посадки: для каждой породы считаем,
+        # что ей вообще доступно на этой площадке. Результат обслуживает сразу
+        # два решения — какие породы пускать в палитру и какая пойдёт в
+        # акценты, — поэтому считается один раз, а не дважды.
+        capacity: dict[str, tuple] = {}
+        wants_accents = pattern in ("auto", "accent") and planting_type in ACCENT_PLANTING_TYPES
+        if wants_accents:
+            # При явно выбранной пользователем породе перебирать каталог незачем
+            # и неправильно: выбор сделан человеком, и акценты идут той же
+            # породой. Отключать при этом акценты совсем было бы хуже всего —
+            # первая версия так и делала, и явный выбор породы молча лишал план
+            # солитеров.
+            pool = (
+                [catalogue.get(override)] if override else catalogue.for_type(planting_type)
+            )
+            for candidate in pool:
+                if candidate is None:
+                    continue
+                capacity[candidate.name] = _species_capacity(
+                    candidate, planting_type, zones, territory, utilities,
+                    norms, keep_spacing_for, catalogue,
+                )
+
+        def _has_room(candidate: Species, _capacity: dict = capacity) -> bool:
+            # Породу, не попавшую в замер, не отбраковываем: замер делается не
+            # всегда (например, при явно выбранной породе считается она одна),
+            # и «не мерили» не значит «не помещается». Первая версия обращалась
+            # по ключу напрямую и падала KeyError ровно на этом.
+            measured = _capacity.get(candidate.name)
+            return measured is None or not measured[0].is_empty
+
+        palette = choose_species_palette(
+            plan_key, planting_type, catalogue, fits=_has_room if capacity else None
+        )
         # Породу ряда берём первой из палитры: в ряду однородность и есть
         # смысл, а остальные породы уходят по куртинам.
         species = catalogue.get(override) if override else (palette[0] if palette else None)
@@ -420,7 +553,50 @@ def plan_items(
             items.extend(selected)
             continue
 
-        if pattern not in ("row", "group") and not remaining.is_empty:
+        # Акценты — солитеры в точках, где вокруг дерева реально есть место.
+        # Ставятся ПОСЛЕ ряда и с оглядкой на него: требуемое расстояние между
+        # рядовой и акцентной породой — больший из двух интервалов, ровно как
+        # между рядом и россыпью (см. ниже о том, почему половины радиуса тут
+        # мало).
+        accents: list[PlantingItem] = []
+        if wants_accents:
+            accent_species = _pick_accent_species(capacity, catalogue, species)
+            if accent_species is not None:
+                accent_area, spots = capacity[accent_species.name]
+                accent_norms = norms
+                if planting_type not in keep_spacing_for:
+                    accent_norms = norms_for_species(norms, planting_type, accent_species, catalogue)
+                accent_interval = accent_norms.spacing_for(planting_type).min_distance_m
+                clearance = max(spacing.min_distance_m, accent_interval)
+                taken = [item.geometry for item in selected]
+                for point, _radius in spots:
+                    if any(point.distance(g) < clearance - _CLEARANCE_EPS_M for g in taken):
+                        continue
+                    accents.append(
+                        PlantingItem(
+                            geometry=point,
+                            planting_type=planting_type,
+                            species=accent_species.name,
+                            score=1.0,
+                            rationale=ACCENT_RATIONALE_PREFIX,
+                        )
+                    )
+                    taken.append(point)
+                selected.extend(accents)
+
+        # Тип, получивший ряд и акценты, россыпью НЕ досыпается: смысл замысла
+        # в том, что между аллеей и солитерами пусто. Досыпка возвращала ровно
+        # тот равномерный крап, ради ухода от которого всё и делалось — и она
+        # же давала «три дуба в случайных щелях», которые на чертеже читались
+        # не акцентами, а промахами. Россыпь остаётся запасным путём для
+        # площадок, где не вышло ни ряда, ни акцентов (нет линейных ориентиров
+        # и нет ни одного свободного кармана), и отдельной схемой по флагу.
+        if pattern == "auto" and planting_type in ACCENT_PLANTING_TYPES and selected:
+            selected = _limit_by_density(selected, territory.area, density_per_ha.get(planting_type))
+            items.extend(selected)
+            continue
+
+        if pattern not in ("row", "group", "accent") and not remaining.is_empty:
             # Россыпь идёт ВТОРОЙ породой палитры, если она есть: аллея одной
             # породы и свободные группы другой — это и отличает план-рисунок
             # от равномерной раскладки. Интервал берётся под эту породу, её

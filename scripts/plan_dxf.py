@@ -35,6 +35,7 @@ from geo_engine.io.dxf_writer import RESULT_LAYER_PREFIX, write_dxf
 from geo_engine.norms import load_norms
 from geo_engine.planner import (
     CROWN_SPACING_TYPES,
+    ACCENT_RATIONALE_PREFIX,
     GROUP_RATIONALE_PREFIX,
     PLACEMENT_PATTERNS,
     ROW_RATIONALE_PREFIX,
@@ -310,10 +311,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"     посадок: {len(items)} ({', '.join(f'{k}: {v}' for k, v in counts.most_common())})")
         in_rows = sum(1 for i in items if i.rationale.startswith(ROW_RATIONALE_PREFIX))
         in_groups = sum(1 for i in items if i.rationale.startswith(GROUP_RATIONALE_PREFIX))
-        loose = len(items) - in_rows - in_groups
+        accents = sum(1 for i in items if i.rationale.startswith(ACCENT_RATIONALE_PREFIX))
+        loose = len(items) - in_rows - in_groups - accents
         parts = [
             f"{label}: {count}"
-            for label, count in (("рядом", in_rows), ("куртинами", in_groups), ("россыпью", loose))
+            for label, count in (
+                ("рядом", in_rows),
+                ("куртинами", in_groups),
+                ("солитерами", accents),
+                ("россыпью", loose),
+            )
             if count
         ]
         if parts:

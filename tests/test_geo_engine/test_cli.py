@@ -134,16 +134,50 @@ def test_the_same_plan_key_reproduces_the_same_plan(tmp_path):
     assert positions[0] == positions[1]
 
 
-def test_a_different_plan_key_gives_a_different_layout(tmp_path):
-    source = _drawing(tmp_path)
-
+def _layouts_for_keys(source, tmp_path, planting_type):
     layouts = []
     for key in ("one", "two"):
-        out = tmp_path / f"{key}.dxf"
-        main(["--input", str(source), "--output", str(out), "--types", "tree", "--plan-key", key])
+        out = tmp_path / f"{key}-{planting_type}.dxf"
+        main(["--input", str(source), "--output", str(out), "--types", planting_type, "--plan-key", key])
         report = json.loads(out.with_suffix(".report.json").read_text(encoding="utf-8"))
         layouts.append([(i["x"], i["y"]) for i in report["items"]])
+    return layouts
 
+
+def test_tree_layout_is_decided_by_the_site_not_by_the_plan_key(tmp_path):
+    """Раскладка деревьев больше НЕ должна зависеть от ключа плана.
+
+    Раньше здесь проверялось обратное — и это было верно, пока деревья
+    сыпались россыпью: у случайной раскладки сид обязан был что-то менять.
+    Россыпь деревьев в схеме auto убрана, а ряд и солитеры выводятся из
+    геометрии площадки: у улицы есть одна ближайшая допустимая эквидистанта и
+    один набор самых просторных карманов. Менять это жребием означало бы
+    вернуть ровно ту случайность, из-за которой план читался как «понатыкали
+    деревьев».
+
+    Воспроизводимость при этом никуда не делась, её держит соседний тест
+    (тот же ключ — та же раскладка); здесь закреплено более сильное свойство.
+    """
+    source = _drawing(tmp_path)
+
+    layouts = _layouts_for_keys(source, tmp_path, "tree")
+
+    assert layouts[0], "на этой площадке деревья должны появиться"
+    assert layouts[0] == layouts[1]
+
+
+def test_a_different_plan_key_still_moves_the_shrub_clumps(tmp_path):
+    """А вот у кустарника сид по-прежнему решает.
+
+    Куртины ставятся по сетке со случайным смещением (`group_positions`), и
+    это осознанно: нормативного правила «где именно стоит группа» нет, в
+    отличие от ряда вдоль улицы и солитера в самом просторном месте.
+    """
+    source = _drawing(tmp_path)
+
+    layouts = _layouts_for_keys(source, tmp_path, "shrub")
+
+    assert layouts[0], "на этой площадке кустарник должен появиться"
     assert layouts[0] != layouts[1]
 
 
