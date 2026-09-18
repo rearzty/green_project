@@ -405,6 +405,7 @@ export default function Home() {
         ) : (
           <MapView
             layersRaster={layersRaster}
+            crsVerified={project?.crs_verified}
             plan={plan?.features}
             planIndex={planIndex}
             layersKey={project?.id}

@@ -15,6 +15,29 @@ body {
   background: #0c0a09;
 }
 
+/* Stands in for the OpenStreetMap tile layer when the project's CRS isn't
+   verified (MapView.tsx omits <TileLayer> entirely rather than show a real
+   street map under coordinates we don't actually know the position of --
+   see backend's Project.crs_verified). A faint CAD-style grid, not a plain
+   flat fill, so it reads as "no real basemap here" rather than "the map
+   failed to load". */
+/* !important: leaflet.css's own `.leaflet-container { background: #ddd }`
+   loads after globals.css in the bundle (component-level `import
+   "leaflet/dist/leaflet.css"` in MapView.tsx vs. the app-level globals
+   import) and otherwise wins on source order alone -- same specificity,
+   later rule, same trap this file's own .gp-plan-dot/.gp-plan-marker
+   comments already document for a different Leaflet default. Normally
+   invisible because tiles cover the whole viewport regardless of this
+   rule's fate; caught live here specifically because omitting <TileLayer>
+   for an unverified CRS means nothing else paints over the gray. */
+.gp-neutral-map-bg {
+  background-color: #0c0a09 !important;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.045) 1px, transparent 1px) !important;
+  background-size: 32px 32px !important;
+}
+
 /* Plan items (tree/shrub points) -- a 16px hit area around a 10px dot, so a
    dot is easy to grab without looking bigger. State classes are toggled
    imperatively on the marker element by MapView (no remount per selection
@@ -63,6 +86,29 @@ body {
 }
 .gp-select-mode .gp-plan-marker.gp-selected {
   cursor: move;
+}
+
+/* Cluster bubbles (MapView.tsx::ClusteredMarkers) -- a neutral stand-in for
+   however many real plan-item dots fall in the same screen cell at the
+   current zoom. Deliberately not colored by planting type (see
+   ControlPanel's earlier discussion): the point is "how many objects are
+   here", not "what's the mix" -- a single flat color keeps that reading
+   unambiguous. Not selectable/draggable (no data-item-id, see
+   ClusteredMarkers) -- clicking one zooms in instead, same as most map UIs'
+   cluster bubbles. */
+.gp-cluster-bubble {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9999px;
+  background: rgba(15, 23, 42, 0.88);
+  border: 2px solid #64748b;
+  color: #e2e8f0;
+  font:
+    600 11px/1 ui-sans-serif,
+    system-ui;
+  cursor: zoom-in;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
 }
 
 @keyframes gp-pop-in {

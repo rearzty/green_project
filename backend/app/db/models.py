@@ -98,6 +98,16 @@ class Project:
     id: str = field(default_factory=_new_uuid)
     name: str = ""
     source_crs: str | None = None
+    # True only when source_crs came from real evidence -- shp_geojson_reader
+    # auto-detecting genuinely geographic (lon/lat-range) coordinates in the
+    # uploaded file itself, see project_service.py::create_project_from_file.
+    # False for everything else, including a source_crs the *user* typed in
+    # (a plausible-looking EPSG code is still a guess, not proof -- the
+    # EPSG:32637 default that produced the Kenya-map bug was exactly that
+    # kind of guess) and any DXF/DWG/ZIP upload, which never carries CRS
+    # metadata at all. The map uses this to decide whether showing a real
+    # OpenStreetMap basemap under the plan is honest or misleading.
+    crs_verified: bool = False
     created_at: datetime = field(default_factory=_utcnow)
 
     layers: list[Layer] = field(default_factory=list)
