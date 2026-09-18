@@ -13,6 +13,7 @@ from __future__ import annotations
 from PIL import Image
 from shapely.geometry import LineString, Point, Polygon
 
+import backend.app.services.layer_raster as layer_raster_module
 from backend.app.db.models import Layer
 from backend.app.services.geo_io import shape_to_db
 from backend.app.services.layer_raster import layer_group_key, render_layer_raster
@@ -111,3 +112,43 @@ class TestRenderLayerRaster:
         # passing straight through as if they were already degrees.
         assert -1 < south < north < 1
         assert not (-1 < west < east < 1)
+
+
+class TestParallelRendering:
+    """Real projects (>=_PARALLEL_RENDER_THRESHOLD geometries) render each
+    legend group in its own process instead of one thread doing them in
+    sequence -- see _render_groups_parallel's docstring. Every test above
+    this class stays well under the threshold, so none of them ever
+    exercises that path; this forces it via monkeypatch against the same
+    tiny fixtures, on the assumption that a real ProcessPoolExecutor
+    round-trip (ie. not mocked) is the only way to actually catch a
+    pickling mistake."""
+
+    def test_parallel_path_matches_sequential_path_byte_for_byte(self, monkeypatch):
+        layers = [
+            _layer(id="territory", kind="zone", object_type="territory", geometry=shape_to_db(TERRITORY)),
+            _layer(id="gas", kind="utility", object_type="gas_pipe", geometry=shape_to_db(GAS_PIPE)),
+            _layer(id="building", kind="zone", object_type="building", geometry=shape_to_db(BUILDING)),
+        ]
+
+        sequential = render_layer_raster(layers, source_crs=None)
+
+        monkeypatch.setattr(layer_raster_module, "_PARALLEL_RENDER_THRESHOLD", 1)
+        parallel = render_layer_raster(layers, source_crs=None)
+
+        assert {g.key for g in parallel.groups} == {g.key for g in sequential.groups}
+        assert {g.key: g.png for g in parallel.groups} == {g.key: g.png for g in sequential.groups}
+        assert parallel.bounds == sequential.bounds
+
+    def test_single_group_never_spins_up_a_pool(self, monkeypatch):
+        """render_layer_raster also requires len(by_group) > 1 before using
+        the pool -- a project with only one legend group would otherwise pay
+        process-spawn overhead for a "parallel" render of exactly one thing.
+        Forcing the threshold down here should still take the inline path,
+        not crash trying to divide work across a pool of one."""
+        layers = [_layer(id="territory", kind="zone", object_type="territory", geometry=shape_to_db(TERRITORY))]
+        monkeypatch.setattr(layer_raster_module, "_PARALLEL_RENDER_THRESHOLD", 1)
+
+        result = render_layer_raster(layers, source_crs=None)
+
+        assert {g.key for g in result.groups} == {"territory"}

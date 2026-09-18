@@ -39,7 +39,13 @@ async def upload_project(
 
 @router.get("/{project_id}", response_model=ProjectOut)
 async def get_project(project: ProjectMetaDep) -> ProjectOut:
-    return ProjectOut(id=project.id, name=project.name, source_crs=project.source_crs, created_at=project.created_at)
+    return ProjectOut(
+        id=project.id,
+        name=project.name,
+        source_crs=project.source_crs,
+        crs_verified=project.crs_verified,
+        created_at=project.created_at,
+    )
 
 
 @router.get("/{project_id}/layers", response_model=GeoJSONFeatureCollection)

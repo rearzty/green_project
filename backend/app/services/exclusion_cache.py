@@ -15,6 +15,20 @@ The territory boundary needs no such invalidation key -- it depends only on
 layers, not on planting_norms.yaml -- but every single move/restore/patch
 edit looks it up (to reject placing something outside the plot), so without
 caching it'd re-run layers_to_domain over the whole layer set on every edit.
+
+Locking is two-tiered. `_struct_lock` is held only for the dict bookkeeping
+(read/insert/evict on the OrderedDicts and the per-key lock registries) --
+always a handful of Python operations, never held across a GEOS call.
+`with_exclusion_zone`/`with_territory` additionally hold a lock scoped to
+their own (project, planting_type[, norms version]) key while a caller uses
+the geometry, because a GEOS-prepared geometry's lazily-built internal index
+isn't guaranteed safe to query concurrently from several run_in_threadpool
+workers at once. That used to be a *single* lock shared across every key --
+correct, but it meant a validate on one project waited behind a compliance
+report being computed on a completely unrelated project, or even behind the
+same project's *other* planting type's zone. Per-key locking keeps the same
+safety guarantee (queries against one specific prepared geometry are still
+serialized) without serializing work that never touched each other.
 """
 
 from __future__ import annotations
@@ -38,36 +52,61 @@ T = TypeVar("T")
 _MAX_ENTRIES = 24  # ~8 recently validated projects x 3 planting types
 _MAX_TERRITORY_ENTRIES = 64  # one entry per project, not per planting type -- cheaper to keep more around
 
-_lock = threading.Lock()
-_cache: OrderedDict[tuple[str, str, int], BaseGeometry | None] = OrderedDict()
+ZoneKey = tuple[str, str, int]
+
+_struct_lock = threading.Lock()
+_cache: OrderedDict[ZoneKey, BaseGeometry | None] = OrderedDict()
 _territory_cache: OrderedDict[str, BaseGeometry] = OrderedDict()
+# One threading.Lock per cache key, created lazily. Evicted alongside its
+# cache entry (see the two _evict_* helpers) so this doesn't grow without
+# bound across a long-running process the way the cache itself wouldn't --
+# a stray lock left behind after eviction is harmless (whoever still holds a
+# reference keeps using it fine), just untidy.
+_zone_locks: dict[ZoneKey, threading.Lock] = {}
+_territory_locks: dict[str, threading.Lock] = {}
 
 
-def _get_or_build_locked(project: Project, planting_type: str) -> BaseGeometry | None:
-    key = (str(project.id), planting_type, settings.planting_norms_path.stat().st_mtime_ns)
-    if key in _cache:
-        _cache.move_to_end(key)
-        return _cache[key]
+def _lock_for(registry: dict, key) -> threading.Lock:
+    with _struct_lock:
+        lock = registry.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            registry[key] = lock
+        return lock
+
+
+def _zone_key(project: Project, planting_type: str) -> ZoneKey:
+    return (str(project.id), planting_type, settings.planting_norms_path.stat().st_mtime_ns)
+
+
+def _get_or_build_locked(key: ZoneKey, project: Project, planting_type: str) -> BaseGeometry | None:
+    with _struct_lock:
+        if key in _cache:
+            _cache.move_to_end(key)
+            return _cache[key]
 
     utilities, zones = layers_to_domain(project.layers)
     zone = build_exclusion_zone(utilities, zones, planting_type, load_norms(settings.planting_norms_path))
     if zone is not None and not zone.is_empty:
         shapely.prepare(zone)
-    _cache[key] = zone
-    while len(_cache) > _MAX_ENTRIES:
-        _cache.popitem(last=False)
+
+    with _struct_lock:
+        _cache[key] = zone
+        while len(_cache) > _MAX_ENTRIES:
+            evicted_key, _ = _cache.popitem(last=False)
+            _zone_locks.pop(evicted_key, None)
     return zone
 
 
 def with_exclusion_zone(project: Project, planting_type: str, fn: Callable[[BaseGeometry | None], T]) -> T:
-    """Runs `fn(zone)` while holding the cache lock. The cached zone is
-    GEOS-prepared (fast point-in-zone checks), and a prepared geometry's
-    lazily-built internal index isn't guaranteed safe to query from several
-    run_in_threadpool workers at once -- so uses are serialized. Cheap in
-    practice: the expensive part, building the zone, happens once per key.
+    """Runs `fn(zone)` while holding a lock scoped to this (project,
+    planting_type, norms version) key only -- see the module docstring for
+    why that's safe and why it used to be one lock for every key.
     """
-    with _lock:
-        return fn(_get_or_build_locked(project, planting_type))
+    key = _zone_key(project, planting_type)
+    with _lock_for(_zone_locks, key):
+        zone = _get_or_build_locked(key, project, planting_type)
+        return fn(zone)
 
 
 def _get_or_build_territory_locked(project: Project) -> BaseGeometry:
@@ -77,23 +116,27 @@ def _get_or_build_territory_locked(project: Project) -> BaseGeometry:
     from backend.app.services.pipeline_service import territory_polygon
 
     key = str(project.id)
-    if key in _territory_cache:
-        _territory_cache.move_to_end(key)
-        return _territory_cache[key]
+    with _struct_lock:
+        if key in _territory_cache:
+            _territory_cache.move_to_end(key)
+            return _territory_cache[key]
 
     _, zones = layers_to_domain(project.layers)
     territory = territory_polygon(zones)
     shapely.prepare(territory)
-    _territory_cache[key] = territory
-    while len(_territory_cache) > _MAX_TERRITORY_ENTRIES:
-        _territory_cache.popitem(last=False)
+
+    with _struct_lock:
+        _territory_cache[key] = territory
+        while len(_territory_cache) > _MAX_TERRITORY_ENTRIES:
+            evicted_key, _ = _territory_cache.popitem(last=False)
+            _territory_locks.pop(evicted_key, None)
     return territory
 
 
 def with_territory(project: Project, fn: Callable[[BaseGeometry], T]) -> T:
-    """Runs `fn(territory)` while holding the cache lock -- same shape and
-    same reason as `with_exclusion_zone` (a prepared geometry's lazily-built
-    index isn't guaranteed safe to query concurrently from several
-    run_in_threadpool workers)."""
-    with _lock:
-        return fn(_get_or_build_territory_locked(project))
+    """Runs `fn(territory)` while holding a lock scoped to this project only
+    -- same reasoning as `with_exclusion_zone`."""
+    key = str(project.id)
+    with _lock_for(_territory_locks, key):
+        territory = _get_or_build_territory_locked(project)
+        return fn(territory)
