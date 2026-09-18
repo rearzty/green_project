@@ -136,3 +136,117 @@ class TestUnsupportedSuffix:
 
         with pytest.raises(UnsupportedFileTypeError, match=r"\.dwg.*\.zip|\.zip.*\.dwg"):
             parse_territory_file(other)
+
+
+class TestZipFilenameEncoding:
+    """Кириллица в именах внутри архива.
+
+    Спецификация ZIP знает две кодировки имён: CP437 и UTF-8, вторую — только
+    если выставлен бит 11. Ни Finder, ни Info-ZIP `zip`, ни проводник Windows
+    его не ставят, а имена пишут в UTF-8 — архив лжёт о себе, и `zipfile`
+    честно декодирует UTF-8-байты как CP437.
+
+    Поймано живьём на реальной загрузке: `archive.extractall()` упал
+    `OSError: [Errno 36] File name too long` на обычном архиве папки улицы.
+    Настоящее имя — 229 байт, после ложного разбора — 566 при лимите в 255.
+    То есть ZIP-загрузка не работала ровно на том входе, ради которого
+    делалась.
+    """
+
+    def _zip_without_utf8_flag(self, zip_path: Path, names: list[str]) -> None:
+        """Архив, в котором имена — UTF-8, а бит 11 не выставлен.
+
+        Ровно то, что делает Finder/`zip`/проводник. Собирается вручную:
+        `zipfile` при записи сам выставит флаг, как только увидит не-ASCII,
+        поэтому флаг снимается уже после записи, в заголовках.
+        """
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            for name in names:
+                archive.writestr(name, b"x")
+        with zipfile.ZipFile(zip_path, "a") as archive:
+            for info in archive.infolist():
+                info.flag_bits &= ~0x800
+
+        raw = zip_path.read_bytes()
+        # Бит 11 живёт в обоих местах: в локальном заголовке (сигнатура
+        # PK\x03\x04, смещение 6) и в записи центрального каталога
+        # (PK\x01\x02, смещение 8). Правится побайтово, потому что zipfile
+        # не даёт записать заголовок с флагом, который сам считает неверным.
+        patched = bytearray(raw)
+        for signature, offset in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+            start = 0
+            while (found := patched.find(signature, start)) != -1:
+                flags = int.from_bytes(patched[found + offset:found + offset + 2], "little")
+                patched[found + offset:found + offset + 2] = (flags & ~0x800).to_bytes(2, "little")
+                start = found + 4
+        zip_path.write_bytes(bytes(patched))
+
+    def test_a_cyrillic_name_survives_extraction(self, tmp_path):
+        from backend.app.services.project_service import _extract_archive, _zip_member_name
+
+        name = "Генеральный план редформат/чертёж.dxf"
+        zip_path = tmp_path / "bundle.zip"
+        self._zip_without_utf8_flag(zip_path, [name])
+
+        with zipfile.ZipFile(zip_path) as archive:
+            info = archive.infolist()[0]
+            assert info.filename != name, "фикстура обязана воспроизводить ложную кодировку"
+            assert _zip_member_name(info) == name
+
+            out = tmp_path / "out"
+            out.mkdir()
+            _extract_archive(archive, out)
+
+        assert (out / "Генеральный план редформат" / "чертёж.dxf").exists()
+
+    def test_a_long_cyrillic_name_no_longer_overflows_the_filesystem_limit(self, tmp_path):
+        """Тот самый отказ: имя короче лимита, а после ложного разбора — нет."""
+        from backend.app.services.project_service import _extract_archive
+
+        stem = "Генеральный план. М1-500 (Совмещен с разбивочным планом и планом покрытий)"
+        assert len(stem.encode("utf-8")) < 255
+        assert len(stem.encode("utf-8").decode("cp437").encode("utf-8")) > 255
+
+        zip_path = tmp_path / "bundle.zip"
+        self._zip_without_utf8_flag(zip_path, [f"{stem}.dxf"])
+        out = tmp_path / "out"
+        out.mkdir()
+        with zipfile.ZipFile(zip_path) as archive:
+            _extract_archive(archive, out)
+
+        assert (out / f"{stem}.dxf").exists()
+
+    def test_an_honest_utf8_archive_is_untouched(self, tmp_path):
+        """Архив с правильно выставленным флагом трогать нельзя."""
+        from backend.app.services.project_service import _extract_archive
+
+        name = "папка/чертёж.dxf"
+        zip_path = tmp_path / "bundle.zip"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr(name, b"x")  # zipfile сам выставит бит 11 на не-ASCII
+
+        out = tmp_path / "out"
+        out.mkdir()
+        with zipfile.ZipFile(zip_path) as archive:
+            assert archive.infolist()[0].flag_bits & 0x800, "фикстура должна быть честной"
+            _extract_archive(archive, out)
+
+        assert (out / "папка" / "чертёж.dxf").exists()
+
+    def test_a_member_escaping_the_extract_dir_is_skipped(self, tmp_path):
+        """zip-slip: ручная распаковка обязана сохранить защиту, которая была
+        в extractall."""
+        from backend.app.services.project_service import _extract_archive
+
+        zip_path = tmp_path / "evil.zip"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr("../escaped.txt", b"x")
+            archive.writestr("ok.txt", b"x")
+
+        out = tmp_path / "out"
+        out.mkdir()
+        with zipfile.ZipFile(zip_path) as archive:
+            _extract_archive(archive, out)
+
+        assert (out / "ok.txt").exists()
+        assert not (tmp_path / "escaped.txt").exists()
