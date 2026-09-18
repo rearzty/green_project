@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import numpy as np
 import shapely
-from shapely.geometry import Point
+from shapely.geometry import LineString, Point
 from shapely.geometry.base import BaseGeometry
 from shapely.strtree import STRtree
 
@@ -65,6 +65,92 @@ def _clearance(geom: BaseGeometry, exclusion_zone: BaseGeometry | None) -> float
     if exclusion_zone is None or exclusion_zone.is_empty:
         return float("inf")
     return geom.distance(exclusion_zone)
+
+
+def _boundary_segments(geom: BaseGeometry) -> list[LineString]:
+    """Every polygon part of `geom`, cut into individual 2-point edge
+    segments -- vectorized per ring (one `shapely.linestrings()` call over
+    an (N-1, 2, 2) coordinate array), not one `LineString(...)` per edge in
+    a Python loop, since a real exclusion zone's rings can carry tens of
+    thousands of vertices between them."""
+    segments: list[LineString] = []
+    for polygon in _iter_polygons(geom):
+        for ring in (polygon.exterior, *polygon.interiors):
+            coords = np.asarray(ring.coords)
+            if len(coords) < 2:
+                continue
+            pairs = np.stack([coords[:-1], coords[1:]], axis=1)
+            segments.extend(shapely.linestrings(pairs))
+    return segments
+
+
+class ExclusionIndex:
+    """Spatial index over an exclusion zone's boundary EDGES (not its whole
+    polygon parts), built once per exclusion_zone value rather than paying
+    the same lookup cost fresh on every disc/row.
+
+    Two separate costs stacked here, found in that order profiling the real
+    "1. Олимпийская деревня" run:
+
+    1. `shapely.distance(geom, exclusion_zone)` against a single complex
+       MultiPolygon is NOT indexed internally, and `shapely.prepare()` does
+       not accelerate it either (checked directly against this GEOS build)
+       -- GEOS considers the whole multi-part geometry on every call
+       regardless of how many points that call carries.
+       `generate_point_candidates` gets away with this because it makes ONE
+       batched call per buildable-area polygon, amortizing that fixed cost
+       over tens of thousands of points at once; `patterns.py::fill_group()`
+       does the opposite -- one small (~400-point) call PER CURTAIN -- and
+       measured **~5.0s per call, ~1180s total** across 235 curtains, the
+       dominant cost of a 1512s combined run.
+    2. Indexing on the exclusion zone's 271 top-level polygon PARTS (one
+       `STRtree.query_nearest()` per curtain instead of per-point) cut that
+       to ~911ms/call -- real, but still the dominant cost. Each "part" is
+       itself a `unary_union` of thousands of individually-buffered utility
+       segments, so a single part can carry tens of thousands of vertices;
+       GEOS still has to walk a whole part's ring to get the exact distance
+       to it once the STRtree hands back which part is nearest by bounding
+       box.
+
+    Indexing individual boundary EDGES instead fixes both: each STRtree leaf
+    is a plain 2-point segment, so its bounding box is tight (real spatial
+    pruning) and computing distance to the one or few candidates the tree
+    returns is O(1), not O(part's vertex count). Correct here specifically
+    because every caller only ever measures distance FROM a point already
+    known to be outside every exclusion part (sampled from `buildable_area`,
+    which is `territory.difference(exclusion_zone)` by construction) --
+    distance-to-polygon and distance-to-its-boundary coincide for a point
+    outside the polygon. Do not reuse this for a point that might be
+    *inside* an exclusion part; it would silently return the wrong (nonzero)
+    answer instead of 0.
+    """
+
+    def __init__(self, exclusion_zone: BaseGeometry | None):
+        self._parts = _boundary_segments(exclusion_zone) if exclusion_zone is not None else []
+        self._tree = STRtree(self._parts) if self._parts else None
+
+    def distance(self, geom: BaseGeometry) -> float:
+        """Nearest-edge distance for one geometry."""
+        if self._tree is None:
+            return float("inf")
+        idx = self._tree.nearest(geom)
+        if idx is None:
+            return float("inf")
+        return float(geom.distance(self._parts[int(idx)]))
+
+    def distances(self, geoms) -> list[float]:
+        """Nearest-edge distance for a batch of geometries, one vectorized
+        STRtree.query_nearest() call -- the same two-step pattern
+        compliance.py's _neighbour_checks() already uses, not a Python loop
+        of single .nearest() calls."""
+        geoms = list(geoms)
+        if self._tree is None or not geoms:
+            return [float("inf")] * len(geoms)
+        pairs, measured = self._tree.query_nearest(geoms, all_matches=False, return_distance=True)
+        result = [float("inf")] * len(geoms)
+        for position, geom_index in enumerate(pairs[0]):
+            result[int(geom_index)] = float(measured[position])
+        return result
 
 
 class TooManyCandidatesError(ValueError):

@@ -41,7 +41,7 @@ import shapely
 from shapely.geometry import LineString, MultiLineString, Point
 from shapely.geometry.base import BaseGeometry
 
-from geo_engine.candidates import ZoningIndex, _clearance
+from geo_engine.candidates import ExclusionIndex, ZoningIndex
 from geo_engine.io.geometry_cleanup import merge_dashed_lines
 from geo_engine.model import PlantingCandidate, PlantingType, Zone
 from geo_engine.norms import PlantingNorms
@@ -311,10 +311,15 @@ def row_candidates(
     который к этой улице отношения не имеет.
     """
     zoning_zones = zoning_zones or []
-    # Индекс строится один раз на вызов, а не на точку: `ZoningIndex` появился
-    # в candidates.py именно затем, чтобы убрать перебор всех зон на каждого
-    # кандидата, и рядовая посадка обязана пользоваться тем же.
+    # Индексы строятся один раз на вызов, а не на точку: `ZoningIndex`
+    # появился в candidates.py именно затем, чтобы убрать перебор всех зон
+    # на каждого кандидата, и рядовая посадка обязана пользоваться тем же.
+    # `ExclusionIndex` — та же идея для отступов: `shapely.distance(point,
+    # exclusion_zone)` против сложного составного `exclusion_zone` не
+    # индексирован и не ускоряется `shapely.prepare()`, каждый вызов платит
+    # за всю геометрию заново (см. docstring `ExclusionIndex`).
     zoning_index = ZoningIndex(zoning_zones)
+    exclusion_index = ExclusionIndex(exclusion_zone)
     if buildable_area is None or buildable_area.is_empty:
         return []
 
@@ -331,7 +336,7 @@ def row_candidates(
                     PlantingCandidate(
                         geometry=point,
                         planting_type=planting_type,
-                        clearance_m=_clearance(point, exclusion_zone),
+                        clearance_m=exclusion_index.distance(point),
                         zoning=zoning_index.category_at(point),
                     )
                 )
@@ -411,6 +416,8 @@ def fill_group(
     in_group_pitch_m: float,
     seed: int,
     zoning_zones: list[Zone] | None = None,
+    exclusion_index: ExclusionIndex | None = None,
+    zoning_index: ZoningIndex | None = None,
 ) -> list[PlantingCandidate]:
     """Кандидаты внутри ОДНОЙ куртины.
 
@@ -424,9 +431,26 @@ def fill_group(
     кустарников — 0,3 м»). Прежняя россыпь с интервалом 3 м была компромиссом
     ровно из-за отсутствия групп: применить 0,3 м ко всей площади означало
     ковёр, а 3 м по всей площади — равномерный крап, не похожий на проект.
+
+    `exclusion_index`/`zoning_index` — построенные вызывающим один раз на
+    весь тип посадки (`ExclusionIndex(exclusion_zone)`/`ZoningIndex(zones)`),
+    а не заново на каждую куртину. Без них функция строит их сама — на «1.
+    Олимпийская деревня» (235 куртин) это стоило: `ZoningIndex(zones)`
+    пересканирует **весь** список зон проекта (271 441 штука) на каждый
+    вызов, ~28мс/вызов, ~6.5с суммарно; `shapely.distance(400 точек,
+    exclusion_zone)` против единого составного `exclusion_zone` (271 часть,
+    1.75М вершин суммарно) не индексирован и не ускоряется
+    `shapely.prepare()` (проверено), ~5.0с/вызов, ~1180с суммарно — основной
+    вклад в комбинированный прогон в 1512с. `ExclusionIndex` строит индекс не
+    по самим частям `exclusion_zone` (у них у самих тысячи вершин — STRtree
+    находит нужную часть быстро, а точное расстояние до неё всё равно
+    O(вершин)), а по их ГРАНИЧНЫМ ОТРЕЗКАМ — с этим то же измерение
+    даёт ~5мс/вызов (~1200с → ~1с). Тот же принцип, что уже применён к
+    `ml_scoring.features.build_existing_greenery_index`.
     """
     zoning_zones = zoning_zones or []
-    zoning_index = ZoningIndex(zoning_zones)
+    if zoning_index is None:
+        zoning_index = ZoningIndex(zoning_zones)
     if disc is None or disc.is_empty:
         return []
 
@@ -446,11 +470,9 @@ def fill_group(
     if not points:
         return []
 
-    # Расстояние до зоны отступов — одним векторизованным вызовом на все точки
-    # группы. Зона отступов на реальной улице собрана из тысяч буферов, и
-    # поштучный `distance` по десяткам тысяч точек уводил генерацию за десять
-    # минут — замерено, прогон пришлось прервать.
-    if exclusion_zone is None or exclusion_zone.is_empty:
+    if exclusion_index is not None:
+        clearances = exclusion_index.distances(points)
+    elif exclusion_zone is None or exclusion_zone.is_empty:
         clearances = [float("inf")] * len(points)
     else:
         clearances = [float(d) for d in shapely.distance(points, exclusion_zone)]

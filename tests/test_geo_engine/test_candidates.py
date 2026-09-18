@@ -8,10 +8,11 @@ stay fast even though they're exercising "would have been catastrophic" cases.
 
 import time
 
+import numpy as np
 import pytest
-from shapely.geometry import Point, Polygon, box
+from shapely.geometry import MultiPolygon, Point, Polygon, box
 
-from geo_engine.candidates import TooManyCandidatesError, ZoningIndex, generate_point_candidates
+from geo_engine.candidates import ExclusionIndex, TooManyCandidatesError, ZoningIndex, generate_point_candidates
 from geo_engine.model import Zone
 from geo_engine.norms import load_norms
 
@@ -113,3 +114,92 @@ class TestZoningIndex:
         # on real data. 5s leaves generous headroom for a slower CI machine
         # without letting a real regression back to O(zones) slip through.
         assert elapsed < 5.0, f"scanning {len(points)} candidates took {elapsed:.1f}s -- looks like the O(n) path again"
+
+
+class TestExclusionIndex:
+    """Regression for `patterns.py::fill_group()` calling
+    `shapely.distance(points, exclusion_zone)` fresh against the whole
+    exclusion geometry once per curtain instead of once per planting type.
+
+    Confirmed live on "1. Олимпийская деревня" (271-part exclusion zone,
+    1.75M vertices total, 235 curtains): naive per-curtain
+    `shapely.distance()` -- not sped up by `shapely.prepare()` either,
+    checked directly -- measured ~5.0s/call, ~1180s total, the dominant cost
+    of a 1512s combined (patterns + parallelism) run. Indexing on the
+    exclusion zone's 271 top-level polygon *parts* (one `STRtree` leaf per
+    part) only got that to ~911ms/call: each part is itself a `unary_union`
+    of thousands of buffered utility segments, so GEOS still walks a whole
+    part's ring once the tree hands back which part is nearest. Indexing on
+    individual boundary EDGES instead (this class) dropped it to
+    ~5ms/call -- each STRtree leaf is a plain 2-point segment, so its
+    bounding box is tight and the exact-distance step is O(1). Combined
+    real-data run: 1512s -> 380s, byte-identical item counts/species.
+    """
+
+    def test_distance_matches_the_naive_geom_distance(self):
+        square = Polygon([(0, 0), (0, 10), (10, 10), (10, 0)])
+        index = ExclusionIndex(square)
+        point = Point(20, 5)
+        assert index.distance(point) == pytest.approx(point.distance(square))
+
+    def test_distances_batch_matches_per_point_naive_distance(self):
+        square = Polygon([(0, 0), (0, 10), (10, 10), (10, 0)])
+        index = ExclusionIndex(square)
+        points = [Point(20, 5), Point(-5, 5), Point(5, 30)]
+        naive = [p.distance(square) for p in points]
+        indexed = index.distances(points)
+        assert indexed == pytest.approx(naive)
+
+    def test_multipolygon_input_finds_the_nearest_part(self):
+        left = Polygon([(0, 0), (0, 10), (10, 10), (10, 0)])
+        right = Polygon([(100, 0), (100, 10), (110, 10), (110, 0)])
+        index = ExclusionIndex(MultiPolygon([left, right]))
+
+        assert index.distance(Point(15, 5)) == pytest.approx(5.0)
+        assert index.distance(Point(95, 5)) == pytest.approx(5.0)
+
+    def test_empty_or_none_exclusion_is_an_infinite_distance(self):
+        assert ExclusionIndex(None).distance(Point(0, 0)) == float("inf")
+        assert ExclusionIndex(Polygon()).distance(Point(0, 0)) == float("inf")
+
+    def test_matches_naive_distance_against_a_single_high_vertex_polygon(self):
+        """The exact case that made the part-level index still slow: ONE
+        polygon carrying thousands of vertices (a real exclusion zone part
+        is a union of thousands of buffered utility segments, not a clean
+        circle like this, but the vertex count and the failure mode --
+        exact-distance-to-a-part being O(vertices) -- are the same)."""
+        n = 4000
+        angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        # tiny per-vertex jitter so it isn't a perfectly regular polygon
+        # GEOS could special-case
+        radii = 10 + (np.arange(n) % 3) * 1e-4
+        coords = list(zip(radii * np.cos(angles), radii * np.sin(angles)))
+        complex_poly = Polygon(coords)
+        index = ExclusionIndex(complex_poly)
+        probe = Point(50, 0)
+
+        assert index.distance(probe) == pytest.approx(probe.distance(complex_poly), rel=1e-6)
+
+    def test_indexed_batch_lookup_stays_fast_against_many_high_vertex_parts(self):
+        """Not real-data scale (that's a live, opt-in verification -- see
+        CLAUDE.md's plan_items paragraph) -- enough vertices and queries
+        that the naive or part-level-indexed path would visibly show up
+        here too."""
+        n = 2000
+        parts = []
+        for cx, cy in [(0, 0), (200, 0), (0, 200), (200, 200)]:
+            angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
+            coords = list(zip(cx + 20 * np.cos(angles), cy + 20 * np.sin(angles)))
+            parts.append(Polygon(coords))
+        index = ExclusionIndex(MultiPolygon(parts))
+        points = [Point(50 + i * 0.01, 50) for i in range(2000)]
+
+        started = time.perf_counter()
+        index.distances(points)
+        elapsed = time.perf_counter() - started
+
+        # The naive per-curtain call measured ~5.0s for a single batch of
+        # 400 points against a 271-part/1.75M-vertex real exclusion zone;
+        # 2s here is generous headroom on a much smaller synthetic case
+        # while still catching a regression back to an unindexed path.
+        assert elapsed < 2.0, f"distances() for {len(points)} points took {elapsed:.2f}s -- looks like the unindexed path again"
