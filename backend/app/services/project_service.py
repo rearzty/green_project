@@ -150,7 +150,15 @@ async def create_project_from_file(
     # back to what parse_territory_file auto-detected (geographic files
     # only -- see its docstring). Leaves DXF/already-metric/CRS-less
     # uploads exactly as before.
-    project = Project(name=name, source_crs=source_crs or detected_crs)
+    #
+    # crs_verified is deliberately narrower than "we have a source_crs at
+    # all": it's only true when *auto-detection* is what produced it, from
+    # real evidence in the file's own coordinates -- a caller-supplied
+    # source_crs (even one that happens to be correct) is still a guess we
+    # have no way to check, and showing a real basemap under it would be
+    # exactly the kind of overconfidence that produced the Kenya-map bug
+    # (see CLAUDE.md). See Project.crs_verified's own docstring.
+    project = Project(name=name, source_crs=source_crs or detected_crs, crs_verified=source_crs is None and detected_crs is not None)
     project.layers = [
         Layer(
             project_id=project.id,

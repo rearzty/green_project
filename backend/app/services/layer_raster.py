@@ -34,8 +34,10 @@ concern is moot.
 from __future__ import annotations
 
 import io
+import os
 import threading
 from collections import OrderedDict
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -92,15 +94,37 @@ _ZONING_CATEGORY_LABELS = {
 }
 _ZONING_PREFIX = "zoning:"
 
-# Longer side of the rendered canvas, in pixels. A real street's extent (up to
-# ~1.5km) at this cap works out to well under half a metre per pixel — plenty
-# for a backdrop nobody measures against, and 4000x4000 RGBA (~64MB before
-# PNG compression) stays comfortably inside normal request memory.
-_MAX_CANVAS_PX = 4000
+# Longer side of the rendered canvas, in pixels. Raised from 4000 once the
+# map's own maxZoom went deeper (see MapView.tsx) than this backdrop could
+# keep up with -- a fixed-resolution <ImageOverlay> doesn't gain real detail
+# past its own pixel count, it just gets visibly blocky. 6000x6000 RGBA is
+# ~144MB before PNG compression (~2x the old 4000px cap's ~64MB, since area
+# scales with the square of the side) -- render cost per legend group scales
+# the same way, which is exactly what the per-group process pool below
+# (_PARALLEL_RENDER_THRESHOLD) exists to absorb.
+_MAX_CANVAS_PX = 6000
 _LINE_WIDTH_PX = {"utility": 3}
 _DEFAULT_LINE_WIDTH_PX = 2
 _POINT_RADIUS_PX = 3
 _FILL_ALPHA = 115  # ~0.45 opacity, matching MapView.tsx's layerStyle fillOpacity
+
+# Each legend group's PNG is independent CPU-bound PIL work (own geometry
+# list, own canvas) -- on "1. Олимпийская деревня" (371,685 rows) this loop
+# was the measured 18-27s cold-render cost, single-threaded, one group after
+# another. Below this many total geometries the whole thing is comfortably
+# under a second already (any small synthetic demo territory), so spinning
+# up worker processes would only add pure overhead -- Windows dev machines
+# in particular pay a real per-process re-import cost that fork-based Linux
+# containers don't. Gate the same way TooManyCandidatesError/
+# MAX_VISIBLE_MARKERS gate their own expensive paths: on measured scale, not
+# unconditionally. Worker count is capped by how many legend groups there
+# actually are (usually well under ten: utility/building/road/territory/
+# existing_greenery plus a handful of zoning categories) -- more workers
+# than groups buys nothing, and one very large group (e.g. a pile of
+# unrecognised "unknown" symbol-block primitives) still bounds the wall
+# time of the whole render on its own, however many cores are free.
+_PARALLEL_RENDER_THRESHOLD = 20_000
+_MAX_RENDER_WORKERS = 6
 
 
 def layer_group_key(layer: _LayerLike) -> str:
@@ -184,7 +208,12 @@ def _make_pixel_transform(minx: float, miny: float, maxx: float, maxy: float, ma
         # Geo Y grows up, image Y grows down -- flip against the top (maxy).
         return (x - minx) * scale, (maxy - y) * scale
 
-    return to_px, px_w, px_h
+    # scale is returned alongside the closure, not just baked into it: a
+    # worker process rendering one group in parallel (see
+    # _render_group_worker) can't be handed `to_px` itself -- closures don't
+    # pickle across a process boundary -- so it rebuilds the identical
+    # transform from these three plain numbers instead.
+    return to_px, px_w, px_h, scale
 
 
 def _draw_geometry(draw: ImageDraw.ImageDraw, geom: BaseGeometry, to_px, color: tuple[int, int, int], group_key: str) -> None:
@@ -210,6 +239,56 @@ def _draw_geometry(draw: ImageDraw.ImageDraw, geom: BaseGeometry, to_px, color: 
             _draw_geometry(draw, part, to_px, color, group_key)
 
 
+def _render_group_worker(
+    key: str,
+    geoms: list[BaseGeometry],
+    px_w: int,
+    px_h: int,
+    minx: float,
+    maxy: float,
+    scale: float,
+    color: tuple[int, int, int],
+) -> tuple[str, bytes]:
+    """Draws one legend group's PNG. Plain module-level function taking only
+    picklable arguments (no closures, no PIL/shapely objects that don't
+    round-trip cleanly) so it can run either inline (small projects) or
+    submitted to a worker process (large ones, see render_layer_raster) --
+    same code either way, so the two paths can't drift apart."""
+    def to_px(x: float, y: float) -> tuple[float, float]:
+        return (x - minx) * scale, (maxy - y) * scale
+
+    image = Image.new("RGBA", (px_w, px_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    for geom in geoms:
+        _draw_geometry(draw, geom, to_px, color, key)
+    buf = io.BytesIO()
+    image.save(buf, format="PNG", optimize=True)
+    return key, buf.getvalue()
+
+
+def _render_groups_parallel(
+    by_group: dict[str, list[BaseGeometry]],
+    px_w: int,
+    px_h: int,
+    minx: float,
+    maxy: float,
+    scale: float,
+    colors: dict[str, tuple[int, int, int]],
+) -> dict[str, bytes]:
+    """One process per legend group (bounded by _MAX_RENDER_WORKERS/core
+    count) instead of one thread doing all of them in sequence. Shapely
+    geometries pickle fine on their own (WKB under the hood) -- the actual
+    win is that groups have no dependency on each other, so this is
+    embarrassingly parallel; it just never used to be split up."""
+    worker_count = max(1, min(len(by_group), _MAX_RENDER_WORKERS, os.cpu_count() or 1))
+    with ProcessPoolExecutor(max_workers=worker_count) as pool:
+        futures = [
+            pool.submit(_render_group_worker, key, geoms, px_w, px_h, minx, maxy, scale, colors[key])
+            for key, geoms in by_group.items()
+        ]
+        return dict(future.result() for future in futures)
+
+
 def render_layer_raster(layers: list[_LayerLike], source_crs: str | None) -> LayerRaster:
     if not layers:
         return LayerRaster(bounds=None, groups=[])
@@ -225,24 +304,26 @@ def render_layer_raster(layers: list[_LayerLike], source_crs: str | None) -> Lay
         bound_geoms = [geom for _, geom in entries]
     minx, miny, maxx, maxy = _bounds_of(bound_geoms)
 
-    to_px, px_w, px_h = _make_pixel_transform(minx, miny, maxx, maxy, _MAX_CANVAS_PX)
+    _, px_w, px_h, scale = _make_pixel_transform(minx, miny, maxx, maxy, _MAX_CANVAS_PX)
     bounds = _wgs84_bounds(minx, miny, maxx, maxy, source_crs)
 
     by_group: dict[str, list[BaseGeometry]] = {}
     for key, geom in entries:
         by_group.setdefault(key, []).append(geom)
+    colors = {key: _hex_to_rgb(_group_color(key)) for key in by_group}
 
-    groups: list[LayerRasterGroup] = []
-    for key, geoms in by_group.items():
-        image = Image.new("RGBA", (px_w, px_h), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(image)
-        color = _hex_to_rgb(_group_color(key))
-        for geom in geoms:
-            _draw_geometry(draw, geom, to_px, color, key)
-        buf = io.BytesIO()
-        image.save(buf, format="PNG", optimize=True)
-        groups.append(LayerRasterGroup(key=key, label=_group_label(key), color=_group_color(key), count=len(geoms), png=buf.getvalue()))
+    if len(entries) >= _PARALLEL_RENDER_THRESHOLD and len(by_group) > 1:
+        pngs = _render_groups_parallel(by_group, px_w, px_h, minx, maxy, scale, colors)
+    else:
+        pngs = dict(
+            _render_group_worker(key, geoms, px_w, px_h, minx, maxy, scale, colors[key])
+            for key, geoms in by_group.items()
+        )
 
+    groups = [
+        LayerRasterGroup(key=key, label=_group_label(key), color=_group_color(key), count=len(geoms), png=pngs[key])
+        for key, geoms in by_group.items()
+    ]
     groups.sort(key=lambda g: g.label)
     return LayerRaster(bounds=bounds, groups=groups)
 

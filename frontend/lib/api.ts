@@ -24,6 +24,11 @@ export interface ProjectOut {
   id: string;
   name: string;
   source_crs: string | null;
+  /** True only when source_crs came from real evidence (auto-detected
+   * geographic coordinates in the uploaded file) -- never for a value the
+   * user typed in, even a plausible one, and never for DXF/DWG/ZIP, which
+   * carries no CRS metadata at all. See backend's Project.crs_verified. */
+  crs_verified: boolean;
   created_at: string;
 }
 
