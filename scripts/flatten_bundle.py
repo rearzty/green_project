@@ -96,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
         _, bundle = resolve_inputs(args.input, Path(tmp))
         print(f"  файлов в бандле: {len(bundle)}")
         utilities, zones = read_dxf_bundle(
-            bundle, layer_map=COMBINED_LAYER_MAP, stitch_dashes=True, drop_origin=True
+            bundle, layer_map=COMBINED_LAYER_MAP, stitch_dashes=True, drop_origin=True, reconstruct_footprints=True
         )
 
     doc = ezdxf.new(setup=True)

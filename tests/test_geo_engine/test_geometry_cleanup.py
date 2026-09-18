@@ -5,13 +5,16 @@ contain — ~1 m dashes with ~0.5 m gaps — so a regression here means the real
 geobase stops importing correctly, not just a synthetic case.
 """
 
-from shapely.geometry import LineString, Point
+import pytest
+from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import linemerge, unary_union
 
 from geo_engine.io.geometry_cleanup import (
+    DEFAULT_DANGLE_BUFFER_M,
     DEFAULT_DASH_GAP_M,
     drop_origin_artifacts,
     merge_dashed_lines,
+    reconstruct_closed_footprints,
 )
 
 DASH_M = 1.0
@@ -171,3 +174,112 @@ def test_a_drawing_entirely_at_the_origin_keeps_everything():
 
     assert origin_is_artifact(only_origin) is False
     assert drop_origin_artifacts(only_origin) == only_origin
+
+
+class TestReconstructClosedFootprints:
+    """The pilot dataset's real "Здания" layer: 0 of 409 LWPOLYLINE entities
+    checked were closed (`is_closed`) — a building outline arrives as an open
+    ring, sometimes with the missing closing edge as a separate LINE entity on
+    the same layer. `buffers.buildable_area()` subtracts hard obstacles by
+    exact-footprint difference, which is a silent no-op against a zero-area
+    LineString — measured live, 6 922 m² of one real street's own computed
+    buildable_area for trees fell inside what should have been building
+    footprints. These tests exercise the reconstruction in isolation, on
+    hand-built line soup, independent of any DXF/ezdxf machinery.
+    """
+
+    def test_a_line_that_traces_its_own_way_back_to_start_becomes_a_polygon(self):
+        """The vertex list happens to already include the closing point (last
+        coordinate repeats the first) -- topologically a closed ring even
+        though nothing at the DXF entity level (no `is_closed` flag) marked
+        it as one.
+        """
+        outline = LineString([(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)])
+
+        result = reconstruct_closed_footprints([outline])
+
+        assert len(result) == 1
+        assert result[0].geom_type == "Polygon"
+        assert result[0].area == pytest.approx(100.0)
+
+    def test_outline_split_across_a_polyline_and_a_separate_closing_line(self):
+        """The exact real-data shape: a 3-sided LWPOLYLINE plus one LINE
+        entity supplying the missing 4th edge -- neither is closed alone, but
+        together they trace a full ring. No single entity's own geometry
+        carries enough information to close itself; only the union does.
+        """
+        three_sides = LineString([(0, 0), (10, 0), (10, 10), (0, 10)])
+        closing_edge = LineString([(0, 10), (0, 0)])
+
+        result = reconstruct_closed_footprints([three_sides, closing_edge])
+
+        assert len(result) == 1
+        assert result[0].geom_type == "Polygon"
+        assert result[0].area == pytest.approx(100.0)
+
+    def test_a_genuinely_open_line_with_no_partner_is_not_turned_into_a_polygon(self):
+        """The complement of the two tests above: three sides with nothing
+        supplying the fourth (no closing entity anywhere in the input) is not
+        a rectangle -- inventing the missing edge would be a guess this
+        function has no basis for. It still becomes *some* obstacle (a thin
+        buffered sliver along the drawn sides), just not a 100 m2 footprint.
+        """
+        three_sides_only = LineString([(0, 0), (10, 0), (10, 10), (0, 10)])
+
+        result = reconstruct_closed_footprints([three_sides_only])
+
+        assert len(result) == 1
+        assert result[0].geom_type == "Polygon"
+        assert result[0].area < 30.0  # a buffered 30 m open path, nowhere near a 100 m2 rectangle
+
+    def test_two_disjoint_buildings_stay_two_separate_polygons(self):
+        building_a = LineString([(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)])
+        building_b = LineString([(100, 100), (110, 100), (110, 110), (100, 110), (100, 100)])
+
+        result = reconstruct_closed_footprints([building_a, building_b])
+
+        assert len(result) == 2
+        assert {round(p.area) for p in result} == {100, 100}
+
+    def test_already_closed_polygons_pass_through_untouched(self):
+        polygon = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+
+        result = reconstruct_closed_footprints([polygon])
+
+        assert result == [polygon]
+
+    def test_a_genuinely_dangling_stub_is_buffered_not_dropped_and_not_shaped_into_a_polygon(self):
+        """A short stub with no matching far end (drafting leftover, or a
+        fragment this survey never completed) cannot be reconstructed into a
+        real footprint -- but the old behaviour (a bare LineString, silently
+        a no-op against buildable_area's difference()) is worse than a thin
+        buffered sliver that at least still blocks a candidate.
+        """
+        dangling_stub = LineString([(50, 50), (55, 50)])
+
+        result = reconstruct_closed_footprints([dangling_stub], dangle_buffer_m=0.3)
+
+        assert len(result) == 1
+        assert result[0].geom_type == "Polygon"
+        # A buffered 5 m segment at 0.3 m radius is on the order of a few
+        # square metres -- nowhere near what a closed rectangle of the same
+        # bounding box would be, i.e. this really did stay a thin sliver.
+        assert 0 < result[0].area < 10.0
+
+    def test_mixed_input_keeps_polygons_and_reconstructs_lines_independently(self):
+        already_closed = Polygon([(200, 200), (210, 200), (210, 210), (200, 210)])
+        open_outline = LineString([(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)])
+
+        result = reconstruct_closed_footprints([already_closed, open_outline])
+
+        assert len(result) == 2
+        areas = sorted(round(p.area) for p in result)
+        assert areas == [100, 100]
+
+    def test_empty_input_is_a_no_op(self):
+        assert reconstruct_closed_footprints([]) == []
+
+    def test_default_dangle_buffer_is_small(self):
+        """A regression on the constant itself: a large default would turn a
+        genuinely unclosable fragment into an oversized fake obstacle."""
+        assert DEFAULT_DANGLE_BUFFER_M <= 1.0

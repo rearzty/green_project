@@ -58,18 +58,22 @@ class _LayerLike(Protocol):
     attrs: dict | None
     geometry: object
 
-# Mirrors frontend/lib/mapStyle.ts's UTILITY_COLOR/ZONE_COLORS/
-# ZONING_CATEGORY_COLORS/LAYER_TYPE_LABELS/ZONING_CATEGORY_LABELS exactly —
-# two copies (Python here, TS there) because the raster is drawn server-side
-# and the legend swatches are drawn client-side, and there's no shared config
-# file either language reads today. Keep the two in sync by hand if either
-# changes.
+# These are now the only source of truth for legend color/label — the
+# frontend's own copy (mapStyle.ts's old ZONE_COLORS/LAYER_TYPE_LABELS) was
+# deleted when vector rendering gave way to this server-rendered raster (see
+# this module's docstring); ControlPanel.tsx just displays whatever `label`/
+# `color` render_layer_raster() computed below, nothing to keep in sync
+# against anymore.
 _UTILITY_COLOR = "#b91c1c"
 _ZONE_COLORS = {
     "building": "#78716c",
     "road": "#57534e",
     "territory": "#0ea5e9",
     "existing_greenery": "#16a34a",
+    # Заливки.dwg's asphalt/tile sidewalk fills (layer_rules.py's АБ ТР/ПЛ ТР
+    # patterns) -- a lighter stone than road/building so it reads as related
+    # hardscape without being mistaken for either.
+    "sidewalk": "#a8a29e",
 }
 _ZONING_CATEGORY_COLORS = {
     "residential": "#a78bfa",
@@ -84,6 +88,7 @@ _LAYER_TYPE_LABELS = {
     "road": "Дороги",
     "existing_greenery": "Существующая зелень",
     "utility": "Инженерные сети",
+    "sidewalk": "Тротуары",
 }
 _ZONING_CATEGORY_LABELS = {
     "residential": "Зонирование: жилая",

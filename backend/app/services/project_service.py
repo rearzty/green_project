@@ -7,9 +7,13 @@ serves an export of ours and a real survey sheet alike. Vector files still pass
 attributes through raw.
 
 DXF is also read with the CAD-export cleanups on (`stitch_dashes`,
-`drop_origin`): an upload here is a real drawing, and on real drawings utility
-runs arrive exploded into linetype dashes and the legend sits at the origin.
-See geo_engine.io.geometry_cleanup for what each one does and does not touch.
+`drop_origin`, `reconstruct_footprints`): an upload here is a real drawing,
+and on real drawings utility runs arrive exploded into linetype dashes, the
+legend sits at the origin, and a building outline arrives as an unclosed
+polyline rather than a polygon (real building geometry, not just visual
+completeness -- see geometry_cleanup.reconstruct_closed_footprints's
+docstring for the buildable_area consequence of leaving it as a line). See
+geo_engine.io.geometry_cleanup for what each one does and does not touch.
 
 A real project drawing is not self-contained -- see
 geo_engine.io.dxf_reader.resolve_bundle_inputs's docstring. Two more suffixes
@@ -66,7 +70,9 @@ def _parse_dxf_bundle(path: Path, workdir: Path) -> tuple[list[Utility], list[Zo
         # but worth keeping somewhere a developer can find it; nothing in the
         # API response surfaces per-file warnings today.
         print(f"  ! {warning}")
-    utilities, zones = read_dxf_bundle(bundle, layer_map=COMBINED_LAYER_MAP, stitch_dashes=True, drop_origin=True)
+    utilities, zones = read_dxf_bundle(
+        bundle, layer_map=COMBINED_LAYER_MAP, stitch_dashes=True, drop_origin=True, reconstruct_footprints=True
+    )
     return utilities, zones, None
 
 
@@ -170,7 +176,7 @@ def parse_territory_file(path: Path, workdir: Path | None = None) -> tuple[list[
     suffix = path.suffix.lower()
     if suffix == ".dxf":
         utilities, zones = read_dxf(
-            path, layer_map=COMBINED_LAYER_MAP, stitch_dashes=True, drop_origin=True
+            path, layer_map=COMBINED_LAYER_MAP, stitch_dashes=True, drop_origin=True, reconstruct_footprints=True
         )
         return utilities, zones, None
     if suffix == ".dwg":
