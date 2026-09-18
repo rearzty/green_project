@@ -14,6 +14,7 @@ import json
 from shapely.geometry import LineString, Point, Polygon
 
 from geo_engine.compliance import (
+    NEIGHBOUR_OBJECT_TYPE,
     UNMAPPED_SOURCE_ID,
     explain_items,
     report_payload,
@@ -22,6 +23,7 @@ from geo_engine.compliance import (
 )
 from geo_engine.model import PlantingItem, Utility, Zone
 from geo_engine.norms import load_norms
+from geo_engine.species import load_catalogue
 
 
 def _tree(x, y):
@@ -150,3 +152,91 @@ def test_trace_csv_has_one_row_per_planting_and_constraint(tmp_path):
 
 def test_no_items_yields_no_records():
     assert explain_items([], [_gas()], [], load_norms()) == []
+
+
+class TestNeighbourSpacing:
+    """Интервал между стволами (МГСН 1.02-02, п. 4.2.9.2) обязан проверяться.
+
+    Источник был объявлен в planting_norms.yaml и не использовался ни одной
+    строчкой кода: интервал применялся при отборе, но не проверялся, а отбор
+    идёт отдельным проходом на каждую фазу посадки. Значит между фазами его не
+    гарантировал никто, и отчёт об этом молчал.
+    """
+
+    def test_trees_closer_than_the_crown_interval_are_flagged(self):
+        norms = load_norms()
+        catalogue = load_catalogue()
+        wide = next(s for s in catalogue.tree if s.crown == "wide")
+        required = catalogue.spacing_for_crown("wide")
+
+        items = [
+            PlantingItem(geometry=Point(0, 0), planting_type="tree", species=wide.name,
+                         score=1.0, rationale="тест"),
+            PlantingItem(geometry=Point(required - 1.0, 0), planting_type="tree", species=wide.name,
+                         score=1.0, rationale="тест"),
+        ]
+        records = explain_items(items, [], [], norms, catalogue)
+
+        breaches = [c for r in records for c in r.checks
+                    if c.object_type == NEIGHBOUR_OBJECT_TYPE and not c.satisfied]
+        assert len(breaches) == 2, "нарушение интервала должно быть видно у обеих посадок"
+        assert breaches[0].required_m == required
+        assert "4.2.9.2" in breaches[0].clause
+        assert breaches[0].verified
+
+    def test_mixed_crown_classes_take_the_larger_interval(self):
+        """Для смешанной пары акт числа не даёт — берётся большее из двух, по
+        тому же правилу, по которому во всём проекте выбирается число из
+        нормативного диапазона.
+        """
+        norms = load_norms()
+        catalogue = load_catalogue()
+        wide = next(s for s in catalogue.tree if s.crown == "wide")
+        narrow = next(s for s in catalogue.tree if s.crown == "narrow")
+        wide_interval = catalogue.spacing_for_crown("wide")
+        narrow_interval = catalogue.spacing_for_crown("narrow")
+        assert wide_interval > narrow_interval
+
+        # Ровно на узком интервале: для узкой кроны хватило бы, для пары с
+        # широкой — нет.
+        items = [
+            PlantingItem(geometry=Point(0, 0), planting_type="tree", species=wide.name,
+                         score=1.0, rationale="тест"),
+            PlantingItem(geometry=Point(narrow_interval, 0), planting_type="tree", species=narrow.name,
+                         score=1.0, rationale="тест"),
+        ]
+        records = explain_items(items, [], [], norms, catalogue)
+        checks = [c for r in records for c in r.checks if c.object_type == NEIGHBOUR_OBJECT_TYPE]
+
+        assert {c.required_m for c in checks} == {wide_interval}
+        assert not any(c.satisfied for c in checks)
+
+    def test_shrubs_are_not_checked_against_each_other(self):
+        """743-ПП табл. 3.6.2 даёт кустарнику 0,3-1,0 м, но это расстояние
+        ВНУТРИ куртины, а не минимум между любыми двумя кустами плана —
+        проверять по нему нормальную плотную группу значило бы объявить её
+        нарушением.
+        """
+        norms = load_norms()
+        catalogue = load_catalogue()
+        shrub = catalogue.shrub[0]
+        items = [
+            PlantingItem(geometry=Point(x * 0.5, 0), planting_type="shrub", species=shrub.name,
+                         score=1.0, rationale="тест")
+            for x in range(4)
+        ]
+        records = explain_items(items, [], [], norms, catalogue)
+
+        assert not [c for r in records for c in r.checks if c.object_type == NEIGHBOUR_OBJECT_TYPE]
+
+    def test_a_single_tree_has_no_neighbour_check(self):
+        """Соседа нет — ограничения нет. Не «соблюдено»: строка с бесконечным
+        расстоянием засоряла бы отчёт утверждением ни о чём.
+        """
+        norms = load_norms()
+        catalogue = load_catalogue()
+        items = [PlantingItem(geometry=Point(0, 0), planting_type="tree",
+                              species=catalogue.tree[0].name, score=1.0, rationale="тест")]
+        records = explain_items(items, [], [], norms, catalogue)
+
+        assert not [c for r in records for c in r.checks if c.object_type == NEIGHBOUR_OBJECT_TYPE]
