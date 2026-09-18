@@ -30,6 +30,7 @@ close that gap here:
 
 from __future__ import annotations
 
+import shutil
 import tempfile
 import zipfile
 from pathlib import Path
@@ -69,14 +70,82 @@ def _parse_dxf_bundle(path: Path, workdir: Path) -> tuple[list[Utility], list[Zo
     return utilities, zones, None
 
 
+# Флаг «имена внутри архива в UTF-8» (general purpose bit 11, APPNOTE 4.4.4).
+# Без него zipfile обязан считать имена CP437 — см. _zip_member_name.
+_ZIP_UTF8_FLAG = 0x800
+
+
+def _zip_member_name(info: zipfile.ZipInfo) -> str:
+    """Имя файла из архива в правильной кодировке.
+
+    Живой отказ, ради которого это написано: `archive.extractall()` на
+    обычном архиве папки улицы падал `OSError: [Errno 36] File name too
+    long`, и загрузка ZIP была нерабочей ровно на том входе, ради которого
+    делалась — на русских папках с чертежами.
+
+    Механика. Спецификация ZIP знает ровно две кодировки имён: CP437 и (если
+    выставлен бит 11) UTF-8. Ни Finder, ни Info-ZIP `zip`, ни проводник
+    Windows этот бит не ставят, а имена пишут в UTF-8 — то есть архив лжёт о
+    себе, и `zipfile` честно декодирует UTF-8-байты как CP437. Каждый
+    кириллический символ превращается в два псевдографических, и имя пухнет:
+    замерено на реальном чертеже — 229 байт стали 566 при лимите имени
+    файла в 255. Отсюда и `File name too long`, хотя настоящее имя короче
+    лимита втрое.
+
+    Восстановление точное, а не эвристика: `.encode("cp437")` возвращает
+    ровно те байты, что лежат в архиве, и их уже можно прочитать как UTF-8.
+    Если архив действительно старый и действительно в CP437, обратный
+    разбор не сложится (UnicodeDecodeError) — тогда правильным и остаётся
+    то, что вернул zipfile.
+    """
+    if info.flag_bits & _ZIP_UTF8_FLAG:
+        return info.filename
+    try:
+        return info.filename.encode("cp437").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return info.filename
+
+
+def _extract_archive(archive: zipfile.ZipFile, extract_dir: Path) -> None:
+    """Распаковать архив, читая имена через `_zip_member_name`.
+
+    Поэлементно, а не `extractall()`, только по одной причине: имя надо
+    исправить до того, как по нему создаётся файл, а `extractall` такого
+    хука не даёт.
+
+    Раз распаковка теперь ручная, проверку выхода за пределы каталога
+    (zip-slip: запись с именем вроде `../../etc/passwd`) приходится делать
+    самим — `extractall` её содержит, и потерять её молча при переходе на
+    ручной цикл было бы обидно.
+    """
+    root = extract_dir.resolve()
+    for info in archive.infolist():
+        target = (extract_dir / _zip_member_name(info)).resolve()
+        if not target.is_relative_to(root):
+            continue
+        if info.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with archive.open(info) as source, open(target, "wb") as sink:
+            shutil.copyfileobj(source, sink)
+
+
 def _parse_zip_bundle(path: Path, workdir: Path) -> tuple[list[Utility], list[Zone], str | None]:
     extract_dir = workdir / "extracted"
     extract_dir.mkdir(parents=True, exist_ok=True)
     try:
         with zipfile.ZipFile(path) as archive:
-            archive.extractall(extract_dir)
+            _extract_archive(archive, extract_dir)
     except zipfile.BadZipFile as error:
         raise UnsupportedFileTypeError("Файл .zip повреждён или не является архивом.") from error
+    except OSError as error:
+        # Имя, которое файловая система не принимает даже после исправления
+        # кодировки. Пользователю нужен понятный отказ, а не 500 с трейсбеком:
+        # именно так этот баг и выглядел снаружи — «нет связи с сервером».
+        raise UnsupportedFileTypeError(
+            f"Не удалось распаковать архив: {error.strerror or error}."
+        ) from error
 
     # A folder zipped on macOS/Windows often lands one level down (the zip
     # root holds a single directory named after the folder) or wrapped in a
