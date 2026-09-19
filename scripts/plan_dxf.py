@@ -277,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
         main_drawing, bundle = resolve_inputs(args.input, workdir)
         print(f"     файлов в бандле: {len(bundle)}")
         utilities, zones = read_dxf_bundle(
-            bundle, layer_map=COMBINED_LAYER_MAP, stitch_dashes=True, drop_origin=True
+            bundle, layer_map=COMBINED_LAYER_MAP, stitch_dashes=True, drop_origin=True, reconstruct_footprints=True
         )
         by_type = Counter(u.object_type for u in utilities)
         print(f"     сетей: {sum(by_type.values())} ({', '.join(f'{k}: {v}' for k, v in by_type.most_common())})")
