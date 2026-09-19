@@ -46,9 +46,10 @@ from __future__ import annotations
 
 import math
 
-from shapely.geometry import LineString, MultiLineString, Point
+import shapely
+from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.geometry.base import BaseGeometry
-from shapely.ops import linemerge
+from shapely.ops import linemerge, polygonize_full, unary_union
 from shapely.strtree import STRtree
 
 # Widest gap between two dashes still treated as "same line". Measured gaps in
@@ -347,3 +348,123 @@ def _total_bounds(geometries: list[BaseGeometry]) -> tuple[float, float, float, 
         max(b[2] for b in bounds),
         max(b[3] for b in bounds),
     )
+
+
+# Buffer applied to a line fragment that never closes into a ring at all (a
+# genuinely dangling stub, or a line that only ever meets another at a single
+# point rather than tracing a loop). Small on purpose: the point is to keep it
+# as *some* obstacle rather than the zero-area no-op it is as a bare line (see
+# reconstruct_closed_footprints), not to invent a footprint out of a fragment
+# nothing here can actually reconstruct the shape of.
+DEFAULT_DANGLE_BUFFER_M = 0.3
+
+# Snap tolerance before polygonize() -- deliberately the same value as
+# dxf_reader._POLYLINE_CLOSE_TOLERANCE_M (can't import it directly: dxf_reader
+# imports *this* module, importing back would be circular), reused rather than
+# invented because it is measuring the same thing: how far apart two vertices
+# that are drafted "at the same point" actually land in this dataset. Found
+# necessary, not just nice-to-have -- on one real sheet (12 867 open building
+# lines), naive polygonize() with no snapping closed 862 rings; nearest-
+# neighbour endpoint gaps showed most of the shortfall wasn't missing data but
+# sub-centimetre drafting noise (8 786 of 23 948 endpoints had a neighbour
+# within 1 cm). Snapping every vertex to this grid before polygonize() raised
+# that to 1 197 -- checked at 0.01/0.05/0.1/0.2 m, 0.05 m gave the most closed
+# rings of the four.
+DEFAULT_SNAP_GRID_M = 0.05
+
+
+def reconstruct_closed_footprints(
+    geometries: list[BaseGeometry],
+    dangle_buffer_m: float = DEFAULT_DANGLE_BUFFER_M,
+    snap_grid_m: float = DEFAULT_SNAP_GRID_M,
+) -> list[BaseGeometry]:
+    """Turn a building-outline line soup into real footprint polygons.
+
+    Found on the pilot dataset's real "Здания" layer, not a hypothetical: of
+    409 LWPOLYLINE entities checked on one sheet, `is_closed` was true for
+    **zero** of them — the drafter traces a building's outline as an open
+    polyline (plus, on that same layer, loose LINE entities that look like the
+    missing closing edge) rather than a closed ring. `_entity_to_geometry()`'s
+    existing 5 cm close-tolerance heuristic (built for a *survey boundary*
+    whose ends are 11 mm apart over an 1833 m perimeter — see
+    `_POLYLINE_CLOSE_TOLERANCE_M`) doesn't fire here: real gaps between a
+    building outline's first and last vertex are metres, not millimetres.
+
+    The consequence is not just cosmetic. `buffers.buildable_area()` excludes
+    hard obstacles by `territory.difference(unary_union(hard_obstacles))` —
+    subtracting a zero-area LineString from a polygon removes nothing.
+    Measured on "1. Олимпийская деревня": of 13 251 zones read as
+    `zone_type="building"`, 12 867 (97%) were LineString, only 382 a real
+    Polygon, and **6 922 m² of the street's own computed buildable_area for
+    trees (out of 45 568 m² total, ~15%) fell inside footprints reconstructed
+    from those lines** — meaning a candidate could legally land on top of a
+    real building.
+
+    The fix is `shapely.ops.polygonize()`, not a smarter per-entity close
+    check: a building's true outline is usually split across *several*
+    entities (the open LWPOLYLINE run plus separate LINE segments closing or
+    subdividing it), so the ring only exists once every line on the layer is
+    unioned together and re-noded at shared endpoints — no single entity
+    carries enough information to close itself. Already-closed input
+    (Polygon/MultiPolygon) passes through untouched; genuinely unclosed
+    leftovers (`polygonize_full`'s dangles/cuts/invalid rings — a stub with no
+    matching far end, at this drafter's hand, at this survey's completeness)
+    are kept as a thin buffered sliver rather than dropped, so a fragment we
+    can't shape correctly still blocks a candidate rather than silently
+    vanishing like the unfixed LineString did.
+
+    Even with snapping, most real building outlines in this dataset still
+    don't close: measured on the full real bundle (not one sheet), 18 204
+    zones read as `zone_type="building"`, only 122 with a footprint-scale
+    area (>20 m²) and 15 954 (88%) as sub-1 m² slivers. A proximity-clustering
+    fallback was tried and deliberately rejected: grouping nearby leftover
+    fragments (buffer-union within a tolerance, then convex hull of each
+    connected group) and reconstructing *that* as a footprint recovers more
+    shapes, but at 1 m clustering tolerance it also produced one 25 874 m²
+    "building" on a single real sheet — an unrelated chain of fragments
+    bridged into one shape via transitive proximity, which would silently
+    swallow real plantable area, a worse failure than the conservative sliver
+    it would replace. Correctness here favours under-recognizing a building
+    (a thin sliver still blocks *something*, and the loss is a few m² of
+    missed exclusion) over over-recognizing one (a wrongly merged blob can
+    blot out territory that was never a building at all). If this needs
+    revisiting, the direction is a *shape-aware* accept test on top of
+    clustering — e.g. comparing a cluster's hull perimeter against the summed
+    length of its member fragments, since a true single-building cluster's
+    fragments roughly trace its perimeter while a wrongly-bridged chain's
+    don't — not just a tighter distance threshold, which only trades one
+    failure mode for the other.
+    """
+    polygons: list[BaseGeometry] = []
+    lines: list[LineString] = []
+    for geometry in geometries:
+        if geometry is None or geometry.is_empty:
+            continue
+        gtype = geometry.geom_type
+        if gtype in ("Polygon", "MultiPolygon"):
+            polygons.append(geometry)
+        elif gtype in ("LineString", "MultiLineString"):
+            lines.extend(_flatten_lines(geometry))
+        elif gtype == "GeometryCollection":
+            for part in geometry.geoms:
+                if part.geom_type in ("Polygon", "MultiPolygon"):
+                    polygons.append(part)
+                elif part.geom_type in ("LineString", "MultiLineString"):
+                    lines.extend(_flatten_lines(part))
+
+    if not lines:
+        return polygons
+
+    if snap_grid_m > 0:
+        lines = [shapely.set_precision(line, snap_grid_m) for line in lines]
+    closed, cuts, dangles, invalid = polygonize_full(unary_union(lines))
+    polygons.extend(g for g in closed.geoms if not g.is_empty)
+
+    for leftover in (*cuts.geoms, *dangles.geoms, *invalid.geoms):
+        if leftover.is_empty:
+            continue
+        buffered = leftover.buffer(dangle_buffer_m)
+        if not buffered.is_empty:
+            polygons.append(buffered)
+
+    return polygons

@@ -92,6 +92,42 @@ class TestZoneRecognition:
         assert classify_layer("Фонари")[1] == "lighting_pole"
 
 
+class TestSurfaceFillLayers:
+    """Заливки.dwg — реальный xref с HATCH-геометрией поверхностей (асфальт/
+    газон/плитка), найденный на «1. Олимпийская деревня». Слои называются
+    парой кодов через дефис (normalize_name разбивает его на пробел), и
+    реальное имя пишет то одну сторону шва первой, то другую.
+    """
+
+    @pytest.mark.parametrize(
+        "layer, expected",
+        [
+            ("_ГЗН-ГЗН", "existing_greenery"),
+            ("_ГЗН-АБ ПЧ", "existing_greenery"),  # частное правило гзн идёт раньше составного
+            ("_АБ ПЧ-АБ ПЧ", "road"),
+            ("_АБ ТР-АБ ПЧ (2 и более метров)", "road"),  # ПЧ выигрывает у ТР при обоих в имени
+            ("_АБ ПЧ-АБ ТР", "road"),  # тот же шов, порядок токенов обратный
+            ("_ЩМА ПЧ-АБ ТР", "road"),
+            ("_АБ ТР-АБ ТР", "sidewalk"),
+            ("_АБ ТР-ПЛ ТР", "sidewalk"),
+            ("_ПЛ ТР-ПЛ ТР", "sidewalk"),
+            # Шов с гравийной стороной ("Щ") всё равно распознаётся по
+            # СВОЕЙ, опознанной стороне — неопределённость только там, где
+            # опознанного кода нет вовсе (см. тест ниже).
+            ("_АБ ТР-Щ", "sidewalk"),
+            ("_ГЗН-Щ", "existing_greenery"),
+        ],
+    )
+    def test_fill_seam_layers_map_to_the_dominant_surface(self, layer, expected):
+        assert classify_layer(layer) == ("zone", expected)
+
+    def test_bare_gravel_code_is_deliberately_left_unmapped(self):
+        """«Щ» без уточнения (щебень?) — соответствие неочевидно и площадь
+        пренебрежимо мала в замере; придумывать тип значило бы гадать.
+        """
+        assert classify_layer("_Щ -Щ") is None
+
+
 class TestWhatIsDeliberatelyNotMapped:
     @pytest.mark.parametrize("layer", ["Ограды", "Береговая линия", "Красные линии", "Горизонтали"])
     def test_objects_no_act_sets_a_distance_to_stay_unmapped(self, layer):
