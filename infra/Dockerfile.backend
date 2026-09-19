@@ -17,11 +17,33 @@
 FROM python:3.11-slim AS libredwg
 
 ARG LIBREDWG_VERSION=0.14
+# Контрольная сумма обязательна с тех пор, как источников стало несколько:
+# зеркало может отдать не тот файл, а версия тут критична — 0.13.3 молча пишет
+# битый DXF (см. geo_engine/io/dwg_convert.py). Проверено: GitHub и GNU-зеркало
+# отдают побайтово одинаковый архив.
+ARG LIBREDWG_SHA256=62ebb73b984f865960f20ed26619ea5f8789d5e3fd088fa40a2598384da81275
 
+# Источников несколько, и это не перестраховка. Живой отказ сборки: из
+# контейнера Docker соединение с ftp.gnu.org обрывается на TLS
+# («GnuTLS: The TLS connection was non-properly terminated», у curl —
+# «unexpected eof while reading»), хотя с хоста тот же адрес открывается, а
+# apt в том же контейнере работает. Проверено на обоих клиентах и на http
+# тоже — дело в сетевом пути, а не в клиенте. Поэтому берём первый источник,
+# который ответил, и сверяем контрольную сумму.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential wget pkg-config libpcre2-dev \
+    && apt-get install -y --no-install-recommends build-essential curl ca-certificates pkg-config libpcre2-dev \
     && rm -rf /var/lib/apt/lists/* \
-    && wget -q "https://ftp.gnu.org/gnu/libredwg/libredwg-${LIBREDWG_VERSION}.tar.xz" -O /tmp/libredwg.tar.xz \
+    && for url in \
+        "https://ftp.gnu.org/gnu/libredwg/libredwg-${LIBREDWG_VERSION}.tar.xz" \
+        "https://github.com/LibreDWG/libredwg/releases/download/${LIBREDWG_VERSION}/libredwg-${LIBREDWG_VERSION}.tar.xz" \
+        "https://mirror.tochlab.net/pub/gnu/libredwg/libredwg-${LIBREDWG_VERSION}.tar.xz" \
+    ; do \
+        echo "libredwg: пробую $url" \
+        && curl -fsSL --connect-timeout 20 --max-time 300 -o /tmp/libredwg.tar.xz "$url" && break \
+        || echo "libredwg: источник недоступен, следующий"; \
+    done \
+    && test -s /tmp/libredwg.tar.xz \
+    && echo "${LIBREDWG_SHA256}  /tmp/libredwg.tar.xz" | sha256sum -c - \
     && tar xf /tmp/libredwg.tar.xz -C /tmp \
     && cd "/tmp/libredwg-${LIBREDWG_VERSION}" \
     && ./configure --disable-bindings --disable-shared --disable-werror CFLAGS="-O2 -Wno-error" \
