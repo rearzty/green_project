@@ -152,3 +152,64 @@ class TestParallelRendering:
         result = render_layer_raster(layers, source_crs=None)
 
         assert {g.key for g in result.groups} == {"territory"}
+
+
+class TestFramingIgnoresStrays:
+    """Габарит подложки не должен задаваться кусками из чужой системы координат.
+
+    Живой отказ, ради которого это написано. На «2. Песчаный переулок» участок
+    472 x 861 м, а сырые координаты слоёв разложены на 47 x 49 км: 88 объектов
+    из 54 803 (0,16 %) лежат в 15-25 км — бандл склеивается конкатенацией, и
+    среди внешних ссылок попался файл в другой системе координат. Габарит
+    растягивался в сто раз, улица занимала 1 % ширины кадра, и подложка на
+    экране вырождалась в ровное серое поле. Пользователь это и увидел при
+    первой загрузке настоящей улицы.
+
+    `territory.territory_polygon()` от этого защищён кластеризацией с 15.09,
+    но растровая подложка считалась мимо неё — тот самый «известный, не тихий
+    пробел» веб-пути, записанный в CLAUDE.md.
+    """
+
+    def test_a_stray_layer_does_not_blow_up_the_canvas(self):
+        stray = Polygon([(20_000, 20_000), (20_000, 20_010), (20_010, 20_010), (20_010, 20_000)])
+        layers = [
+            _layer(kind="zone", object_type="territory", geometry=shape_to_db(TERRITORY)),
+            _layer(kind="zone", object_type="building", geometry=shape_to_db(BUILDING)),
+            _layer(kind="utility", object_type="gas_pipe", geometry=shape_to_db(stray)),
+        ]
+
+        result = render_layer_raster(layers, source_crs=None)
+
+        (south, west), (north, east) = result.bounds
+        assert east - west < 1_000, f"кадр растянут чужим куском: ширина {east - west:.0f}"
+        assert north - south < 1_000, f"кадр растянут чужим куском: высота {north - south:.0f}"
+
+    def test_the_stray_is_still_drawn_just_not_framing(self):
+        """Отброшенное из габарита продолжает рисоваться — терять объекты мы не
+        хотим, мы хотим перестать подгонять под них кадр."""
+        stray = Polygon([(20_000, 20_000), (20_000, 20_010), (20_010, 20_010), (20_010, 20_000)])
+        layers = [
+            _layer(kind="zone", object_type="territory", geometry=shape_to_db(TERRITORY)),
+            _layer(kind="utility", object_type="gas_pipe", geometry=shape_to_db(stray)),
+        ]
+
+        result = render_layer_raster(layers, source_crs=None)
+
+        assert {g.key for g in result.groups} == {"territory", "utility"}
+
+    def test_a_spread_out_but_contiguous_site_is_not_clipped(self):
+        """Обратная сторона: нормальный вытянутый участок обрезать нельзя.
+
+        Порог — MAX_PART_DISTANCE_RATIO диагоналей опоры, то есть он
+        масштабируется вместе с площадкой, а не задан в метрах.
+        """
+        far_but_related = Polygon([(120, 0), (120, 100), (220, 100), (220, 0)])
+        layers = [
+            _layer(kind="zone", object_type="territory", geometry=shape_to_db(TERRITORY)),
+            _layer(kind="zone", object_type="building", geometry=shape_to_db(far_but_related)),
+        ]
+
+        result = render_layer_raster(layers, source_crs=None)
+
+        (_, west), (_, east) = result.bounds
+        assert east - west >= 220, "соседний квартал того же проекта обрезать нельзя"

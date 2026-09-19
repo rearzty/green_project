@@ -48,6 +48,9 @@ from PIL import Image, ImageDraw
 from shapely.geometry.base import BaseGeometry
 
 from backend.app.services.geo_io import _transformer_to_wgs84, db_to_shape
+# То же правило, что защищает territory_polygon от файла бандла в чужой
+# системе координат — намеренно один источник, а не вторая копия числа.
+from geo_engine.territory import MAX_PART_DISTANCE_RATIO
 
 
 class _LayerLike(Protocol):
@@ -289,6 +292,52 @@ def _render_groups_parallel(
         return dict(future.result() for future in futures)
 
 
+def _framing_geometries(
+    entries: list[tuple[str, BaseGeometry]], candidates: list[BaseGeometry]
+) -> list[BaseGeometry]:
+    """Что задаёт габарит подложки — без кусков, уехавших в другую систему
+    координат.
+
+    Прежняя версия брала простой min/max по всем геометриям, и этого хватало
+    ровно до первой настоящей поставки. Живой замер на «2. Песчаный
+    переулок»: участок 472 x 861 м, а сырые координаты слоёв разложены на
+    **47 x 49 км**. Виноваты 88 объектов из 54 803 (0,16 %), лежащих в 15-25
+    км: они растягивают кадр в сто раз, улица занимает 1 % его ширины, и
+    подложка на экране вырождается в ровное серое поле. Пользователь это и
+    увидел при первой же загрузке настоящей улицы.
+
+    Причина у разлёта известная и уже описанная в CLAUDE.md: бандл
+    склеивается конкатенацией файлов, а среди внешних ссылок попадается файл
+    в ДРУГОЙ системе координат. `territory.territory_polygon()` от этого уже
+    защищён кластеризацией, но растровая подложка считалась мимо неё — тот
+    самый «известный, не тихий пробел» веб-пути.
+
+    Правило то же самое и намеренно то же: опора — самый крупный контур
+    участка, и всё, что дальше `MAX_PART_DISTANCE_RATIO` его диагоналей,
+    габарит не задаёт. Отброшенное продолжает рисоваться — просто обрезается
+    холстом, как и зонирование выше; терять объекты мы не хотим, мы хотим
+    перестать подгонять кадр под мусор.
+    """
+    territory = [geom for key, geom in entries if key == "territory" and not geom.is_empty]
+    pool = territory or [geom for geom in candidates if not geom.is_empty]
+    if not pool:
+        return candidates
+
+    # Опора — самый крупный контур: если в данных смешаны два объекта, больший
+    # почти наверняка и есть заказанный участок. У линейных слоёв площади нет,
+    # поэтому вторым ключом идёт длина.
+    anchor = max(pool, key=lambda g: (g.area, g.length))
+    minx, miny, maxx, maxy = anchor.bounds
+    diagonal = ((maxx - minx) ** 2 + (maxy - miny) ** 2) ** 0.5
+    if diagonal <= 0:
+        return candidates
+    limit = diagonal * MAX_PART_DISTANCE_RATIO
+
+    distances = shapely.distance(np.array(candidates, dtype=object), anchor)
+    kept = [geom for geom, gap in zip(candidates, distances) if gap <= limit]
+    return kept or candidates
+
+
 def render_layer_raster(layers: list[_LayerLike], source_crs: str | None) -> LayerRaster:
     if not layers:
         return LayerRaster(bounds=None, groups=[])
@@ -302,6 +351,7 @@ def render_layer_raster(layers: list[_LayerLike], source_crs: str | None) -> Lay
     bound_geoms = [geom for key, geom in entries if not key.startswith(_ZONING_PREFIX)]
     if not bound_geoms:
         bound_geoms = [geom for _, geom in entries]
+    bound_geoms = _framing_geometries(entries, bound_geoms)
     minx, miny, maxx, maxy = _bounds_of(bound_geoms)
 
     _, px_w, px_h, scale = _make_pixel_transform(minx, miny, maxx, maxy, _MAX_CANVAS_PX)
