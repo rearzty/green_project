@@ -100,7 +100,23 @@ def buildable_area(
     """
     if territory_margin_m > 0:
         territory = territory.buffer(-territory_margin_m)
-    hard_obstacles = [z.geometry for z in other_zones if z.zone_type in HARD_OBSTACLE_ZONE_TYPES]
+    # Only polygonal geometry can subtract area in the first place -- a
+    # building/road read as an unclosed LineString (real Мосгеотрест data,
+    # see CLAUDE.md) or a stray Point already contributes nothing to a
+    # difference against a polygon. Live crash on real data (17. Грузинская
+    # М ул): thousands of such LineStrings/Points mixed into this same list
+    # made `unary_union(hard_obstacles)` a heterogeneous GeometryCollection,
+    # and GEOS's overlay engine cannot always compute a result dimension for
+    # a mixed-dimension second operand of `difference()`
+    # ("AssertionFailedException: ... determine overlay result geometry
+    # dimension") -- dropping the zero-area geometries here is a no-op for
+    # the result and removes the crash at the source, rather than papering
+    # over it with a repair/retry on the union.
+    hard_obstacles = [
+        z.geometry
+        for z in other_zones
+        if z.zone_type in HARD_OBSTACLE_ZONE_TYPES and z.geometry.geom_type in ("Polygon", "MultiPolygon")
+    ]
     if exclusion_zone is not None and not exclusion_zone.is_empty:
         result = territory.difference(exclusion_zone)
     else:
