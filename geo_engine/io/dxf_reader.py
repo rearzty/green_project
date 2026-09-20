@@ -50,7 +50,9 @@ Kind = Literal["utility", "zone"]
 
 # layer name -> (kind, object_type). object_type must match a key in
 # planting_norms.yaml's setbacks_m for utilities, or a zone_type geo_engine
-# understands ("building", "road", "zoning", "existing_greenery", "territory").
+# understands ("building", "road", "zoning", "existing_greenery",
+# "existing_lawn", "territory"). "existing_lawn" is NOT a hard obstacle
+# (unlike "existing_greenery") -- see layer_rules.py's "гзн" rule docstring.
 # "territory" is the one zone_type pipeline_service._territory_polygon()
 # requires to find the overall site outline — must match across every
 # reader (see shp_geojson_reader / generate_synthetic_data.py).
