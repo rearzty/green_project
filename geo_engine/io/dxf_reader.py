@@ -33,9 +33,41 @@ from typing import Iterable, Iterator, Literal
 
 import ezdxf
 import ezdxf.recover
+import ezdxf.lldxf.encoding
 from shapely.geometry import LineString, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
+
+# Live bug, found on 3 of the pilot streets (Старый Гай, Берзарина,
+# Академика Понтрягина): a DWG's embedded material/plot-style metadata can
+# carry a raw byte that isn't valid in the file's stated encoding; ezdxf
+# decodes it with errors="surrogateescape", producing a lone UTF-16
+# surrogate character glued right up against whatever text follows. That
+# collides with ezdxf's own `\U+xxxx`-escape decoder
+# (ezdxf/lldxf/encoding.py): `decode_dxf_unicode()` splits on the strict
+# 4-hex-digit pattern and hands every *unmatched* leftover to `_decode()`
+# too, which still tries `chr(int(s[3:], 16))` on anything starting with the
+# literal `\U+` -- a truncated escape landing next to the corrupted
+# surrogate satisfies that `startswith` check with zero or garbage hex
+# digits after it, and `_decode` raises `ValueError` with no fallback of its
+# own. This is the *recovery* path (`ezdxf.recover`, meant to survive
+# exactly this kind of damage) failing on the same bug -- `read_document()`
+# below has nothing further to fall back to once this raises. Patched here,
+# not fixed upstream: leave an escape we can't decode as literal text
+# instead of aborting the whole file: that's the same "graceful degradation
+# over crash" this module already applies to a torn block or an unreadable
+# xref, just one call deeper.
+_original_decode_dxf_char = ezdxf.lldxf.encoding._decode
+
+
+def _decode_dxf_char_or_keep_literal(s: str) -> str:
+    try:
+        return _original_decode_dxf_char(s)
+    except ValueError:
+        return s
+
+
+ezdxf.lldxf.encoding._decode = _decode_dxf_char_or_keep_literal
 
 from geo_engine.io.geometry_cleanup import (
     is_origin_artifact,
