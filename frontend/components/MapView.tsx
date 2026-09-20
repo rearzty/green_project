@@ -561,6 +561,19 @@ const VIEWPORT_PADDING_RATIO = 0.5;
 // projection).
 const CLUSTER_CELL_PX = 56;
 
+// Below this many visible points, every one renders as a real marker, even
+// if several land in the same 56px cell -- grid clustering alone made a
+// hedge unreadable at any zoom short of "so close only a handful of shrubs
+// fit on screen at all", because adjacent hedge points sit ~0.5m apart and
+// 56 screen-px covers far more than 0.5m of ground at any normal zoom. The
+// count that actually needs collapsing into bubbles is hundreds of
+// thousands of items in view at once (a whole real territory zoomed out) --
+// not a few hundred/thousand, which is what a normal working view shows and
+// where every point being individually visible/selectable is the point.
+// Reuses the same order-of-magnitude as the old VirtualizedMarkers
+// threshold (MAX_VISIBLE_MARKERS) this component replaced.
+const MAX_UNCLUSTERED_VISIBLE_POINTS = 4000;
+
 function clusterCellSizeDeg(zoom: number): number {
   return (360 * CLUSTER_CELL_PX) / (256 * Math.pow(2, zoom));
 }
@@ -657,15 +670,28 @@ function ClusteredMarkers({
     const bounds = map.getBounds().pad(VIEWPORT_PADDING_RATIO);
     const cellDeg = clusterCellSizeDeg(map.getZoom());
 
-    // cellKey -> ids of every visible point that lands in that cell.
-    const buckets = new Map<string, string[]>();
+    const visibleIds: string[] = [];
     planIndex.forEach((item) => {
-      if (!item.isPoint || !bounds.contains([item.minLat, item.minLng])) return;
-      const key = `${Math.floor(item.minLat / cellDeg)}:${Math.floor(item.minLng / cellDeg)}`;
-      const bucket = buckets.get(key);
-      if (bucket) bucket.push(item.id);
-      else buckets.set(key, [item.id]);
+      if (item.isPoint && bounds.contains([item.minLat, item.minLng])) visibleIds.push(item.id);
     });
+
+    // cellKey -> ids of every visible point that lands in that cell. Below
+    // the threshold, every point gets its own one-item "cell" (its own id as
+    // the key) so nothing clusters regardless of how tightly packed it is on
+    // screen -- see MAX_UNCLUSTERED_VISIBLE_POINTS.
+    const buckets = new Map<string, string[]>();
+    if (visibleIds.length > MAX_UNCLUSTERED_VISIBLE_POINTS) {
+      for (const id of visibleIds) {
+        const item = planIndex.get(id);
+        if (!item) continue;
+        const key = `${Math.floor(item.minLat / cellDeg)}:${Math.floor(item.minLng / cellDeg)}`;
+        const bucket = buckets.get(key);
+        if (bucket) bucket.push(id);
+        else buckets.set(key, [id]);
+      }
+    } else {
+      for (const id of visibleIds) buckets.set(id, [id]);
+    }
 
     const nextSingles = new Set<string>();
     const nextClusters = new Map<string, string[]>();

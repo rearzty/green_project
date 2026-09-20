@@ -1,7 +1,11 @@
+import pytest
+from shapely.geometry import box
+
 from ml_scoring.heuristic_scorer import HeuristicScorer
 
 from geo_engine.buffers import build_exclusion_zone, buildable_area
 from geo_engine.candidates import generate_candidates
+from geo_engine.model import Zone
 from geo_engine.norms import load_norms
 from geo_engine.placement import greedy_select
 
@@ -39,6 +43,25 @@ def test_buildable_area_excludes_existing_greenery(synthetic_scene):
     buildable = buildable_area(territory, exclusion, zones)
 
     assert buildable.intersection(greenery).area < 1e-6
+
+
+def test_buildable_area_does_not_exclude_existing_lawn():
+    """existing_lawn (Заливки.dwg's "гзн" surface-fill code -- layer_rules.py)
+    is real ground cover, not a hard obstacle: a tree/shrub/lawn candidate is
+    allowed to land right on top of already-grassy ground, same as it's
+    allowed to land on newly-generated lawn (see CLAUDE.md's "Дерево/куст
+    поверх газона" section). Regression for the split from existing_greenery
+    -- before it, "гзн" layers fed the same hard-obstacle bucket as real
+    existing trees/shrubs.
+    """
+    territory = box(0, 0, 50, 50)
+    lawn = box(10, 10, 40, 40)
+    zones = [Zone(geometry=territory, zone_type="territory"), Zone(geometry=lawn, zone_type="existing_lawn")]
+
+    exclusion = build_exclusion_zone([], zones, "tree", NORMS)
+    buildable = buildable_area(territory, exclusion, zones)
+
+    assert buildable.intersection(lawn).area == pytest.approx(lawn.area)
 
 
 def test_exclusion_zone_grows_with_more_utilities(synthetic_scene):

@@ -74,6 +74,11 @@ _ZONE_COLORS = {
     # patterns) -- a lighter stone than road/building so it reads as related
     # hardscape without being mistaken for either.
     "sidewalk": "#a8a29e",
+    # Existing lawn (Заливки.dwg's "гзн" surface-fill code) -- deliberately a
+    # paler lime than existing_greenery's forest-green: this is real ground
+    # cover, not a hard obstacle (see layer_rules.py), and shouldn't read as
+    # the same "don't plant here" category on the map.
+    "existing_lawn": "#bef264",
 }
 _ZONING_CATEGORY_COLORS = {
     "residential": "#a78bfa",
@@ -89,6 +94,7 @@ _LAYER_TYPE_LABELS = {
     "existing_greenery": "Существующая зелень",
     "utility": "Инженерные сети",
     "sidewalk": "Тротуары",
+    "existing_lawn": "Существующий газон",
 }
 _ZONING_CATEGORY_LABELS = {
     "residential": "Зонирование: жилая",
@@ -337,7 +343,20 @@ def render_layer_raster(layers: list[_LayerLike], source_crs: str | None) -> Lay
         LayerRasterGroup(key=key, label=_group_label(key), color=_group_color(key), count=len(geoms), png=pngs[key])
         for key, geoms in by_group.items()
     ]
-    groups.sort(key=lambda g: g.label)
+    # Paint order, not just list order: MapView.tsx renders one <ImageOverlay>
+    # per group in this exact array order, and later ImageOverlays paint over
+    # earlier ones. Plain alphabetical-by-label sorting put "Территория"
+    # (blue solid fill over the whole work boundary) after "Здания" on real
+    # data -- the territory wash then painted OVER the building outlines,
+    # visually burying them under a uniform blue even though buildable_area()
+    # correctly excludes them from the actual generated plan underneath.
+    # Found live: a user screenshot showing a big blue rectangle with no
+    # visible buildings, right where the real "Проектное решение" reference
+    # plan shows two building footprints. Territory is a backdrop -- it must
+    # paint first (bottom), same idea as a basemap sitting under everything
+    # else -- everything else keeps its existing alphabetical order among
+    # itself, only territory's position is pinned.
+    groups.sort(key=lambda g: (g.key != "territory", g.label))
     return LayerRaster(bounds=bounds, groups=groups)
 
 

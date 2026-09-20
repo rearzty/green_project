@@ -102,8 +102,8 @@ class TestSurfaceFillLayers:
     @pytest.mark.parametrize(
         "layer, expected",
         [
-            ("_ГЗН-ГЗН", "existing_greenery"),
-            ("_ГЗН-АБ ПЧ", "existing_greenery"),  # частное правило гзн идёт раньше составного
+            ("_ГЗН-ГЗН", "existing_lawn"),
+            ("_ГЗН-АБ ПЧ", "existing_lawn"),  # частное правило гзн идёт раньше составного
             ("_АБ ПЧ-АБ ПЧ", "road"),
             ("_АБ ТР-АБ ПЧ (2 и более метров)", "road"),  # ПЧ выигрывает у ТР при обоих в имени
             ("_АБ ПЧ-АБ ТР", "road"),  # тот же шов, порядок токенов обратный
@@ -115,7 +115,7 @@ class TestSurfaceFillLayers:
             # СВОЕЙ, опознанной стороне — неопределённость только там, где
             # опознанного кода нет вовсе (см. тест ниже).
             ("_АБ ТР-Щ", "sidewalk"),
-            ("_ГЗН-Щ", "existing_greenery"),
+            ("_ГЗН-Щ", "existing_lawn"),
         ],
     )
     def test_fill_seam_layers_map_to_the_dominant_surface(self, layer, expected):
