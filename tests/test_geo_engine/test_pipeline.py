@@ -1,5 +1,6 @@
 import pytest
-from shapely.geometry import box
+from shapely import unary_union
+from shapely.geometry import LineString, Point, box
 
 from ml_scoring.heuristic_scorer import HeuristicScorer
 
@@ -62,6 +63,35 @@ def test_buildable_area_does_not_exclude_existing_lawn():
     buildable = buildable_area(territory, exclusion, zones)
 
     assert buildable.intersection(lawn).area == pytest.approx(lawn.area)
+
+
+def test_buildable_area_ignores_non_polygonal_hard_obstacles():
+    """Real Мосгеотрест data reads plenty of buildings/roads as bare
+    LineString (an unclosed footprint outline) or even a stray Point -- see
+    CLAUDE.md's "Здания на реальном чертеже -- не полигон". Either already
+    contributes zero area to a difference against a polygon, but mixing them
+    into `unary_union(hard_obstacles)` used to make that a heterogeneous
+    GeometryCollection -- and GEOS's overlay engine cannot always compute a
+    result dimension for that as `difference()`'s second operand. Live crash
+    on real data (17. Грузинская М ул, thousands of such LineStrings/Points):
+    "AssertionFailedException: ... determine overlay result geometry
+    dimension". Only Polygon/MultiPolygon obstacles should reach the union;
+    this must not crash, and must still subtract exactly the real building.
+    """
+    territory = box(0, 0, 10, 10)
+    real_building = box(2, 2, 4, 4)
+    unclosed_building_outline = LineString([(6, 6), (8, 6), (8, 8)])
+    stray_vertex = Point(5, 5)
+    zones = [
+        Zone(geometry=real_building, zone_type="building"),
+        Zone(geometry=unclosed_building_outline, zone_type="building"),
+        Zone(geometry=stray_vertex, zone_type="building"),
+    ]
+
+    buildable = buildable_area(territory, unary_union([]), zones)
+
+    assert buildable.intersection(real_building).area < 1e-9
+    assert abs(buildable.area - (territory.area - real_building.area)) < 1e-9
 
 
 def test_exclusion_zone_grows_with_more_utilities(synthetic_scene):
