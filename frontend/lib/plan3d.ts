@@ -58,6 +58,22 @@ export function makeProjector(refLon: number, refLat: number): Projector {
   };
 }
 
+/** Counterpart to makeProjector for an unverified project's CRS (see
+ * backend's geo_io.py::display_crs) -- there, `layers`/`plan`'s "lon/lat"
+ * are never real WGS84 degrees to begin with, just the drawing's own raw
+ * local metres passed straight through. Running those through the
+ * equirectangular approximation above would multiply them by a bogus
+ * cos(latitude) factor derived from numbers that were never a latitude --
+ * this just recenters on the reference point without any unit conversion,
+ * since they're already metres. */
+export function makeLocalProjector(refX: number, refY: number): Projector {
+  return {
+    project(x, y) {
+      return [x - refX, y - refY];
+    },
+  };
+}
+
 /** A polygon's outer ring plus any holes, in local meters. Mirrors
  * THREE.Shape's own outer/holes split so the renderer can build one
  * directly without re-deriving it. */
@@ -201,10 +217,14 @@ function extendBounds(bounds: Scene3DBounds, points: [number, number][]): void {
 export function buildScene3DData(
   layers: GeoJSONFeatureCollection | undefined,
   plan: GeoJSONFeatureCollection | undefined,
-  norms: PlantingNorms | undefined
+  norms: PlantingNorms | undefined,
+  // Defaults to true (the old, only behaviour) so any call site that hasn't
+  // been updated to pass the project's real crs_verified keeps working
+  // exactly as before -- see makeLocalProjector for what changes when false.
+  crsVerified = true
 ): Scene3DData {
   const [refLon, refLat] = pickReferenceLonLat(layers, plan);
-  const projector = makeProjector(refLon, refLat);
+  const projector = crsVerified ? makeProjector(refLon, refLat) : makeLocalProjector(refLon, refLat);
 
   const treeCanopyRadius = norms?.species_spacing?.tree_default?.canopy_radius_m ?? DEFAULT_TREE_CANOPY_RADIUS_M;
   const shrubCanopyRadius = norms?.species_spacing?.shrub_default?.canopy_radius_m ?? DEFAULT_SHRUB_CANOPY_RADIUS_M;

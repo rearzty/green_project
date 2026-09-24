@@ -9,7 +9,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile
 from backend.app.api.deps import ProjectDep, ProjectMetaDep
 from backend.app.schemas.geo import GeoJSONFeatureCollection
 from backend.app.schemas.project import LayersRasterGroupOut, LayersRasterOut, ProjectCreateResponse, ProjectOut
-from backend.app.services.geo_io import layers_to_feature_collection
+from backend.app.services.geo_io import display_crs, layers_to_feature_collection
 from backend.app.services.layer_raster import get_layer_raster
 from backend.app.services.project_service import UnsupportedFileTypeError, create_project_from_file
 
@@ -54,7 +54,7 @@ async def get_project_layers(project: ProjectDep) -> GeoJSONFeatureCollection:
     own lazy endpoint, fetched only by the 3D view (see ProjectOut's own
     docstring for why: on a real-scale project this is a genuinely slow,
     genuinely large response, and most sessions never open 3D at all)."""
-    return layers_to_feature_collection(project.layers, project.source_crs)
+    return layers_to_feature_collection(project.layers, display_crs(project))
 
 
 @router.get("/{project_id}/layers-raster", response_model=LayersRasterOut)

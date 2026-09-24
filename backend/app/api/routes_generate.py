@@ -10,7 +10,7 @@ from backend.app.api.deps import PlanDep, ProjectDep, get_project_or_404
 from backend.app.db.models import Plan
 from backend.app.schemas.plan import GenerateJobOut, GenerateJobStatus, GenerateRequest, PlanOut, PlanSummary
 from backend.app.services import generation_jobs
-from backend.app.services.geo_io import planting_items_to_feature_collection
+from backend.app.services.geo_io import display_crs, planting_items_to_feature_collection
 from backend.app.services.pipeline_service import CurrentPlanDeletionError, MissingTerritoryError, delete_plan, generate_plan
 from geo_engine.candidates import TooManyCandidatesError
 
@@ -28,7 +28,7 @@ def _to_plan_out(plan: Plan) -> PlanOut:
     return PlanOut(
         plan_id=plan.id,
         scoring_mode=plan.scoring_mode,
-        features=planting_items_to_feature_collection(plan.items, plan.project.source_crs),
+        features=planting_items_to_feature_collection(plan.items, display_crs(plan.project)),
     )
 
 
