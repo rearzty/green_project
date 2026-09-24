@@ -8,6 +8,7 @@ knowing about ml_scoring at all.
 
 from __future__ import annotations
 
+import math
 from typing import Callable
 
 from geo_engine.model import PlantingCandidate, PlantingItem
@@ -40,6 +41,25 @@ _MAX_CELLS_PER_FOOTPRINT = 64
 # threshold" the way two independently-random points can land -- switching
 # candidate generation to random scatter (candidates.py) is what surfaced it.
 _CANOPY_BUFFER_QUAD_SEGS = 32
+
+# quad_segs=32 alone still leaves a residual, uncompensated gap: the nearest
+# point on a `quad_segs=N`-approximated buffer's boundary sits at
+# `r*cos(pi/(4N))`, a hair inside the true circle of radius r. Two accepted
+# canopy buffers can therefore report "not intersecting" a sub-millimetre
+# distance under the real nominal spacing -- live on 13. Харьковский проезд
+# after the row/density fix let a single street's row grow into the
+# thousands of candidates: two "Берёза повислая" row trees landed 4.999 m
+# apart against a required 5.0 m, just past compliance.py's own 1 mm
+# tolerance. Same fix already applied to `planner._CLEARANCE_INFLATION` for
+# the identical reason (inter-phase clearance, not in-phase spacing) --
+# inflating the buffer radius by `1/cos(pi/(4*quad_segs))` guarantees the
+# buffer boundary is never closer than the true radius, so accepted
+# candidates are never closer than the real nominal spacing either. Only
+# widens the footprint used for THIS conflict check, not the geometry stored
+# on the accepted PlantingItem (that stays `candidate.geometry`, the bare
+# point) -- so this cannot change what gets exported, only which candidates
+# get accepted next to each other.
+_CANOPY_BUFFER_INFLATION = 1.0 / math.cos(math.pi / (4 * _CANOPY_BUFFER_QUAD_SEGS))
 
 
 def _cell_index(x: float, y: float, cell_size: float) -> tuple[int, int]:
@@ -88,7 +108,9 @@ def greedy_select(
     for candidate, score, rationale in scored:
         spacing = norms.spacing_for(candidate.planting_type)
         footprint = (
-            candidate.geometry.buffer(spacing.canopy_radius_m, quad_segs=_CANOPY_BUFFER_QUAD_SEGS)
+            candidate.geometry.buffer(
+                spacing.canopy_radius_m * _CANOPY_BUFFER_INFLATION, quad_segs=_CANOPY_BUFFER_QUAD_SEGS
+            )
             if candidate.geometry.geom_type == "Point"
             else candidate.geometry
         )
