@@ -14,7 +14,7 @@ from shapely.geometry import mapping
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform as shapely_transform
 
-from backend.app.db.models import Layer, PlantingItemRow
+from backend.app.db.models import Layer, PlantingItemRow, Project
 from backend.app.schemas.geo import GeoJSONFeature, GeoJSONFeatureCollection, GeoJSONGeometry
 from geo_engine.model import PlantingItem, Utility, Zone
 
@@ -70,6 +70,29 @@ def from_wgs84(geometry: BaseGeometry, source_crs: str | None) -> BaseGeometry:
     if not source_crs:
         return geometry
     return shapely_transform(_transformer_from_wgs84(source_crs).transform, geometry)
+
+
+def display_crs(project: Project) -> str | None:
+    """The CRS to actually reproject through for outgoing GeoJSON/bounds and
+    to reproject *back* from for incoming edits -- every _to_wgs84/from_wgs84
+    call site should pass this instead of reading `project.source_crs`
+    directly.
+
+    Only project.crs_verified (real evidence from the uploaded file's own
+    coordinates, see its docstring) earns a real reprojection; a caller-typed
+    guess -- even a plausible one, even the UI's own EPSG:32637 default --
+    does not, because that's exactly what produced the Kenya-map bug (a real
+    Mosgeotrest drawing's small local numbers reprojected through UTM 37N as
+    if they were real eastings/northings, landing the whole site near the
+    equator in Kenya -- see CLAUDE.md). Unverified projects get their raw
+    local-unit coordinates passed straight through instead, the same
+    passthrough _to_wgs84/from_wgs84 already do for source_crs=None -- the
+    frontend then renders them with Leaflet's CRS.Simple (plain Cartesian
+    units) instead of the real-world WGS84/Mercator CRS, and edits round-trip
+    through the same identity, so "WGS84" coordinates the frontend sends back
+    are actually just the untouched local numbers already.
+    """
+    return project.source_crs if project.crs_verified else None
 
 
 def layer_to_domain(layer: Layer) -> Utility | Zone:

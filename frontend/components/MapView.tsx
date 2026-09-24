@@ -558,7 +558,10 @@ const VIEWPORT_PADDING_RATIO = 0.5;
 // fine at this project's scale (a single street/district, a sliver of
 // latitude), same tolerance this codebase already accepts elsewhere for
 // non-geodesic math at small scale (see plan3d.ts's own equirectangular
-// projection).
+// projection). Under Leaflet's CRS.Simple (unverified projects, see
+// crsVerified below) "degrees" are really raw local metres and the
+// 256*2^zoom/360 constant above doesn't apply at all -- see
+// pixelsPerLatLngUnit for the CRS-aware version this actually calls.
 const CLUSTER_CELL_PX = 56;
 
 // Below this many visible points, every one renders as a real marker, even
@@ -574,8 +577,22 @@ const CLUSTER_CELL_PX = 56;
 // threshold (MAX_VISIBLE_MARKERS) this component replaced.
 const MAX_UNCLUSTERED_VISIBLE_POINTS = 4000;
 
-function clusterCellSizeDeg(zoom: number): number {
-  return (360 * CLUSTER_CELL_PX) / (256 * Math.pow(2, zoom));
+/** Screen pixels per one unit of `latlng` space at a given zoom -- degrees
+ * of longitude under the default WGS84/Mercator CRS (256*2^zoom pixels
+ * span 360°, exact for longitude, off by cos(latitude) for latitude, see
+ * this file's own note on CLUSTER_CELL_PX), or raw local metres directly
+ * under Leaflet's CRS.Simple (its own scale(zoom) is just 2^zoom, no
+ * 256/360 tile-based normalization -- see MapView's crs= prop). Getting
+ * this wrong for the CRS.Simple case wouldn't crash anything, just silently
+ * make every cluster cell far too small, so clustering would stop
+ * triggering exactly where it matters most (a whole territory zoomed out).
+ */
+function pixelsPerLatLngUnit(zoom: number, crsVerified: boolean): number {
+  return crsVerified ? (256 * Math.pow(2, zoom)) / 360 : Math.pow(2, zoom);
+}
+
+function clusterCellSizeDeg(zoom: number, crsVerified: boolean): number {
+  return CLUSTER_CELL_PX / pixelsPerLatLngUnit(zoom, crsVerified);
 }
 
 function clusterBubbleSizePx(count: number): number {
@@ -633,10 +650,12 @@ function ClusteredMarkers({
   planIndex,
   planRevision,
   registerLayer,
+  crsVerified,
 }: {
   planIndex?: PlanIndex;
   planRevision: number;
   registerLayer: (id: string, type: string, layer: Layer) => void;
+  crsVerified?: boolean;
 }) {
   const map = useMap();
   const groupRef = useRef<L.LayerGroup | null>(null);
@@ -668,7 +687,7 @@ function ClusteredMarkers({
     }
 
     const bounds = map.getBounds().pad(VIEWPORT_PADDING_RATIO);
-    const cellDeg = clusterCellSizeDeg(map.getZoom());
+    const cellDeg = clusterCellSizeDeg(map.getZoom(), crsVerified ?? true);
 
     const visibleIds: string[] = [];
     planIndex.forEach((item) => {
@@ -768,7 +787,7 @@ function ClusteredMarkers({
       marker.addTo(group);
       clusters.set(key, { marker, count: ids.length });
     });
-  }, [map, planIndex, registerLayer]);
+  }, [map, planIndex, registerLayer, crsVerified]);
 
   useEffect(() => {
     recompute();
@@ -805,10 +824,15 @@ export interface MapViewProps {
    * OpenStreetMap basemap under the plan -- see backend's
    * Project.crs_verified for exactly what "trustworthy" means here (auto-
    * detected from the uploaded file's own coordinates, never a typed-in
-   * guess). Undefined/false shows a neutral CAD-style grid instead, so an
-   * unverifiable CRS reads as "we don't know where this is" rather than
-   * quietly repeating the Kenya-map bug (see CLAUDE.md) with more
-   * confidence than the data actually earns. */
+   * guess, and never true for a DXF/DWG upload -- that format carries no
+   * CRS metadata at all). Undefined/false switches the whole map to
+   * Leaflet's CRS.Simple (see the crs= prop below) and shows a neutral
+   * CAD-style grid instead of OSM tiles: every coordinate `layersRaster`/
+   * `plan` carries is then raw local metres, not WGS84 degrees (see
+   * backend's geo_io.py::display_crs), because there's no known real-world
+   * placement to reproject them onto -- reprojecting a plausible-but-
+   * unverified CRS onto a real basemap is exactly what produced the
+   * Kenya-map bug (see CLAUDE.md). */
   crsVerified?: boolean;
   plan?: GeoJSONFeatureCollection;
   planIndex?: PlanIndex;
@@ -961,8 +985,29 @@ export default function MapView({
 
   return (
     <MapContainer
-      center={center}
-      zoom={zoom}
+      // Leaflet's Map object fixes its CRS at construction and never
+      // re-reads this prop -- keyed on crsVerified so switching between a
+      // verified and an unverified project (rare, but possible across two
+      // uploads in the same session) tears down and rebuilds the Leaflet
+      // instance instead of silently keeping the old, now-wrong CRS.
+      // Switching between two projects that share the same crsVerified
+      // value (by far the common case) doesn't remount anything.
+      key={crsVerified ? "geo" : "local"}
+      // A real drawing's coordinates are raw local metres, not WGS84 degrees
+      // (see backend's geo_io.py::display_crs) -- CRS.Simple treats them as
+      // plain Cartesian units (north stays up: its default transformation
+      // just flips pixel-y, same convention as any northing-increases-north
+      // survey drawing) instead of running them through Web Mercator, which
+      // is undefined outside real longitude/latitude ranges and is exactly
+      // what produced the Kenya-map bug for a plausible-but-unverified CRS.
+      crs={crsVerified ? undefined : L.CRS.Simple}
+      center={crsVerified ? center : [0, 0]}
+      zoom={crsVerified ? zoom : 0}
+      // CRS.Simple has no fixed real-world tile size to bottom out at --
+      // without a generously negative floor, FitBounds can't zoom out far
+      // enough to fit a territory bigger than one screen's worth of metres
+      // at zoom 0 (1 CRS unit = 1px there).
+      minZoom={crsVerified ? undefined : -20}
       // 19 is roughly where OSM's own tiles stop getting sharper; the plan
       // itself is vector (real markers, not tiles) and benefits from going
       // deeper than that -- planting_norms.yaml allows spacing as tight as
@@ -1011,7 +1056,9 @@ export default function MapView({
           onEachFeature={registerPlanFeature}
         />
       )}
-      {showPlan && <ClusteredMarkers planIndex={planIndex} planRevision={planRevision} registerLayer={registerLayer} />}
+      {showPlan && (
+        <ClusteredMarkers planIndex={planIndex} planRevision={planRevision} registerLayer={registerLayer} crsVerified={crsVerified} />
+      )}
       <SelectionController
         selectMode={selectMode}
         editsLocked={editsLocked}
