@@ -34,6 +34,7 @@ from typing import Iterable, Iterator, Literal
 import ezdxf
 import ezdxf.recover
 import ezdxf.lldxf.encoding
+import ezdxf.entities.mtext
 from shapely.geometry import LineString, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
@@ -69,11 +70,31 @@ def _decode_dxf_char_or_keep_literal(s: str) -> str:
 
 ezdxf.lldxf.encoding._decode = _decode_dxf_char_or_keep_literal
 
+# Live bug, found on 13. Харьковский проезд (the separately-supplied
+# electrical drawing, `ЭС_Харьковский проезд.dwg`): the same class of
+# embedded-metadata corruption that motivates the `\U+` patch above can also
+# desync a downstream MTEXT entity's XDATA-encoded column-layout group codes
+# (`ACAD_MTEXT_COLUMN_INFO`, group code 75 inside a 1070-tagged xdata stream)
+# far enough that `ColumnType(value)` gets handed a value no member matches
+# -- 1434 seen live. `enum.IntEnum` has no fallback of its own here, and this
+# is Python enum construction during entity loading, not DXF group-code
+# tokenizing -- `ezdxf.recover`'s own per-tag resilience (the thing
+# `read_document()` below falls back to) does not reach this far, so the
+# `ValueError` aborts the whole file in both readfile and recover modes.
+# MTEXT's multi-column layout is a cosmetic text-formatting detail this
+# project's pipeline never reads (only geometry is extracted for
+# utilities/zones), so an unrecognised column type is safe to treat as "no
+# special column layout" (`NONE`) instead of letting it abort the file.
+ezdxf.entities.mtext.ColumnType._missing_ = classmethod(lambda cls, value: cls.NONE)
+
 from geo_engine.io.geometry_cleanup import (
+    DEFAULT_DANGLE_BUFFER_M,
+    DEFAULT_SNAP_GRID_M,
     is_origin_artifact,
     merge_dashed_lines,
     origin_is_artifact,
     reconstruct_closed_footprints,
+    reconstruct_closed_road_polygons,
 )
 from geo_engine.io.layer_rules import classify_layer, is_symbol_layer
 from geo_engine.model import Utility, Zone
@@ -145,12 +166,17 @@ MOSGEOTREST_LAYER_MAP: LayerMap = {
     # street's file only has fragments on it and the real outline is
     # elsewhere. A fourth spelling ("ДВ_ГП_П_Граница работ") confirmed live on
     # "1. Олимпийская деревня"'s ссылки/10000176_Границы работ_Олимп.dwg — a
-    # different source/drafter for that street, same role. Expect more
-    # spellings across the other 18 streets; this list is not claimed complete.
+    # different source/drafter for that street, same role. A fifth
+    # ("Граница проектирования") confirmed live on "7. Нижние Поля ул" —
+    # same fragment-only pattern as the others there (one 2-vertex open
+    # LWPOLYLINE on the main drawing), real outline still elsewhere in that
+    # street's bundle. Expect more spellings across the other streets; this
+    # list is not claimed complete.
     "!Граница работ": ("zone", "territory"),
     "!!!_1. ГРАНИЦА РАБОТ": ("zone", "territory"),
     "_ГП_граница работ": ("zone", "territory"),
     "ДВ_ГП_П_Граница работ": ("zone", "territory"),
+    "Граница проектирования": ("zone", "territory"),
     "Леса и газоны": ("zone", "existing_greenery"),
     "Полоса деревьев": ("zone", "existing_greenery"),
     "Отдельно стоящее дерево": ("zone", "existing_greenery"),
@@ -232,6 +258,20 @@ _MAX_BLOCK_DEPTH = 8
 # 1833 m perimeter. 5 cm is two orders above that and far below any gap someone
 # left on purpose. Guarded by a vertex count so a stray 3-point line whose ends
 # happen to land near each other stays a line.
+#
+# A second live case (12. Наташинский пр-д, a road-corridor work boundary --
+# two rings of 649 and 554 vertices) gaps by 5.0 and 22.9 cm and turned out to
+# need more than a bigger number here anyway: `Polygon(points)` on both is
+# *invalid* even once closed (a long hand-drafted ring is more likely to
+# self-touch by a hair right at its own seam than a simple rectangle is), and
+# this function deliberately does not force a repair on an invalid ring --
+# see `test_a_self_touching_near_closed_ring_is_left_as_a_line`, a real
+# design choice, not an oversight: a silently "fixed" shape nobody checked is
+# worse than a clean fallback to a line. The actual fix for that class of gap
+# is `reconstruct_closed_footprints()` (already used for buildings) extended
+# to `zone_type="territory"` -- it closes rings by noding/snapping the whole
+# line network, which handles a self-touching seam correctly (splits it into
+# proper simple rings) instead of patching an already-invalid Polygon.
 _POLYLINE_CLOSE_TOLERANCE_M = 0.05
 _POLYLINE_CLOSE_MIN_POINTS = 4
 
@@ -247,6 +287,22 @@ def _entity_to_geometry(entity) -> BaseGeometry | None:
     if dxftype == "LINE":
         start, end = entity.dxf.start, entity.dxf.end
         return LineString([(start.x, start.y), (end.x, end.y)])
+
+    if dxftype == "ARC":
+        # Живая находка на «2. Песчаный переулок»: радиусный борт на
+        # повороте/перекрёстке (легенда: «радиусный бортовой камень ...
+        # внутренний/внешний») бюро рисует отдельными сущностями ARC, не
+        # бульжем внутри LWPOLYLINE -- до этой ветки такая дуга была вообще
+        # без геометрии (падала в финальный return None), независимо от
+        # того, распознан слой или нет. Та же аппроксимация (0.2 м sagitta),
+        # что уже принята для HATCH-дуг в _boundary_path_points -- это
+        # питает буфер отступа/препятствие, не съёмку, которой нужна точность
+        # до миллиметра.
+        tool = entity.construction_tool()
+        points = [(p.x, p.y) for p in tool.flattening(0.2)]
+        if len(points) < 2:
+            return None
+        return LineString(points)
 
     if dxftype in ("LWPOLYLINE", "POLYLINE"):
         points = [(p[0], p[1]) for p in entity.get_points()] if dxftype == "LWPOLYLINE" else [
@@ -790,6 +846,15 @@ def read_dxf_bundle(
 
     if stitch_dashes:
         utilities = stitch_utility_lines(utilities)
+    if reconstruct_footprints:
+        # Тот же приём, что уже применяется для stitch_dashes выше: то, что
+        # действительно кроссфайловое, не может быть сделано внутри
+        # per-file read_dxf() (тот видит только один файл бандла за раз).
+        # `read_dxf()`'s собственный вызов _add_closed_road_polygons() уже
+        # замкнул петли борта, целиком лежащие в одном xref-файле съёмки —
+        # этот проход по объединённому списку зон дополнительно замыкает
+        # петли, разрезанные по границе файлов (см. функции докстринг).
+        zones = _add_closed_road_polygons(zones)
     return utilities, zones
 
 
@@ -817,13 +882,116 @@ def resolve_layer(layer: str, layer_map: LayerMap, use_rules: bool = True) -> tu
 
 # Zone types reconstructed from line soup into closed polygons when
 # `reconstruct_footprints=True` — see geometry_cleanup.reconstruct_closed_footprints
-# for why this is necessary at all. Building only for now: it's the one
-# checked live on the pilot data (real "Здания" layer, 0/409 LWPOLYLINE
-# entities closed) and the one with a real correctness consequence
-# (buildable_area's hard-obstacle subtraction is a no-op on a LineString).
-# "road" stays a deliberate line (the kerb, not the carriageway — see
+# for why this is necessary at all. Keyed by zone_type -> (snap_grid_m,
+# dangle_buffer_m), not a flat list, because the two live cases need
+# different values for BOTH:
+#
+# * snap grid: a building footprint's drafted gaps are metres (checked live
+#   on the pilot data, real "Здания" layer, 0/409 LWPOLYLINE entities closed;
+#   DEFAULT_SNAP_GRID_M's 5 cm is already generous there), but a long
+#   hand-drafted work-area boundary (hundreds of vertices tracing a real road
+#   corridor — 12. Наташинский пр-д) gaps by up to 23 cm at its own closing
+#   seam, and is invalid as a naive closed Polygon even once that gap is
+#   bridged (self-touches itself by a hair right at the seam — the same
+#   class of ring `_entity_to_geometry`'s own close-tolerance deliberately
+#   does not force-repair, see `_POLYLINE_CLOSE_TOLERANCE_M`'s comment).
+#   A second, wider live gap moved this again: «1. Олимпийская деревня»'s
+#   own outer "Границы работ" is drawn as two separate open polylines meant
+#   to close against EACH OTHER, not each against itself — one endpoint
+#   pair is 6 cm apart, the other 1.09 m, past what 0.3 m bridges. Widening
+#   further is not simply "safer the bigger" — measured directly (see
+#   worklog): `shapely.set_precision()`'s grid snap is position-dependent,
+#   not a clean "any grid >= the gap works" — scanning 1.1-6.0 m in 0.1 m
+#   steps found the correct 9-piece result (8 known small rings + this one
+#   big outer one, nothing spuriously split) at exactly 2.0 m, with several
+#   nearby values (2.1, 3.0, 3.2...) failing to close it at all and several
+#   larger ones introducing NEW spurious splits elsewhere on the same
+#   network. 2.0 m is therefore not a "round up for safety margin" choice —
+#   it is the measured value that actually reproduces the real boundary
+#   without side effects, same empirical spirit as every other constant in
+#   this function's docstring.
+# * dangle buffer: for a building, a fragment that can't be closed at all is
+#   still kept as a thin buffered sliver — an imperfect obstacle beats a
+#   vanished one (see reconstruct_closed_footprints' own docstring). For
+#   territory that trade reverses: a thin sliver silently standing in for
+#   "the whole legal work area" is worse than the loud MissingTerritoryError
+#   a genuinely absent boundary should raise (live case, 7. Нижние Поля ул:
+#   the only candidate on the mapped layer is an isolated 9.4 m stub with no
+#   partner anywhere in the bundle — buffering it would manufacture a ~6 m²
+#   "territory" out of a street that in truth has none in this input at
+#   all). `dangle_buffer_m=0.0` makes every unclosable leftover buffer to an
+#   empty geometry (`leftover.buffer(0)`) and contribute nothing, so only
+#   genuinely closed rings count.
+#
+# Both have a real correctness consequence if left as lines: `buildable_area`'s
+# hard-obstacle subtraction is a no-op on a LineString, and territory_polygon
+# either misses a real work area entirely or silently keeps only whatever
+# small fragments elsewhere on the layer happen to already close on their
+# own. "road" stays a deliberate line (the kerb, not the carriageway — see
 # MOSGEOTREST_LAYER_MAP's "Бортовой камень" comment), so it is not in here.
-RECONSTRUCT_FOOTPRINT_ZONE_TYPES = ("building",)
+#
+# "existing_greenery" joined the same list for the same reason as
+# "building", not "territory": the real-data finding (4. Харьковская улица)
+# was that "Полоса деревьев"/"Леса и газоны" arrive as boundary LineStrings
+# around a green area (92% of the layer's objects on that street), not
+# filled polygons — the map rendered them as a scatter of thin lines/dots
+# instead of a filled patch, and `buildable_area` was silently not
+# subtracting them at all (a LineString has zero area to subtract). It's
+# also a hard obstacle in the exact same sense as a building (real existing
+# vegetation, not a soft scoring factor — see buffers.HARD_OBSTACLE_ZONE_TYPES),
+# so the same building-style tradeoff applies: an imperfectly-closed
+# dangle-buffered sliver is still a real (if approximate) obstacle, and
+# safer than one that silently vanishes because reconstruct_closed_footprints
+# couldn't fully close a hand-drafted line into a valid ring —
+# `dangle_buffer_m=DEFAULT_DANGLE_BUFFER_M` (not territory's 0.0).
+RECONSTRUCT_FOOTPRINT_ZONE_TYPES: dict[str, tuple[float, float]] = {
+    "building": (DEFAULT_SNAP_GRID_M, DEFAULT_DANGLE_BUFFER_M),
+    "territory": (2.0, 0.0),
+    "existing_greenery": (DEFAULT_SNAP_GRID_M, DEFAULT_DANGLE_BUFFER_M),
+}
+
+ADDITIVE_ROAD_POLYGON_ZONE_TYPES = ("road", "sidewalk")
+
+
+def _add_closed_road_polygons(zones: list[Zone]) -> list[Zone]:
+    """Живая находка на «2. Песчаный переулок»: road/sidewalk уже в
+    buffers.HARD_OBSTACLE_ZONE_TYPES, но это был no-op с самого начала
+    проекта -- ни у того, ни у другого никогда не было Polygon-геометрии
+    для фильтра. В отличие от building/territory/existing_greenery выше,
+    здесь линии НЕЛЬЗЯ заменить реконструкцией целиком: у бортовой линии
+    есть законные незамкнутые концы (дорога продолжается за границей
+    съёмки), и буферизовать их в тонкий срез было бы неверно -- уже
+    работающий путь линия+отступ корректно защищает именно эти участки.
+    Поэтому это отдельный, аддитивный шаг: существующие zone (линии) не
+    трогает, только добавляет новые Polygon-зоны там, где сеть борта
+    реально замкнулась в контур. `reconstruct_closed_road_polygons()`
+    тихо отбрасывает всё незамкнутое вместо буферизации в срез -- см. её
+    докстринг.
+
+    Вызывается дважды, не один раз: изнутри `read_dxf()` (замыкает петли
+    борта, целиком лежащие в одном файле) и ещё раз изнутри
+    `read_dxf_bundle()` на уже объединённом списке зон всех файлов пачки
+    (замыкает петли, разрезанные по границе файлов съёмки). Дублирования
+    не возникает: то, что уже замкнулось на первом проходе, стало
+    Polygon и не попадает в `targeted` фильтр по `geom_type` второго
+    прохода -- обрабатываются только оставшиеся LineString/
+    MultiLineString. Живой результат на Песчаном: 23 полигона (4583 м²)
+    только внутрифайловым проходом -> 49 полигонов (8460 м²) после
+    добавления прохода на объединённом бандле -- почти половина реальных
+    петель борта разрезана по границам xref-файлов съёмки.
+    """
+    for road_type in ADDITIVE_ROAD_POLYGON_ZONE_TYPES:
+        targeted = [
+            z for z in zones
+            if z.zone_type == road_type and z.geometry.geom_type in ("LineString", "MultiLineString")
+        ]
+        if not targeted:
+            continue
+        extra_polygons = reconstruct_closed_road_polygons([z.geometry for z in targeted])
+        if extra_polygons:
+            layer_note = targeted[0].attrs or {}
+            zones.extend(Zone(geometry=g, zone_type=road_type, attrs=layer_note) for g in extra_polygons)
+    return zones
 
 
 def read_dxf(
@@ -879,14 +1047,29 @@ def read_dxf(
         # unrelated road-edge lines into one polygonize() call would let GEOS
         # node them together at any incidental shared point and merge two
         # unrelated objects into one bogus ring.
-        for footprint_type in RECONSTRUCT_FOOTPRINT_ZONE_TYPES:
+        for footprint_type, (snap_grid_m, dangle_buffer_m) in RECONSTRUCT_FOOTPRINT_ZONE_TYPES.items():
             targeted = [z for z in zones if z.zone_type == footprint_type]
             if not targeted:
                 continue
             rest = [z for z in zones if z.zone_type != footprint_type]
-            rebuilt = reconstruct_closed_footprints([z.geometry for z in targeted])
-            layer_note = targeted[0].attrs or {}
-            zones = rest + [Zone(geometry=g, zone_type=footprint_type, attrs=layer_note) for g in rebuilt]
+            # Point geometry -- existing_greenery's individual tree markers
+            # ("Отдельно стоящее дерево") are the live case -- has nothing to
+            # close into a ring and isn't line-soup either;
+            # reconstruct_closed_footprints() has no branch for it and would
+            # silently drop it if handed in, which for a real existing tree is
+            # a correctness regression (a new candidate could then legally
+            # land right on top of it), not just a cosmetic loss. Passed
+            # through untouched instead, same as before reconstruction
+            # existed for this zone_type at all.
+            points = [z for z in targeted if z.geometry.geom_type == "Point"]
+            linelike = [z for z in targeted if z.geometry.geom_type != "Point"]
+            rebuilt = reconstruct_closed_footprints(
+                [z.geometry for z in linelike], dangle_buffer_m=dangle_buffer_m, snap_grid_m=snap_grid_m
+            )
+            layer_note = (linelike[0].attrs if linelike else points[0].attrs) or {}
+            zones = rest + points + [Zone(geometry=g, zone_type=footprint_type, attrs=layer_note) for g in rebuilt]
+
+        zones = _add_closed_road_polygons(zones)
 
     if drop_origin:
         # One decision over the whole extraction, then a per-object predicate:

@@ -65,6 +65,27 @@ def test_buildable_area_does_not_exclude_existing_lawn():
     assert buildable.intersection(lawn).area == pytest.approx(lawn.area)
 
 
+def test_buildable_area_excludes_a_real_sidewalk_polygon():
+    """sidewalk joined HARD_OBSTACLE_ZONE_TYPES (buffers.py) once real Polygon
+    geometry for it existed to subtract at all -- live case, 4. Харьковская
+    улица: "ДВ_ПП_ДО_ТипN_..." pavement-repair-scope layers (layer_rules.py)
+    give real sidewalk-surface polygons, and a wide sidewalk's own setback
+    (0.7 m from its edge) isn't enough on its own to keep a candidate off a
+    2m+ wide paved path -- same reasoning as building/road/existing_greenery
+    here. Historically this was a no-op (sidewalk was always a LineString,
+    silently skipped by the Polygon-only filter); this is the regression for
+    what happens now that it isn't always one.
+    """
+    territory = box(0, 0, 50, 50)
+    sidewalk = box(10, 10, 15, 40)  # a real, wide paved path, not a bare edge line
+    zones = [Zone(geometry=territory, zone_type="territory"), Zone(geometry=sidewalk, zone_type="sidewalk")]
+
+    exclusion = build_exclusion_zone([], zones, "tree", NORMS)
+    buildable = buildable_area(territory, exclusion, zones)
+
+    assert buildable.intersection(sidewalk).area < 1e-6
+
+
 def test_buildable_area_ignores_non_polygonal_hard_obstacles():
     """Real Мосгеотрест data reads plenty of buildings/roads as bare
     LineString (an unclosed footprint outline) or even a stray Point -- see

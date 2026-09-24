@@ -283,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"     сетей: {sum(by_type.values())} ({', '.join(f'{k}: {v}' for k, v in by_type.most_common())})")
 
         try:
-            territory = territory_polygon(zones)
+            territory = territory_polygon(zones, utilities)
         except MissingTerritoryError as error:
             raise SystemExit(f"\nОШИБКА: {error}") from error
         print(f"2/5 Граница участка: {territory.geom_type}, площадь {territory.area:,.0f} м²".replace(",", " "))

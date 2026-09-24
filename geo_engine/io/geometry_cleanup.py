@@ -468,3 +468,56 @@ def reconstruct_closed_footprints(
             polygons.append(buffered)
 
     return polygons
+
+
+DEFAULT_ROAD_POLYGON_SNAP_GRID_M = 0.1
+
+
+def reconstruct_closed_road_polygons(
+    geometries: list[BaseGeometry],
+    snap_grid_m: float = DEFAULT_ROAD_POLYGON_SNAP_GRID_M,
+) -> list[Polygon]:
+    """Curb-line loops that close into a real road/sidewalk surface polygon.
+
+    Deliberately a *different*, additive function rather than another call
+    to `reconstruct_closed_footprints()` above, because a curb network's
+    open ends are not the same kind of failure as a building's: a building
+    outline that doesn't close is a data gap (the drafter's lines really do
+    trace a closed shape, just not quite meeting), so a thin dangle-buffer
+    sliver is the safe fallback. A curb network's open ends are frequently
+    *real* — the road legitimately continues past the edge of the surveyed
+    territory — and there is no "0.3 m buffered sliver" that means anything
+    for that case; the existing line-plus-setback-buffer path already
+    handles it correctly today. So this function only ever returns the
+    genuinely CLOSED loops and silently drops every dangle/cut/invalid
+    leftover -- callers add these polygons alongside the original line
+    zones (never replacing them), the same way `buffers.HARD_OBSTACLE_ZONE_TYPES`
+    already treats `"road"`/`"sidewalk"` -- it has always included both, it
+    is just that neither ever had Polygon geometry to act on before this.
+
+    Live motivation, "2. Песчаный переулок": before the ARC-entity gap in
+    `dxf_reader._entity_to_geometry()` was fixed (radius curb segments at
+    corners/junctions had no geometry branch at all), retrying this same
+    `polygonize_full` idea on a different street's curb network produced
+    only 7 closed shapes out of ~10 700 leftover fragments -- because every
+    single corner was an unbridgeable gap where the connecting arc was
+    invisible. With that gap fixed, the same idea on this street's now-
+    complete curb network closes into 49 real road-surface polygons
+    (~8460 m^2, scanned 0.0-1.0 m for the least fragmentation/most closure,
+    same non-monotonic-snap caution as territory's own snap grid -- 0.1 m
+    was the smallest grid that already reached the plateau).
+    """
+    lines: list[LineString] = []
+    for geometry in geometries:
+        if geometry is None or geometry.is_empty:
+            continue
+        if geometry.geom_type in ("LineString", "MultiLineString"):
+            lines.extend(_flatten_lines(geometry))
+
+    if not lines:
+        return []
+
+    if snap_grid_m > 0:
+        lines = [shapely.set_precision(line, snap_grid_m) for line in lines]
+    closed, _cuts, _dangles, _invalid = polygonize_full(unary_union(lines))
+    return [g for g in closed.geoms if not g.is_empty]

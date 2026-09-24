@@ -75,7 +75,18 @@ def build_exclusion_zone(
     return unary_union(buffered)
 
 
-HARD_OBSTACLE_ZONE_TYPES = ("building", "road", "existing_greenery")
+# "sidewalk" joined this list once real Polygon geometry for it existed to
+# subtract at all -- historically the layer was always a LineString (a
+# pedestrian-path *edge*, same shape as road's kerb), so the hard-obstacle
+# filter below (Polygon/MultiPolygon only) silently skipped it and only the
+# setback buffer (0.7/0.5/0.0 m) applied. Live case, 4. Харьковская улица:
+# "ДВ_ПП_ДО_ТипN_..." pavement-repair-scope layers (see layer_rules.py)
+# include real sidewalk-surface polygons -- a candidate sitting 1m from one
+# edge of a 2m+ wide sidewalk is still standing on paved sidewalk, not just
+# too close to its edge, and the setback alone can't express that (same
+# reasoning as road/building here). Adding it here is a pure no-op for any
+# project where sidewalk is still only ever a line, like before.
+HARD_OBSTACLE_ZONE_TYPES = ("building", "road", "existing_greenery", "sidewalk")
 
 
 def buildable_area(

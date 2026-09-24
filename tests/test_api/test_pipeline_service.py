@@ -153,6 +153,53 @@ class TestTerritoryPolygon:
         with pytest.raises(MissingTerritoryError):
             territory_polygon(zones)
 
+    def test_a_zone_fully_inside_another_is_cut_out_as_a_hole_not_unioned(self):
+        """Живая находка, «1. Олимпийская деревня»: тот же слой «Границы
+        работ» несёт и широкую внешнюю границу, и несколько отдельно
+        нарисованных, гораздо более мелких колец, каждое на 100% внутри
+        внешнего — это исключаемые из работы куски (сверено с пользователем
+        напрямую по чертежу), а не дополнительная площадь. Обычное
+        объединение здесь no-op (маленькое кольцо не высовывается за
+        границы большого), поэтому нужно явное вычитание, а не просто
+        unary_union."""
+        from shapely.geometry import Polygon
+
+        from backend.app.services.pipeline_service import territory_polygon
+        from geo_engine.model import Zone
+
+        outer = Polygon([(0, 0), (100, 0), (100, 100), (0, 100)])
+        hole = Polygon([(20, 20), (40, 20), (40, 40), (20, 40)])
+        zones = [Zone(geometry=outer, zone_type="territory"), Zone(geometry=hole, zone_type="territory")]
+
+        territory = territory_polygon(zones)
+
+        assert territory.area == pytest.approx(outer.area - hole.area)
+        assert territory.intersection(hole).area == pytest.approx(0.0, abs=1e-9)
+
+    def test_an_island_inside_a_hole_is_added_back(self):
+        """Дыра внутри дыры -- островок посередине исключённого куска,
+        который сам всё же входит в объём работ. Тот же класс геометрии,
+        что у полигона с отверстиями и островами в ГИС в целом, не
+        специальный случай под одну улицу."""
+        from shapely.geometry import Polygon
+
+        from backend.app.services.pipeline_service import territory_polygon
+        from geo_engine.model import Zone
+
+        outer = Polygon([(0, 0), (100, 0), (100, 100), (0, 100)])
+        hole = Polygon([(20, 20), (60, 20), (60, 60), (20, 60)])
+        island = Polygon([(30, 30), (40, 30), (40, 40), (30, 40)])
+        zones = [
+            Zone(geometry=outer, zone_type="territory"),
+            Zone(geometry=hole, zone_type="territory"),
+            Zone(geometry=island, zone_type="territory"),
+        ]
+
+        territory = territory_polygon(zones)
+
+        assert territory.area == pytest.approx(outer.area - hole.area + island.area)
+        assert territory.intersection(island).area == pytest.approx(island.area)
+
 
 class TestTerritoryClustering:
     """Отбрасывание контуров, которые участку не принадлежат.
@@ -220,3 +267,57 @@ class TestTerritoryClustering:
         territory = territory_polygon(zones)
 
         assert territory.area == pytest.approx(real_site.area)
+
+    def test_a_distant_contour_is_kept_if_real_infrastructure_surrounds_it(self):
+        """13. Харьковский проезд: один заказ на съёмку («output[1-6]_...»,
+        шесть блоков) честно распадается на два кластера ~4.5 км друг от
+        друга — то же расстояние, что и у настоящего мусора в
+        test_a_contour_kilometres_away_is_dropped, так что дистанция одна
+        здесь не разделяющий признак. Разделяет то, что рядом: у мусорного
+        куска на 4. Харьковской в радиусе 100м — 0 сетей; у обоих кластеров
+        харьковского проезда — 12+ сетей и тысячи зон.
+        """
+        from shapely.geometry import LineString, Polygon
+
+        from geo_engine.territory import territory_polygon
+        from geo_engine.model import Utility, Zone
+
+        site = Polygon([(0, 0), (200, 0), (200, 200), (0, 200)])
+        far_site = Polygon([(5000, 0), (5100, 0), (5100, 100), (5000, 100)])
+        zones = [
+            Zone(geometry=site, zone_type="territory"),
+            Zone(geometry=far_site, zone_type="territory"),
+        ]
+        # Enough utilities near far_site to look like real infrastructure,
+        # not a stray CRS artifact -- mirrors the live count (12-178 utilities)
+        # seen on the genuinely-real far cluster, well above the 0 seen on
+        # the actually-bogus one.
+        utilities = [Utility(geometry=LineString([(5000 + i, 10), (5000 + i, 90)]), object_type="cable_line") for i in range(6)]
+
+        territory = territory_polygon(zones, utilities)
+
+        assert territory.area == pytest.approx(site.area + far_site.area)
+
+    def test_a_distant_contour_with_no_nearby_infrastructure_is_still_dropped(self):
+        """Same distance as the rescue case above, but nothing real nearby --
+        the Измайловская-shaped bug this clustering exists to catch in the
+        first place. Utilities existing elsewhere in the bundle must not
+        rescue a piece they are nowhere near.
+        """
+        from shapely.geometry import LineString, Polygon
+
+        from geo_engine.territory import territory_polygon
+        from geo_engine.model import Utility, Zone
+
+        site = Polygon([(0, 0), (200, 0), (200, 200), (0, 200)])
+        far_site = Polygon([(5000, 0), (5100, 0), (5100, 100), (5000, 100)])
+        zones = [
+            Zone(geometry=site, zone_type="territory"),
+            Zone(geometry=far_site, zone_type="territory"),
+        ]
+        utilities = [Utility(geometry=LineString([(10, 10), (190, 190)]), object_type="cable_line")]
+
+        territory = territory_polygon(zones, utilities)
+
+        assert territory.geom_type == "Polygon"
+        assert territory.area == pytest.approx(site.area)

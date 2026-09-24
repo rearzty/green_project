@@ -14,12 +14,19 @@ that looked fine in the DXF but was never actually usable by the pipeline:
   `geometry_cleanup.reconstruct_closed_footprints` for the isolated unit
   tests on the reconstruction logic itself; the tests here exercise the
   `read_dxf(reconstruct_footprints=True)` wiring end to end.
+
+A third, independent finding from "2. Песчаный переулок": standalone ARC
+entities (curb radius segments at corners/junctions, drawn as their own
+entity rather than a bulge inside a polyline -- confirmed live: 197 of them
+on that street's real curb layers) had no branch in `_entity_to_geometry` at
+all and fell straight to `None`, same silent-vanishing failure mode as the
+HATCH gap above but for a different entity type.
 """
 
 import ezdxf
 import pytest
 
-from geo_engine.io.dxf_reader import MOSGEOTREST_LAYER_MAP, read_dxf
+from geo_engine.io.dxf_reader import MOSGEOTREST_LAYER_MAP, _entity_to_geometry, read_dxf
 
 BUILDING_LAYER = "Здания"
 
@@ -89,6 +96,50 @@ class TestHatchGeometry:
         assert buildings[0].geometry.area == pytest.approx(300.0)
 
 
+class TestArcGeometry:
+    def test_a_standalone_arc_becomes_a_flattened_linestring(self):
+        doc = ezdxf.new()
+        msp = doc.modelspace()
+        arc = msp.add_arc(center=(0, 0), radius=10, start_angle=0, end_angle=90, dxfattribs={"layer": "x"})
+
+        geometry = _entity_to_geometry(arc)
+
+        assert geometry is not None
+        assert geometry.geom_type == "LineString"
+        coords = list(geometry.coords)
+        assert coords[0] == pytest.approx((10.0, 0.0))
+        assert coords[-1] == pytest.approx((0.0, 10.0), abs=1e-9)
+        # A quarter circle of radius 10 has true arc length pi/2*10 ~= 15.708;
+        # flattened to a short chain of straight segments it must be close
+        # but strictly no longer than the true arc (chords are shorter).
+        assert geometry.length == pytest.approx(15.708, abs=0.2)
+
+    def test_a_real_kerb_radius_arc_is_read_as_a_road_zone(self, tmp_path):
+        """Live case, "2. Песчаный переулок": this bureau draws curb radius
+        segments at corners as standalone ARC entities on layers named
+        through the English word "kerb" (`!Project_road kerb - БР100.30.15
+        внутренний`) -- neither the bare-code `\\bбр\\b.*\\d+.*\\d+` rule
+        (fails: "БР100" has no word boundary right after "р") nor the
+        `\\bборт\\w*` rule (no Russian "борт" word present at all) matched
+        before this test, and the ARC itself had no geometry branch either.
+        """
+        doc = ezdxf.new()
+        msp = doc.modelspace()
+        msp.add_arc(
+            center=(0, 0), radius=5, start_angle=0, end_angle=90,
+            dxfattribs={"layer": "!Project_road kerb - БР100.30.15 внутренний"},
+        )
+
+        path = tmp_path / "kerb_arc.dxf"
+        doc.saveas(str(path))
+
+        _, zones = read_dxf(path, layer_map=MOSGEOTREST_LAYER_MAP)
+
+        roads = [z for z in zones if z.zone_type == "road"]
+        assert len(roads) == 1
+        assert roads[0].geometry.geom_type == "LineString"
+
+
 class TestReconstructFootprintsWiring:
     """`read_dxf(reconstruct_footprints=...)` — the flag itself, not the
     reconstruction algorithm (see test_geometry_cleanup.py for that)."""
@@ -127,11 +178,13 @@ class TestReconstructFootprintsWiring:
         assert buildings[0].geometry.geom_type == "Polygon"
         assert buildings[0].geometry.area == pytest.approx(100.0)
 
-    def test_other_zone_types_are_not_touched_by_reconstruction(self, tmp_path):
-        """Only RECONSTRUCT_FOOTPRINT_ZONE_TYPES (building) goes through
-        polygonize() -- "road" stays the kerb line it is by design (see
-        MOSGEOTREST_LAYER_MAP's "Бортовой камень" comment), not something
-        this flag should silently reshape."""
+    def test_a_zone_type_outside_the_footprint_dict_is_not_touched_by_reconstruction(self, tmp_path):
+        """Zone types outside RECONSTRUCT_FOOTPRINT_ZONE_TYPES don't go
+        through polygonize() replacement at all. "road" specifically also
+        gets a *separate*, additive pass (see TestAdditiveRoadPolygonWiring
+        below) -- this fixture's single open kerb run has no partner to
+        close against, so that pass adds nothing here and the line survives
+        exactly as read, same as before that pass existed."""
         doc = ezdxf.new(setup=True)
         doc.layers.add(name="Бортовой камень")
         msp = doc.modelspace()
@@ -159,3 +212,192 @@ class TestReconstructFootprintsWiring:
         assert len(buildings) == 1
         assert buildings[0].geometry.geom_type == "Polygon"
         assert buildings[0].geometry.area == pytest.approx(100.0)
+
+    def test_territory_is_reconstructed_with_its_own_wider_snap_grid(self, tmp_path):
+        """`RECONSTRUCT_FOOTPRINT_ZONE_TYPES` covers "territory" too, with its
+        own (snap_grid_m, dangle_buffer_m) -- see
+        test_geometry_cleanup.py::TestReconstructClosedFootprints for the
+        reconstruction algorithm itself (this test is only about the
+        wiring). A gap of 23 cm is past DEFAULT_SNAP_GRID_M (5 cm, what
+        "building" still uses) but within what territory's wider grid
+        bridges -- the live case behind this, 12. Наташинский пр-д, is not
+        reproduced vertex-for-vertex here. Tolerance widened (5 -> 15) when
+        the grid itself widened further (0.3 -> 2.0 m, see
+        RECONSTRUCT_FOOTPRINT_ZONE_TYPES's comment for the second live case
+        that forced that) -- a coarser grid snaps this fixture's own
+        vertices by up to ~1 m each, which measurably moves the exact area
+        of a shape this size without meaning the mechanism is wrong.
+        """
+        doc = ezdxf.new(setup=True)
+        doc.layers.add(name="!Граница работ")
+        msp = doc.modelspace()
+        msp.add_lwpolyline(
+            [(0, 0), (100, 0), (100, 80), (50, 110), (0, 80), (0.23, 0)],
+            close=False,
+            dxfattribs={"layer": "!Граница работ"},
+        )
+        path = tmp_path / "wide_gap_territory.dxf"
+        doc.saveas(str(path))
+
+        without_flag = read_dxf(path, layer_map=MOSGEOTREST_LAYER_MAP)[1]
+        with_flag = read_dxf(path, layer_map=MOSGEOTREST_LAYER_MAP, reconstruct_footprints=True)[1]
+
+        assert without_flag[0].geometry.geom_type == "LineString"
+        territory = [z for z in with_flag if z.zone_type == "territory"]
+        assert len(territory) == 1
+        assert territory[0].geometry.geom_type == "Polygon"
+        assert territory[0].geometry.area == pytest.approx(9488.5, abs=15.0)
+
+    def test_an_unclosable_territory_fragment_is_dropped_not_faked_into_an_area(self, tmp_path):
+        """Live case, 7. Нижние Поля ул: the only boundary-layer candidate in
+        the whole bundle is an isolated stub with no partner to close it
+        against. Buffering that into a fake sliver "territory" would turn a
+        street with no usable boundary in this input into one that silently
+        looks fine -- territory's dangle_buffer_m=0.0 (unlike building's)
+        means it is dropped instead, same as with the flag off.
+        """
+        doc = ezdxf.new(setup=True)
+        doc.layers.add(name="!Граница работ")
+        msp = doc.modelspace()
+        msp.add_lwpolyline([(0, 0), (9.4, 0)], close=False, dxfattribs={"layer": "!Граница работ"})
+        path = tmp_path / "unclosable_stub.dxf"
+        doc.saveas(str(path))
+
+        _, zones = read_dxf(path, layer_map=MOSGEOTREST_LAYER_MAP, reconstruct_footprints=True)
+
+        assert zones == []
+
+    def test_existing_greenery_boundary_lines_are_reconstructed_into_fillable_polygons(self, tmp_path):
+        """Live case, 4. Харьковская улица: "Полоса деревьев"/"Леса и
+        газоны" arrive as boundary LineStrings around a green patch (92% of
+        the layer's objects on that street), not filled polygons -- the map
+        rendered them as scattered thin lines instead of a filled area, and
+        buildable_area() was silently not subtracting them at all (a
+        LineString has zero area). Same mechanism as building, joined
+        RECONSTRUCT_FOOTPRINT_ZONE_TYPES for the same reason."""
+        doc = ezdxf.new(setup=True)
+        doc.layers.add(name="Леса и газоны")
+        msp = doc.modelspace()
+        msp.add_lwpolyline([(0, 0), (20, 0), (20, 20), (0, 20)], dxfattribs={"layer": "Леса и газоны"})
+        msp.add_line((0, 20), (0, 0), dxfattribs={"layer": "Леса и газоны"})
+        path = tmp_path / "greenery_boundary.dxf"
+        doc.saveas(str(path))
+
+        _, zones = read_dxf(path, layer_map=MOSGEOTREST_LAYER_MAP, reconstruct_footprints=True)
+
+        greenery = [z for z in zones if z.zone_type == "existing_greenery"]
+        assert len(greenery) == 1
+        assert greenery[0].geometry.geom_type == "Polygon"
+        assert greenery[0].geometry.area == pytest.approx(400.0)
+
+    def test_existing_greenery_tree_points_survive_reconstruction_untouched(self, tmp_path):
+        """The same real layer also carries individual existing-tree points
+        ("Отдельно стоящее дерево") alongside the boundary lines above --
+        reconstruct_closed_footprints() has no branch for Point geometry and
+        would silently drop it if handed the whole mixed list, which for a
+        real existing tree is a correctness regression (a new candidate
+        could then legally land right on top of it), not just a cosmetic
+        loss. This is the regression test for the point/linelike split in
+        the reconstruction loop, not just the polygon case above."""
+        doc = ezdxf.new(setup=True)
+        doc.layers.add(name="Отдельно стоящее дерево")
+        doc.layers.add(name="Леса и газоны")
+        msp = doc.modelspace()
+        msp.add_point((5, 5), dxfattribs={"layer": "Отдельно стоящее дерево"})
+        msp.add_lwpolyline([(50, 50), (70, 50), (70, 70), (50, 70)], close=True, dxfattribs={"layer": "Леса и газоны"})
+        path = tmp_path / "greenery_mixed.dxf"
+        doc.saveas(str(path))
+
+        _, zones = read_dxf(path, layer_map=MOSGEOTREST_LAYER_MAP, reconstruct_footprints=True)
+
+        greenery = [z for z in zones if z.zone_type == "existing_greenery"]
+        points = [z for z in greenery if z.geometry.geom_type == "Point"]
+        polygons = [z for z in greenery if z.geometry.geom_type == "Polygon"]
+        assert len(points) == 1
+        assert (points[0].geometry.x, points[0].geometry.y) == (5, 5)
+        assert len(polygons) == 1
+        assert polygons[0].geometry.area == pytest.approx(400.0)
+
+
+class TestAdditiveRoadPolygonWiring:
+    """`read_dxf(reconstruct_footprints=True)`'s separate, additive step for
+    "road"/"sidewalk" (see geometry_cleanup.reconstruct_closed_road_polygons'
+    docstring for why it can't reuse the building-style replace-in-place
+    reconstruction above): a closed curb loop adds a NEW Polygon zone
+    alongside the original line zones, which stay exactly as read.
+    """
+
+    def test_a_closed_kerb_loop_adds_a_polygon_without_removing_the_lines(self, tmp_path):
+        doc = ezdxf.new(setup=True)
+        doc.layers.add(name="Бортовой камень")
+        msp = doc.modelspace()
+        # Open 3-sided run + a separate closing LINE -- so the gap is metres,
+        # not the reader's own 5 cm close-tolerance, and `_entity_to_geometry`
+        # reads both as LineString; only polygonize() inside the additive
+        # step should close this into a ring.
+        msp.add_lwpolyline([(0, 0), (10, 0), (10, 10), (0, 10)], dxfattribs={"layer": "Бортовой камень"})
+        msp.add_line((0, 10), (0, 0), dxfattribs={"layer": "Бортовой камень"})
+        path = tmp_path / "closed_kerb.dxf"
+        doc.saveas(str(path))
+
+        _, zones = read_dxf(path, layer_map=MOSGEOTREST_LAYER_MAP, reconstruct_footprints=True)
+
+        roads = [z for z in zones if z.zone_type == "road"]
+        lines = [r for r in roads if r.geometry.geom_type == "LineString"]
+        polygons = [r for r in roads if r.geometry.geom_type == "Polygon"]
+        # The two original lines survive untouched, alongside the new polygon.
+        assert len(lines) == 2
+        assert len(polygons) == 1
+        assert polygons[0].geometry.area == pytest.approx(100.0)
+
+    def test_default_off_never_runs_the_additive_step_either(self, tmp_path):
+        doc = ezdxf.new(setup=True)
+        doc.layers.add(name="Бортовой камень")
+        msp = doc.modelspace()
+        msp.add_lwpolyline(
+            [(0, 0), (10, 0), (10, 10), (0, 10)],
+            dxfattribs={"layer": "Бортовой камень"},
+        )
+        msp.add_line((0, 10), (0, 0), dxfattribs={"layer": "Бортовой камень"})
+        path = tmp_path / "closed_kerb_default_off.dxf"
+        doc.saveas(str(path))
+
+        _, zones = read_dxf(path, layer_map=MOSGEOTREST_LAYER_MAP)
+
+        roads = [z for z in zones if z.zone_type == "road"]
+        assert len(roads) == 2
+        assert all(r.geometry.geom_type == "LineString" for r in roads)
+
+    def test_buildable_area_now_actually_excludes_the_closed_road_polygon(self, tmp_path):
+        """The point of the whole feature: buffers.HARD_OBSTACLE_ZONE_TYPES
+        has always listed "road", but it was a no-op because road never had
+        Polygon geometry for that filter to catch. This is the first test
+        anywhere in the suite that exercises that no-op turning real."""
+        from shapely.geometry import Polygon as ShapelyPolygon
+
+        from geo_engine.buffers import buildable_area
+
+        doc = ezdxf.new(setup=True)
+        doc.layers.add(name="Бортовой камень")
+        msp = doc.modelspace()
+        # A closed kerb loop sitting entirely inside a larger territory --
+        # e.g. a traffic island or a courtyard drive ring. Split open
+        # run + closing LINE, same as the wiring test above, so this
+        # specifically exercises the additive polygonize() step rather than
+        # a Polygon that _entity_to_geometry already closed on its own.
+        msp.add_lwpolyline([(20, 20), (40, 20), (40, 40), (20, 40)], dxfattribs={"layer": "Бортовой камень"})
+        msp.add_line((20, 40), (20, 20), dxfattribs={"layer": "Бортовой камень"})
+        path = tmp_path / "island_kerb.dxf"
+        doc.saveas(str(path))
+
+        _, zones = read_dxf(path, layer_map=MOSGEOTREST_LAYER_MAP, reconstruct_footprints=True)
+        territory_geom = ShapelyPolygon([(0, 0), (0, 100), (100, 100), (100, 0)])
+
+        area = buildable_area(territory_geom, None, zones)
+
+        # The 20x20 traffic island (400 m^2) is now a real hard obstacle --
+        # before this feature it would have been fully plantable.
+        island = ShapelyPolygon([(20, 20), (40, 20), (40, 40), (20, 40)])
+        assert area.intersection(island).area == pytest.approx(0.0, abs=1.0)
+        # Everything outside the island is untouched.
+        assert area.area == pytest.approx(100 * 100 - 20 * 20, abs=1.0)
