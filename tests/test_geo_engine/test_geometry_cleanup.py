@@ -15,6 +15,7 @@ from geo_engine.io.geometry_cleanup import (
     drop_origin_artifacts,
     merge_dashed_lines,
     reconstruct_closed_footprints,
+    reconstruct_closed_road_polygons,
 )
 
 DASH_M = 1.0
@@ -283,3 +284,124 @@ class TestReconstructClosedFootprints:
         """A regression on the constant itself: a large default would turn a
         genuinely unclosable fragment into an oversized fake obstacle."""
         assert DEFAULT_DANGLE_BUFFER_M <= 1.0
+
+    def test_a_wider_snap_grid_closes_a_bigger_gap(self):
+        """Live case, 12. Наташинский пр-д: a road-corridor work boundary
+        (649 vertices) gaps by 22.9 cm at its own closing seam -- past
+        DEFAULT_SNAP_GRID_M (5 cm, what "building" still uses), so this
+        street's real geometry (not reproduced vertex-for-vertex here) needs
+        a wider grid, which `read_dxf_bundle` supplies for
+        `zone_type="territory"` via `RECONSTRUCT_FOOTPRINT_ZONE_TYPES`. A
+        genuinely large gap (5 m, matching the "not a drafting slip" case
+        used elsewhere in this suite) stays unclosed even at that wider
+        grid -- the tolerance is generous, not unbounded.
+        """
+        ring = LineString([(0, 0), (100, 0), (100, 80), (50, 110), (0, 80), (0.23, 0)])
+        genuinely_open = LineString([(0, 0), (100, 0), (100, 80), (0, 80), (0, 5)])
+
+        wide_enough = reconstruct_closed_footprints([ring], snap_grid_m=0.3, dangle_buffer_m=0.0)
+        still_too_far = reconstruct_closed_footprints([genuinely_open], snap_grid_m=0.3, dangle_buffer_m=0.0)
+
+        assert len(wide_enough) == 1
+        assert wide_enough[0].geom_type == "Polygon"
+        assert wide_enough[0].area == pytest.approx(9488.5, abs=5.0)
+        assert still_too_far == []
+
+    def test_a_ring_that_self_touches_at_the_seam_splits_into_its_real_lobes(self):
+        """Closing the gap is not the whole story: a long, hand-drafted
+        boundary is more likely to touch itself by a hair right at its own
+        seam than a simple rectangle is, which makes the naive closed
+        `Polygon` invalid. `polygonize_full`'s noding resolves a self-touch
+        correctly into separate simple rings (unlike patching an already
+        -built invalid Polygon) -- this bowtie is a small, deterministic
+        stand-in for that shape, not the pilot geometry itself.
+        """
+        ring = LineString([(0, 0), (10, 10), (10, 0), (0, 10), (0.01, 0.01)])
+
+        result = reconstruct_closed_footprints([ring], snap_grid_m=0.3, dangle_buffer_m=0.0)
+
+        assert len(result) == 2
+        assert all(g.geom_type == "Polygon" for g in result)
+        assert sum(g.area for g in result) == pytest.approx(49.0, abs=2.0)
+
+    def test_zero_dangle_buffer_drops_unclosable_fragments_instead_of_faking_an_area(self):
+        """Live case, 7. Нижние Поля ул: the only boundary-layer candidate in
+        the whole bundle is an isolated 9.4 m stub with no partner anywhere
+        to close it against. For a building, buffering that into a thin
+        sliver is the right call (an imperfect obstacle beats a vanished
+        one) -- for territory it is the wrong one: a fake ~6 m2 "work area"
+        silently standing in for a street that has none in this input at all
+        is worse than the loud MissingTerritoryError an absent boundary
+        should raise. `dangle_buffer_m=0.0` (what
+        RECONSTRUCT_FOOTPRINT_ZONE_TYPES sets for "territory") is how that is
+        expressed: every unclosable leftover buffers to nothing.
+        """
+        stub = LineString([(15073.566, -1338.141), (15064.124, -1338.141)])
+
+        with_fallback = reconstruct_closed_footprints([stub], snap_grid_m=0.3, dangle_buffer_m=0.3)
+        without_fallback = reconstruct_closed_footprints([stub], snap_grid_m=0.3, dangle_buffer_m=0.0)
+
+        assert with_fallback and with_fallback[0].area > 0
+        assert without_fallback == []
+
+
+class TestReconstructClosedRoadPolygons:
+    """Live case, "2. Песчаный переулок": road/sidewalk are already in
+    buffers.HARD_OBSTACLE_ZONE_TYPES, but that has been a no-op since either
+    zone_type ever only had LineString geometry to offer the hard-obstacle
+    filter (which only accepts Polygon/MultiPolygon). Unlike
+    reconstruct_closed_footprints() above, this deliberately does NOT
+    buffer unclosable leftovers into a sliver -- a curb network's open ends
+    are usually the road legitimately continuing past the surveyed
+    territory's edge, not a data gap, and the existing line-plus-setback
+    path already covers that case correctly. Callers add these polygons
+    alongside the original line zones, never in place of them.
+    """
+
+    def test_a_closed_curb_loop_becomes_a_road_polygon(self):
+        loop = LineString([(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)])
+
+        result = reconstruct_closed_road_polygons([loop])
+
+        assert len(result) == 1
+        assert result[0].geom_type == "Polygon"
+        assert result[0].area == pytest.approx(100.0)
+
+    def test_a_loop_split_across_curb_segments_and_a_corner_arc_still_closes(self):
+        """Stand-in for the real finding: a rectangular block's curb arrives
+        as separate straight runs (as if from distinct kerb-code layers)
+        plus what used to be an invisible corner -- now that ARC entities
+        have geometry, the connecting piece is just another LineString here.
+        """
+        south = LineString([(0, 0), (10, 0)])
+        east = LineString([(10, 0), (10, 10)])
+        north = LineString([(10, 10), (0, 10)])
+        west_and_corner = LineString([(0, 10), (0, 0)])
+
+        result = reconstruct_closed_road_polygons([south, east, north, west_and_corner])
+
+        assert len(result) == 1
+        assert result[0].area == pytest.approx(100.0)
+
+    def test_an_open_ended_curb_running_off_the_surveyed_edge_yields_no_polygon(self):
+        """The road legitimately continues past this street's territory
+        boundary -- there is no partner to close this line against, and
+        unlike a building outline that should have closed, that is not a
+        data defect to paper over with a buffered sliver."""
+        dangling = LineString([(0, 0), (50, 0), (50, 3)])
+
+        result = reconstruct_closed_road_polygons([dangling])
+
+        assert result == []
+
+    def test_a_closed_loop_and_a_separate_dangling_run_together(self):
+        """The real mixed case: most of a street's curb network is one big
+        open run, but a side loop (a courtyard entrance, a traffic island)
+        closes on its own -- only the closed part should surface here."""
+        loop = LineString([(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)])
+        dangling = LineString([(100, 100), (150, 100)])
+
+        result = reconstruct_closed_road_polygons([loop, dangling])
+
+        assert len(result) == 1
+        assert result[0].area == pytest.approx(100.0)
