@@ -98,6 +98,38 @@ def territory_polygon(zones: list[Zone], utilities: list[Utility] | None = None)
     return kept[0] if len(kept) == 1 else _combine_with_holes(kept)
 
 
+def _as_polygonal(geometry: BaseGeometry) -> BaseGeometry:
+    """Coerce a union/difference result back to Polygon/MultiPolygon.
+
+    Live crash, «18. Кустанайская улица»: `_combine_with_holes()`'s
+    `unary_union`/`difference` calls can hand back a `GeometryCollection`
+    instead of a clean polygon — GEOS does this when two pieces touch along a
+    degenerate lower-dimensional edge (a shared boundary segment, a
+    near-zero-width sliver from floating-point noise) and folds a spurious
+    `LineString`/`Point` component in alongside the real area. Nothing here
+    downstream expects that: `patterns.py::territory_guide()` calls
+    `.boundary` on whatever `territory_polygon()` returns to build the
+    along-the-edge row guide, and `GeometryCollection.boundary` is `None` in
+    shapely (not an exception) — that `None` silently became a
+    `RowGuide(geometry=None, ...)`, and the real crash surfaced several calls
+    later and several files away, in `_row_path()`'s `guide.geometry.buffer(...)`,
+    as a bare `AttributeError: 'NoneType' object has no attribute 'buffer'`.
+
+    The fix applies the same principle `territory_polygon()` already applies
+    to its own *input* zones (ignore what is not areal) to its own *output*:
+    keep only the Polygon/MultiPolygon parts of the collection — the real
+    area is always still in there, the degenerate parts contribute ~0 area
+    and exist only as a GEOS book-keeping artifact of the operation, not
+    because a genuine loss of site coverage happened.
+    """
+    if geometry.geom_type != "GeometryCollection":
+        return geometry
+    polygonal = [g for g in geometry.geoms if g.geom_type in _AREAL and not g.is_empty]
+    if not polygonal:
+        return geometry
+    return polygonal[0] if len(polygonal) == 1 else unary_union(polygonal)
+
+
 def _combine_with_holes(pieces: list[BaseGeometry]) -> BaseGeometry:
     """Union, except a piece (almost) entirely inside a bigger one already
     combined is cut out as a hole, not added as redundant area.
@@ -138,9 +170,9 @@ def _combine_with_holes(pieces: list[BaseGeometry]) -> BaseGeometry:
             continue
         contained_fraction = piece.intersection(result).area / piece.area
         if contained_fraction > 0.99:
-            result = result.difference(piece)
+            result = _as_polygonal(result.difference(piece))
         else:
-            result = unary_union([result, piece])
+            result = _as_polygonal(unary_union([result, piece]))
     return result
 
 
