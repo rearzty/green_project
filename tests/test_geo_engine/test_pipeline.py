@@ -1,7 +1,12 @@
+import pytest
+from shapely import unary_union
+from shapely.geometry import LineString, Point, box
+
 from ml_scoring.heuristic_scorer import HeuristicScorer
 
 from geo_engine.buffers import build_exclusion_zone, buildable_area
 from geo_engine.candidates import generate_candidates
+from geo_engine.model import Zone
 from geo_engine.norms import load_norms
 from geo_engine.placement import greedy_select
 
@@ -39,6 +44,75 @@ def test_buildable_area_excludes_existing_greenery(synthetic_scene):
     buildable = buildable_area(territory, exclusion, zones)
 
     assert buildable.intersection(greenery).area < 1e-6
+
+
+def test_buildable_area_does_not_exclude_existing_lawn():
+    """existing_lawn (Заливки.dwg's "гзн" surface-fill code -- layer_rules.py)
+    is real ground cover, not a hard obstacle: a tree/shrub/lawn candidate is
+    allowed to land right on top of already-grassy ground, same as it's
+    allowed to land on newly-generated lawn (see CLAUDE.md's "Дерево/куст
+    поверх газона" section). Regression for the split from existing_greenery
+    -- before it, "гзн" layers fed the same hard-obstacle bucket as real
+    existing trees/shrubs.
+    """
+    territory = box(0, 0, 50, 50)
+    lawn = box(10, 10, 40, 40)
+    zones = [Zone(geometry=territory, zone_type="territory"), Zone(geometry=lawn, zone_type="existing_lawn")]
+
+    exclusion = build_exclusion_zone([], zones, "tree", NORMS)
+    buildable = buildable_area(territory, exclusion, zones)
+
+    assert buildable.intersection(lawn).area == pytest.approx(lawn.area)
+
+
+def test_buildable_area_excludes_a_real_sidewalk_polygon():
+    """sidewalk joined HARD_OBSTACLE_ZONE_TYPES (buffers.py) once real Polygon
+    geometry for it existed to subtract at all -- live case, 4. Харьковская
+    улица: "ДВ_ПП_ДО_ТипN_..." pavement-repair-scope layers (layer_rules.py)
+    give real sidewalk-surface polygons, and a wide sidewalk's own setback
+    (0.7 m from its edge) isn't enough on its own to keep a candidate off a
+    2m+ wide paved path -- same reasoning as building/road/existing_greenery
+    here. Historically this was a no-op (sidewalk was always a LineString,
+    silently skipped by the Polygon-only filter); this is the regression for
+    what happens now that it isn't always one.
+    """
+    territory = box(0, 0, 50, 50)
+    sidewalk = box(10, 10, 15, 40)  # a real, wide paved path, not a bare edge line
+    zones = [Zone(geometry=territory, zone_type="territory"), Zone(geometry=sidewalk, zone_type="sidewalk")]
+
+    exclusion = build_exclusion_zone([], zones, "tree", NORMS)
+    buildable = buildable_area(territory, exclusion, zones)
+
+    assert buildable.intersection(sidewalk).area < 1e-6
+
+
+def test_buildable_area_ignores_non_polygonal_hard_obstacles():
+    """Real Мосгеотрест data reads plenty of buildings/roads as bare
+    LineString (an unclosed footprint outline) or even a stray Point -- see
+    CLAUDE.md's "Здания на реальном чертеже -- не полигон". Either already
+    contributes zero area to a difference against a polygon, but mixing them
+    into `unary_union(hard_obstacles)` used to make that a heterogeneous
+    GeometryCollection -- and GEOS's overlay engine cannot always compute a
+    result dimension for that as `difference()`'s second operand. Live crash
+    on real data (17. Грузинская М ул, thousands of such LineStrings/Points):
+    "AssertionFailedException: ... determine overlay result geometry
+    dimension". Only Polygon/MultiPolygon obstacles should reach the union;
+    this must not crash, and must still subtract exactly the real building.
+    """
+    territory = box(0, 0, 10, 10)
+    real_building = box(2, 2, 4, 4)
+    unclosed_building_outline = LineString([(6, 6), (8, 6), (8, 8)])
+    stray_vertex = Point(5, 5)
+    zones = [
+        Zone(geometry=real_building, zone_type="building"),
+        Zone(geometry=unclosed_building_outline, zone_type="building"),
+        Zone(geometry=stray_vertex, zone_type="building"),
+    ]
+
+    buildable = buildable_area(territory, unary_union([]), zones)
+
+    assert buildable.intersection(real_building).area < 1e-9
+    assert abs(buildable.area - (territory.area - real_building.area)) < 1e-9
 
 
 def test_exclusion_zone_grows_with_more_utilities(synthetic_scene):

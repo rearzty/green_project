@@ -322,3 +322,78 @@ class TestPlannerPatterns:
                 assert row_item.geometry.distance(loose_item.geometry) >= required - 1e-3, (
                     f"{row_item.species} и {loose_item.species} ближе {required} м"
                 )
+
+    def test_shrub_auto_produces_a_hedge_not_only_curtains(self, norms, catalogue):
+        """Живая изгородь для кустарника — регрессия на сравнение с реальным
+        пилотным проектом (2. Песчаный переулок, 20. Макеева С. ул.): там
+        почти весь кустарник посажен однорядной изгородью вдоль борта/газона
+        (1171 из 1192 на одной улице), а не куртиной, которую генератор до
+        этой правки ставил для кустарника безальтернативно.
+        """
+        from geo_engine.planner import ROW_RATIONALE_PREFIX, plan_items
+
+        territory, zones = self._scene()
+
+        items = plan_items(
+            "shrub-hedge", [], zones, territory, ["shrub"], self._score, norms,
+            pattern="auto", catalogue=catalogue,
+        )
+        in_rows = [i for i in items if i.rationale.startswith(ROW_RATIONALE_PREFIX)]
+
+        assert in_rows, "вдоль проезда должна появиться живая изгородь из кустарника"
+
+    def test_shrub_row_uses_the_hedge_pitch_not_the_anti_carpet_spacing(self, norms, catalogue):
+        """Обычный интервал кустарника (3,0 м) специально завышен против
+        ковра при россыпи по всей площади — применённый к изгороди, он дал бы
+        дырявый, нехарактерный ряд вместо плотной изгороди (743-ПП
+        табл. 3.6.2: 0,5-1 м). `IN_ROW_PITCH_M` существует ровно для этого.
+        """
+        from geo_engine.planner import IN_ROW_PITCH_M, plan_items
+
+        territory, zones = self._scene()
+
+        items = plan_items(
+            "shrub-hedge-pitch", [], zones, territory, ["shrub"], self._score, norms,
+            pattern="row", catalogue=catalogue,
+        )
+        near_road = sorted(
+            (i for i in items if i.geometry.y < 5.0), key=lambda i: i.geometry.x
+        )
+        gaps = [a.geometry.distance(b.geometry) for a, b in zip(near_road, near_road[1:])]
+
+        assert gaps, "изгородь вдоль проезда должна дать несколько соседей"
+        assert min(gaps) >= IN_ROW_PITCH_M["shrub"] - 1e-6
+        assert statistics.median(gaps) < norms.spacing_for("shrub").min_distance_m, (
+            "изгородь должна быть плотнее обычного (анти-ковёр) интервала кустарника"
+        )
+
+    def test_shrub_curtains_do_not_land_on_top_of_the_hedge(self, norms, catalogue):
+        """Куртина — второй паттерн кустарника, не единственный (см.
+        patterns.GROUP_PLANTING_TYPES): она занимает то, что осталось от
+        изгороди, а не перекрывает её. У каждой фазы свой пространственный
+        индекс, общей памяти между ними нет — без явного вычитания куртина
+        насыпала бы кусты прямо на уже поставленный ряд (тот же класс дефекта,
+        что уже поймали для россыпи после ряда, см. тест выше для дерева).
+        """
+        from geo_engine.planner import GROUP_RATIONALE_PREFIX, IN_ROW_PITCH_M, ROW_RATIONALE_PREFIX, plan_items
+
+        territory, zones = self._scene()
+
+        # density_per_ha={"shrub": 0}: at a 0.5 м hedge pitch the row alone
+        # already exceeds DEFAULT_DENSITY_PER_HA["shrub"] on this small
+        # scene (perimeter guides give ~1600 raw candidates before any
+        # curtain is even considered) -- same caveat already documented for
+        # the tree row/scatter split above, unrelated to what this test
+        # verifies.
+        items = plan_items(
+            "shrub-mixed", [], zones, territory, ["shrub"], self._score, norms,
+            pattern="auto", catalogue=catalogue,
+            density_per_ha={"shrub": 0},
+        )
+        rows = [i for i in items if i.rationale.startswith(ROW_RATIONALE_PREFIX)]
+        groups = [i for i in items if i.rationale.startswith(GROUP_RATIONALE_PREFIX)]
+        assert rows and groups, "сцена должна давать обе фазы, иначе тест ничего не проверяет"
+
+        for row_item in rows:
+            for group_item in groups:
+                assert row_item.geometry.distance(group_item.geometry) >= IN_ROW_PITCH_M["shrub"] - 1e-3

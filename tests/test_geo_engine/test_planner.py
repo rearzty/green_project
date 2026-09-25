@@ -133,8 +133,20 @@ class TestDefaultDensity:
         area_ha = territory.area / 10_000
         allowed = max(1, round(DEFAULT_DENSITY_PER_HA["tree"] * area_ha))
 
-        uncapped = plan_items("density-test", utilities, zones, territory, ["tree"], _constant_score_fn, NORMS, density_per_ha={"tree": 0})
-        defaulted = plan_items("density-test", utilities, zones, territory, ["tree"], _constant_score_fn, NORMS)
+        # pattern="scatter": row is now exempt from this budget entirely --
+        # its count comes from real guide length at the required pitch, not
+        # from "how much looks right per hectare" (see DEFAULT_DENSITY_PER_HA's
+        # module comment and _limit_row_and_group_by_density's docstring) --
+        # so with the default "auto" pattern, a row long enough could legally
+        # push the total past `allowed`. Forcing scatter-only isolates the
+        # discretionary path this test actually means to check.
+        uncapped = plan_items(
+            "density-test", utilities, zones, territory, ["tree"], _constant_score_fn, NORMS,
+            pattern="scatter", density_per_ha={"tree": 0},
+        )
+        defaulted = plan_items(
+            "density-test", utilities, zones, territory, ["tree"], _constant_score_fn, NORMS, pattern="scatter"
+        )
 
         assert len(uncapped) > allowed, "fixture too small for this test to be meaningful -- the cap never engages"
         assert len(defaulted) <= allowed
@@ -149,9 +161,12 @@ class TestDefaultDensity:
         # pass at the default's much higher allowance.
         shrub_override_allowed = max(1, round(1 * area_ha))
 
+        # pattern="scatter": see the comment in the test above -- row is exempt
+        # from density_per_ha now, and this test is about the override
+        # mechanism, not the row/scatter split.
         items = plan_items(
             "density-test", utilities, zones, territory, ["tree", "shrub"], _constant_score_fn, NORMS,
-            density_per_ha={"shrub": 1},
+            pattern="scatter", density_per_ha={"shrub": 1},
         )
         shrub_count = len([i for i in items if i.planting_type == "shrub"])
         tree_count = len([i for i in items if i.planting_type == "tree"])

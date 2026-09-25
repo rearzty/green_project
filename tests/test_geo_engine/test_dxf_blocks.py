@@ -198,7 +198,9 @@ def test_polyline_closed_by_geometry_but_not_by_flag_reads_as_an_area(tmp_path):
     # Gap of 11 mm, matching the real outline. Deliberately not laid back along
     # the first edge: a ring whose last point sits *on* an existing segment is
     # self-touching and shapely calls it invalid, which is a different case —
-    # the reader leaves those as lines rather than guessing at a repair.
+    # the reader leaves those as lines rather than guessing at a repair (see
+    # test_a_self_touching_near_closed_ring_is_left_as_a_line below, and
+    # reconstruct_closed_footprints() for the real fix path for that class).
     ring = [(0, 0), (100, 0), (100, 80), (50, 110), (0, 80), (0.008, 0.008)]
     doc.modelspace().add_lwpolyline(ring, close=False, dxfattribs={"layer": BOUNDARY_LAYER})
     path = tmp_path / "outline.dxf"

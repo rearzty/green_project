@@ -399,6 +399,7 @@ export default function Home() {
           <ThreeDView
             layers={layers3d?.projectId === project?.id ? layers3d?.layers : undefined}
             plan={plan?.features}
+            crsVerified={project?.crs_verified}
             season={season}
             storageKey={project?.id}
           />

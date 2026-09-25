@@ -75,7 +75,18 @@ def build_exclusion_zone(
     return unary_union(buffered)
 
 
-HARD_OBSTACLE_ZONE_TYPES = ("building", "road", "existing_greenery")
+# "sidewalk" joined this list once real Polygon geometry for it existed to
+# subtract at all -- historically the layer was always a LineString (a
+# pedestrian-path *edge*, same shape as road's kerb), so the hard-obstacle
+# filter below (Polygon/MultiPolygon only) silently skipped it and only the
+# setback buffer (0.7/0.5/0.0 m) applied. Live case, 4. Харьковская улица:
+# "ДВ_ПП_ДО_ТипN_..." pavement-repair-scope layers (see layer_rules.py)
+# include real sidewalk-surface polygons -- a candidate sitting 1m from one
+# edge of a 2m+ wide sidewalk is still standing on paved sidewalk, not just
+# too close to its edge, and the setback alone can't express that (same
+# reasoning as road/building here). Adding it here is a pure no-op for any
+# project where sidewalk is still only ever a line, like before.
+HARD_OBSTACLE_ZONE_TYPES = ("building", "road", "existing_greenery", "sidewalk")
 
 
 def buildable_area(
@@ -100,7 +111,23 @@ def buildable_area(
     """
     if territory_margin_m > 0:
         territory = territory.buffer(-territory_margin_m)
-    hard_obstacles = [z.geometry for z in other_zones if z.zone_type in HARD_OBSTACLE_ZONE_TYPES]
+    # Only polygonal geometry can subtract area in the first place -- a
+    # building/road read as an unclosed LineString (real Мосгеотрест data,
+    # see CLAUDE.md) or a stray Point already contributes nothing to a
+    # difference against a polygon. Live crash on real data (17. Грузинская
+    # М ул): thousands of such LineStrings/Points mixed into this same list
+    # made `unary_union(hard_obstacles)` a heterogeneous GeometryCollection,
+    # and GEOS's overlay engine cannot always compute a result dimension for
+    # a mixed-dimension second operand of `difference()`
+    # ("AssertionFailedException: ... determine overlay result geometry
+    # dimension") -- dropping the zero-area geometries here is a no-op for
+    # the result and removes the crash at the source, rather than papering
+    # over it with a repair/retry on the union.
+    hard_obstacles = [
+        z.geometry
+        for z in other_zones
+        if z.zone_type in HARD_OBSTACLE_ZONE_TYPES and z.geometry.geom_type in ("Polygon", "MultiPolygon")
+    ]
     if exclusion_zone is not None and not exclusion_zone.is_empty:
         result = territory.difference(exclusion_zone)
     else:

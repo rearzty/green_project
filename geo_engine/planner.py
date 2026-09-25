@@ -79,6 +79,29 @@ GROUP_RATIONALE_PREFIX = "Групповая посадка (куртина)."
 # кругами крон) соответствует ближе, чем 0,3 (около 11 шт/м²).
 IN_GROUP_PITCH_M = 0.5
 
+# Интервал внутри рядовой посадки (живой изгороди) для типов, чей обычный
+# интервал (`type_norms.spacing_for`) настроен под другой паттерн, а не под
+# ряд. У кустарника это ровно так: `shrub_default` (3,0 м) специально завышен,
+# чтобы россыпь по всей площади не превращалась в сплошной ковёр (см.
+# DEFAULT_DENSITY_PER_HA ниже и историю в CLAUDE.md) — применённый к ряду, тот
+# же интервал дал бы дырявую, нехарактерную изгородь вместо плотной, которую
+# 743-ПП табл. 3.6.2 отводит однорядной посадке кустарника (0,5-1 м для
+# высокого класса, 0,3-0,4 для среднего/низкого). Берётся нижняя граница
+# высокого класса — та же логика выбора числа из диапазона, что и везде в
+# проекте: для интервала («не реже X») нижняя граница гарантирует, что норму
+# невозможно нарушить, при этом остаётся достаточно плотной, чтобы читаться
+# именно изгородью, а не редкой цепочкой кустов.
+#
+# Найдено сравнением с реальным пилотным проектом (2. Песчаный переулок,
+# 20. Макеева С. ул.) — там почти весь кустарник посажен именно однорядной
+# изгородью с интервалом такого порядка, не куртиной, которую генератор до
+# этой правки ставил безальтернативно (см. patterns.GROUP_PLANTING_TYPES).
+#
+# Дерево сюда не входит: у него обычный интервал (МГСН 1.02-02 п. 4.2.9.2,
+# выведенный из класса кроны) и есть верный интервал ряда/аллеи — заменять
+# его не нужно.
+IN_ROW_PITCH_M: dict[str, float] = {"shrub": 0.5}
+
 # Плотность посадки по умолчанию, шт/га — практика, не норматив (акты задают
 # плотность ВНУТРИ группы, но не то, сколько посадок нужно на весь участок).
 # Раньше здесь сознательно не было значения: без ограничения greedy_select
@@ -96,6 +119,30 @@ IN_GROUP_PITCH_M = 0.5
 # подставляет эти значения только для типов, для которых вызывающий не
 # передал свои — явный `density_per_ha={"shrub": 500}` меняет только shrub,
 # `0` для типа отключает ограничение для него же (см. `_limit_by_density`).
+#
+# С паттернами (ряд/куртина/россыпь) этот бюджет относится ТОЛЬКО к
+# дискреционной части плана — куртине и россыпи (`_limit_by_density`,
+# `_limit_row_and_group_by_density`), не к ряду. Ряд не заполняет площадь до
+# отказа и не нуждается в этой защите: его численность и так задаёт реальная
+# структура площадки — длина ориентиров при нормативном/породном шаге, а не
+# оценка "сколько на глаз достаточно на гектар". Обратное (единый бюджет на
+# всё сразу) резало живую аллею по счёту, если её естественная длина
+# превышала эту практическую цифру — на длинной улице сплошной ряд вдоль
+# всего тротуара это нормальный дизайн, не тот "лес", ради которого это
+# ограничение появилось.
+#
+# Площадь для этого бюджета — не `territory.area` целиком, а фактически
+# доступный остаток под куртину/россыпь (`group_area`/`loose_area` в
+# `_plan_type_items`, уже за вычетом ряда и пересчитанной под конкретную
+# породу зоны отступов). Найдено сравнением с реальными улицами пилота:
+# на плотной улице (сети съедают почти всю территорию — см. живую находку
+# по 17. Грузинской в CLAUDE.md, buildable_area 0.2% от territory.area)
+# гектары НОМИНАЛЬНОЙ территории обманчиво велики относительно того, что
+# физически можно засадить — бюджет, посчитанный от них, был бы завышен не
+# только количественно, но и по смыслу самого числа ("плотность на
+# доступный холст", а не "плотность на площадь по кадастру"). На
+# компактной территории с широким буферным отступом от неё разница
+# заметно меньше, но направление поправки то же самое в обе стороны.
 DEFAULT_DENSITY_PER_HA: dict[str, float] = {"tree": 25.0, "shrub": 250.0}
 
 # Буфер shapely — многоугольник, ВПИСАННЫЙ в окружность: его стороны-хорды
@@ -121,6 +168,7 @@ def _fit_row_species(
     norms: PlantingNorms,
     keep_spacing_for: Collection[str],
     catalogue: SpeciesCatalogue,
+    row_pitch_override_m: float | None = None,
 ):
     """Выбрать из палитры породу, которой на этой площадке реально есть место.
 
@@ -137,12 +185,20 @@ def _fit_row_species(
 
     Перебор по палитре, а не оптимизация: пород в палитре единицы, каждая
     проверка — один проход построения ряда.
+
+    `row_pitch_override_m` — см. `planner.IN_ROW_PITCH_M`: для типов, чей
+    обычный интервал настроен не под ряд (сейчас — кустарник), шаг ряда
+    берётся отсюда, а не из `type_norms.spacing_for`. Не применяется, если
+    пользователь сам задал интервал этому типу (`keep_spacing_for`) — явная
+    настройка пользователя не должна тихо подменяться дефолтом изгороди.
     """
     best = None
     for candidate_species in palette or [None]:
         type_norms = norms
         if candidate_species is not None and planting_type not in keep_spacing_for:
             type_norms = norms_for_species(norms, planting_type, candidate_species, catalogue)
+        if row_pitch_override_m is not None and planting_type not in keep_spacing_for:
+            type_norms = type_norms.with_spacing_override(planting_type, row_pitch_override_m)
         exclusion = build_exclusion_zone(
             utilities, zones, planting_type, type_norms, candidate_species, catalogue.crown_reference_diameter_m
         )
@@ -191,6 +247,35 @@ def _palette_pick(palette: list[Species], index: int) -> Species | None:
     return palette[index % len(palette)]
 
 
+def _subtract_item_footprints(
+    area: BaseGeometry, items: list[PlantingItem], clearance_m: float
+) -> BaseGeometry:
+    """Вырезать из `area` места уже поставленных `items`.
+
+    Общий шаг для перехода между фазами одного типа посадки (ряд -> куртина,
+    ряд -> россыпь): у каждого прохода `greedy_select` свой пространственный
+    индекс, общей памяти между фазами нет, и без явного вычитания следующая
+    фаза насыпала бы новые позиции прямо на уже поставленный ряд.
+
+    Буфер — ЦЕЛЫЙ требуемый интервал (`clearance_m`), а не половина: точка
+    следующей фазы ставится в сам остаток площади, её собственный радиус
+    здесь ничем не компенсирован (в отличие от отбора внутри одной фазы, где
+    оба соседа буферизуются на свой радиус). Инфляция и число сегментов —
+    те же, что уже применяются к этому классу вычитания в этом модуле (см.
+    `_CLEARANCE_INFLATION`).
+    """
+    if not items:
+        return area
+    return area.difference(
+        unary_union(
+            [
+                item.geometry.buffer(clearance_m * _CLEARANCE_INFLATION, quad_segs=_CLEARANCE_QUAD_SEGS)
+                for item in items
+            ]
+        )
+    )
+
+
 def _limit_by_density(
     items: list[PlantingItem], area_m2: float, density_per_ha: float | None
 ) -> list[PlantingItem]:
@@ -219,6 +304,40 @@ def _limit_by_density(
     if len(items) <= allowed:
         return items
     return sorted(items, key=lambda item: item.score, reverse=True)[:allowed]
+
+
+def _limit_row_and_group_by_density(
+    row_items: list[PlantingItem],
+    group_items: list[PlantingItem],
+    area_m2: float,
+    density_per_ha: float | None,
+) -> list[PlantingItem]:
+    """Ряд идёт целиком, без ограничения; бюджет плотности достаётся только
+    куртине.
+
+    Раньше ряд и куртина делили один и тот же бюджет `density_per_ha», ряд —
+    с первым правом на него. Это чинило соотношение (см. историю ниже), но
+    само по себе оставалось не тем вопросом: у ряда число посадок и так
+    определено реальной структурой площадки — длиной ориентиров при
+    нормативном/породном шаге, — а не тем, «сколько на глаз достаточно на
+    гектар». `density_per_ha` придуман именно для второго вопроса — сколько
+    рассыпать там, где акт не даёт ответа, — и не должен урезать ряд, если
+    его настоящая длина даёт больше, чем этот произвольный норматив на
+    гектар: длинная сплошная аллея вдоль длинной улицы — нормальный
+    результат, не «лес», который эта защита должна было останавливать
+    (см. `_limit_by_density`).
+
+    Куртина при этом всё ещё нуждается в ограничении по той же причине, что
+    и раньше: у неё физически больше кандидатов, чем у ряда — десятки куртин
+    по IN_GROUP_PITCH_M дают тысячи точек, — и без отдельного бюджета она
+    заполнила бы всю оставшуюся площадь. Живой пример, из-за которого общий
+    (ещё более старый) отбор по одной оценке был впервые заменён на
+    приоритет ряда: 2. Песчаный переулок дал 213 в ряду против 1046 куртиной
+    при общем отборе, хотя настоящий проект даёт обратное соотношение — 1171
+    изгородью против 21 куртины, куртина там украшение по краям, а не
+    основной объём.
+    """
+    return row_items + _limit_by_density(group_items, area_m2, density_per_ha)
 
 
 def choose_species_palette(
@@ -351,6 +470,7 @@ def _plan_type_items(
     selected: list[PlantingItem] = []
     remaining = buildable
     row_items: list[PlantingItem] = []
+    group_items: list[PlantingItem] = []
 
     wants_rows = pattern in ("auto", "row") and planting_type in ROW_PLANTING_TYPES
     if wants_rows:
@@ -369,6 +489,7 @@ def _plan_type_items(
             norms,
             keep_spacing_for,
             catalogue,
+            row_pitch_override_m=IN_ROW_PITCH_M.get(planting_type),
         )
         spacing = type_norms.spacing_for(planting_type)
         exclusion = build_exclusion_zone(
@@ -386,18 +507,28 @@ def _plan_type_items(
             # поле пришлось бы протаскивать через строки БД и миграцию ради
             # сведения, которое нужно отчёту и CLI, а не доменной модели.
             item.rationale = f"{ROW_RATIONALE_PREFIX} {item.rationale}"
-        selected.extend(row_items)
+        # НЕ идёт в `selected` -- ряд больше не делит бюджет плотности с
+        # россыпью, см. docstring `_limit_by_density`/`_limit_row_and_group_by_density`
+        # и итоговый return этой функции.
 
     seed = zlib.crc32(f"{plan_key}:{planting_type}".encode())
 
     wants_groups = pattern in ("auto", "group") and planting_type in GROUP_PLANTING_TYPES
+    # Площадь под куртину-и-россыпь для бюджета плотности ниже -- дефолт до
+    # реального построения куртины (см. _limit_row_and_group_by_density):
+    # реально доступный остаток, а не territory.area целиком.
+    group_area = remaining
     if wants_groups and not remaining.is_empty:
         # Отбор внутри куртины идёт по ГРУППОВОМУ интервалу, а не по
         # обычному: иначе greedy_select, буферизующий каждую точку на
         # canopy_radius_m от одиночной посадки, прорядил бы группу до той
         # же россыпи, ради ухода от которой она и делается.
         group_norms = type_norms.with_spacing_override(planting_type, IN_GROUP_PITCH_M)
-        discs = group_positions(remaining, GROUP_PITCH_M, GROUP_RADIUS_M, seed)
+        # Куртина не должна перекрыть только что поставленную изгородь — тот
+        # же класс проблемы, что и у россыпи после ряда ниже (свой
+        # пространственный индекс на каждую фазу, общей памяти нет).
+        group_area = _subtract_item_footprints(remaining, row_items, spacing.min_distance_m)
+        discs = group_positions(group_area, GROUP_PITCH_M, GROUP_RADIUS_M, seed)
         # Индексы отступов/зонирования — по одному на весь тип, а не на
         # куртину: ни `exclusion`, ни `zones` не меняются между куртинами
         # одного типа, а fill_group's собственная перестройка индексов без
@@ -430,7 +561,7 @@ def _plan_type_items(
                 item.rationale = f"{GROUP_RATIONALE_PREFIX} {item.rationale}"
                 if disc_species is not None:
                     item.species = disc_species.name
-                selected.append(item)
+                group_items.append(item)
 
     # Тип, посаженный куртинами, россыпью НЕ досыпается. Две причины, и обе
     # существенные. Композиционная: смысл куртины в том, что между группами
@@ -440,9 +571,18 @@ def _plan_type_items(
     # на реальной улице состоит из тысячи с лишним кусков, стоило минут —
     # замерено, весь прогон уходил за 23 минуты при 51 секунде на сами
     # куртины.
-    if wants_groups and selected:
-        return _limit_by_density(selected, territory.area, density_per_ha)
+    #
+    # Ряд и куртина делят один бюджет плотности, но не поровну — ряд получает
+    # приоритет (`_limit_row_and_group_by_density`, см. её docstring), потому
+    # что у куртины физически больше кандидатов и общий отбор по одной оценке
+    # отдал бы ей весь бюджет по численному перевесу, а не по замыслу.
+    if wants_groups and (row_items or group_items):
+        return _limit_row_and_group_by_density(row_items, group_items, group_area.area, density_per_ha)
 
+    # Дефолт до реального построения россыпи, по той же причине, что и
+    # group_area выше -- используется, если блок ниже не выполняется вовсе
+    # (pattern="row"/"group", или remaining пуст).
+    loose_area = remaining
     if pattern not in ("row", "group") and not remaining.is_empty:
         # Россыпь идёт ВТОРОЙ породой палитры, если она есть: аллея одной
         # породы и свободные группы другой — это и отличает план-рисунок
@@ -514,17 +654,7 @@ def _plan_type_items(
                 spacing.min_distance_m,
                 loose_norms.spacing_for(planting_type).min_distance_m,
             )
-            loose_area = loose_area.difference(
-                unary_union(
-                    [
-                        item.geometry.buffer(
-                            clearance * _CLEARANCE_INFLATION,
-                            quad_segs=_CLEARANCE_QUAD_SEGS,
-                        )
-                        for item in row_items
-                    ]
-                )
-            )
+            loose_area = _subtract_item_footprints(loose_area, row_items, clearance)
         scattered = generate_candidates(
             loose_area, loose_exclusion, planting_type, loose_norms, zoning_zones=zones, seed=seed
         )
@@ -533,7 +663,24 @@ def _plan_type_items(
                 item.species = loose_species.name
             selected.append(item)
 
-    return _limit_by_density(selected, territory.area, density_per_ha)
+    # Ряд не участвует в бюджете плотности -- он и так физически ограничен
+    # длиной ориентиров при нормативном/породном шаге, а не заполняет
+    # площадь до отказа, как это делала бы неограниченная россыпь (см.
+    # docstring `_limit_by_density`). Ограничивать его тем же числом,
+    # придуманным для «сколько рассыпи достаточно», раньше срезало живую
+    # аллею по счёту, а не по месту, если её естественная длина превышала
+    # DEFAULT_DENSITY_PER_HA -- на длинной улице настоящий сплошной ряд
+    # вдоль тротуара это нормальный результат, не лес.
+    #
+    # Площадь для бюджета — loose_area (фактически доступный остаток под
+    # россыпь, уже за вычетом ряда и зоны отступов конкретной породы), а не
+    # territory.area целиком. См. структурную находку в docstring
+    # DEFAULT_DENSITY_PER_HA: на плотной улице (сети съедают почти всю
+    # площадь) territory.area обманчиво большая относительно того, что
+    # реально можно засадить, и бюджет, посчитанный от неё, был бы завышен
+    # относительно настоящего холста, а не только относительно нормативного
+    # смысла числа.
+    return row_items + _limit_by_density(selected, loose_area.area, density_per_ha)
 
 
 def plan_items(
