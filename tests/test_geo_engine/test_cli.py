@@ -308,6 +308,39 @@ def test_an_umbrella_folder_with_no_drawing_at_its_own_level_names_its_subfolder
     assert "10000176_Генплан_Олимп - Standard" in message
 
 
+def test_an_unreadable_bundle_member_warns_that_the_territory_may_be_short(tmp_path, capsys):
+    """Живая находка, «10. Старый Гай ул»: файл, где реально лежала граница
+    участка, не прочитался (DXFStructureError), другой, читаемый файл того же
+    бандла случайно нёс собственный маленький обрывок слоя territory — и
+    прогон тихо завершился успешно с 633 м² вместо настоящих гектаров улицы,
+    без единого слова о том, что часть бандла вообще была потеряна. Это не
+    ловится размерной эвристикой (нет улично-независимого «слишком мало»),
+    поэтому чинится не подгонкой числа, а явным предупреждением: что-то не
+    прочиталось, вот что получилось всё равно, дальше решать человеку.
+    """
+    site = tmp_path / "site"
+    site.mkdir()
+
+    broken = site / "broken.dxf"
+    broken.write_text("это не DXF", encoding="utf-8")
+
+    readable = ezdxf.new(setup=True)
+    readable.layers.add(name="!Граница работ")
+    readable.modelspace().add_lwpolyline(
+        [(0, 0), (10, 0), (10, 10), (0, 10)], close=True, dxfattribs={"layer": "!Граница работ"}
+    )
+    readable.saveas(str(site / "readable.dxf"))
+
+    out = tmp_path / "plan.dxf"
+    exit_code = main(["--input", str(site), "--output", str(out), "--types", "tree"])
+
+    assert exit_code == 0  # a small-but-valid plan, not a crash -- that's exactly what makes this dangerous
+    captured = capsys.readouterr()
+    assert "ВНИМАНИЕ" in captured.err
+    assert "broken.dxf" in captured.err
+    assert "не прочитаны" in captured.err
+
+
 class TestBaseDrawingChoice:
     """Какой файл бандла становится холстом для слоя результата."""
 
