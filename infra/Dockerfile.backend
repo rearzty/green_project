@@ -1,10 +1,13 @@
 # Build context is the repo root (see infra/docker-compose.yml).
 
-# --- LibreDWG: DWG -> DXF, in its own stage so the multi-minute compile is
-# cached independently of anything in this repo. -----------------------------
-# The pilot dataset is 818 DWG files against a single DXF, and ezdxf cannot read
-# DWG at all (closed Autodesk binary), so without this the service can only
-# accept drawings someone converted by hand.
+# --- LibreDWG: DWG -> DXF fallback, in its own stage so the multi-minute
+# compile is cached independently of anything in this repo. ------------------
+# ODA File Converter (installed below, in the backend stage) is now the
+# PRIMARY DWG->DXF backend -- see geo_engine/io/dwg_convert.py's module
+# docstring. LibreDWG stays built and available so the service still has a
+# converter if ODA is ever missing from an environment (its Qt/X11 runtime
+# stack is heavier); it is a fully capable converter for everything except
+# ACIS solids/regions, which is the one thing that pushed ODA to primary.
 #
 # 0.14 is pinned, not "whatever is current": 0.13.3 converts the pilot general
 # plan without a word of complaint and writes a malformed DXF — a long MTEXT
@@ -32,6 +35,46 @@ RUN apt-get update \
 
 # --- backend ----------------------------------------------------------------
 FROM python:3.11-slim
+
+# ODA File Converter -- the official Open Design Alliance DWG<->DXF converter,
+# now the PRIMARY backend (see geo_engine/io/dwg_convert.py's module docstring
+# for the full story). LibreDWG above stays as the fallback: it silently
+# produces empty (0-byte) ACIS payloads for REGION/3DSOLID entities -- surface
+# fills, on real pilot drawings ("2. Песчаный переулок"'s "план покрытий",
+# 189 REGION entities) -- while ODA preserves the real binary data, which
+# ezdxf.acis.api can then turn into actual polygon geometry. Organizers
+# confirmed in writing there is no ToR restriction on using it for this
+# hackathon, which is what unblocked switching to it as the primary path
+# despite ODA's own FAQ describing the general license as non-commercial-only.
+#
+# It ships as a Qt6 GUI application with a CLI mode, so it needs a working
+# (if virtual) X server even for headless conversion -- `xvfb-run` wraps each
+# invocation (geo_engine/io/dwg_convert.py::convert_with_oda), and the long
+# tail of xcb/GL/font/audio libraries below is what that Qt platform plugin
+# actually dlopens at startup, found one missing-library error at a time
+# (`ldd libqxcb.so | grep 'not found'`) rather than guessed up front. `xauth`
+# is `xvfb-run`'s own dependency (its `-a` auto-display mode shells out to it
+# to generate the auth cookie) -- caught by actually running a real
+# conversion against a freshly built image, not just checking `ODAFileConverter
+# --version`, which does not exercise xvfb-run at all and would have missed
+# this.
+# The .deb is fetched directly from opendesign.com's own guestfiles route
+# (not a third-party mirror) -- confirmed empirically to be a stable,
+# unauthenticated download (plain 200, no login/EULA redirect), not a
+# short-lived presigned link.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        wget xvfb xauth libgl1 libxkbcommon0 libxkbcommon-x11-0 libxcb-icccm4 \
+        libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 \
+        libxcb-xkb1 libfontconfig1 libxrender1 libsm6 libice6 libxrandr2 \
+        libxi6 libxcursor1 libxcomposite1 libxdamage1 libxtst6 libnss3 \
+        libasound2t64 libdbus-1-3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && wget -q "https://www.opendesign.com/guestfiles/get?filename=ODAFileConverter_QT6_lnxX64_8.3dll_27.1.deb" \
+        -O /tmp/oda_converter.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends /tmp/oda_converter.deb \
+    && rm -rf /tmp/oda_converter.deb /var/lib/apt/lists/*
 
 WORKDIR /app
 

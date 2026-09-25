@@ -3,10 +3,37 @@ Autodesk binary format).
 
 Two interchangeable backends, because neither is bundled with the project:
 
-* **LibreDWG** (`dwg2dxf`) — GNU project, GPL-3.0, installed as a normal CLI
-  tool. Verified against the pilot dataset: converts every DWG version present
-  there (AC1021/R2007, AC1027/R2013, AC1032/R2018), including the drawings the
-  project reads utilities and dendroplans out of.
+* **ODA File Converter** — the official free Open Design Alliance tool,
+  https://www.opendesign.com/guestfiles/oda_file_converter, now the **primary**
+  backend. It was not always: ODA's own FAQ describes the general download as
+  free for non-commercial use only, and an earlier pass through this decision
+  (before this project had asked anyone) took that at face value and rejected
+  ODA outright over the licensing risk. That conclusion is now superseded, not
+  merely re-guessed — the organizers were asked directly and answered in
+  writing: **«Использовать можно, в рамках ТЗ ограничений на такой инструмент
+  нет»** (usable, no restriction on this tool within the brief). What tipped
+  the switch technically, not just the license clearing: LibreDWG cannot
+  recover REGION/3DSOLID entities at all — verified directly, its conversion
+  writes them with a 0-byte ACIS payload (`acis_data`/`sab`/`sat` all empty),
+  so the geometry is gone before `dxf_reader.py` ever sees the file. Real
+  bureau drawings use REGION for surface fills that matter to this project
+  (`"2. Песчаный переулок"`'s topography/utility xrefs: existing greenery, gas
+  mains, cables, street boundaries — 189+ entities on one sheet alone). ODA
+  preserves the real binary payload (confirmed: `acis_data` starts `b"ASM "`,
+  real ShapeManager bytes, where the same entity through LibreDWG was empty),
+  which `geo_engine/io/dxf_reader.py::_region_to_geometry()` then turns into
+  real polygon geometry via `ezdxf.acis.api`. Ships as a Qt6 GUI application
+  (CLI-capable but still needs a working, if virtual, X server) — `xvfb-run`
+  wraps every invocation below, see `convert_with_oda()`. Installed via
+  `infra/Dockerfile.backend`'s own apt stage (`.deb` fetched directly from
+  opendesign.com's own guestfiles route, confirmed to be a stable,
+  unauthenticated download, not a short-lived presigned link), not by hand.
+* **LibreDWG** (`dwg2dxf`) — GNU project, GPL-3.0, kept as the fallback when
+  ODA is unavailable (e.g. a bare-metal dev machine without the Qt/X11
+  runtime stack ODA needs). Verified against the pilot dataset: converts
+  every DWG version present there (AC1021/R2007, AC1027/R2013, AC1032/R2018),
+  including the drawings the project reads utilities and dendroplans out of
+  — it is a perfectly good converter for everything except ACIS solids/faces.
   Availability, checked rather than assumed: `brew install libredwg` works on
   macOS (0.14 bottled). There is **no** `libredwg-tools` package in Debian
   trixie — the backend image's base — and no PyPI distribution, so the image
@@ -32,17 +59,15 @@ Two interchangeable backends, because neither is bundled with the project:
   builds static (`--disable-shared`) and links only against libc/libm, so the
   runtime image takes it as a single file with no extra packages. LibreDWG is
   GPL-3.0 and is invoked here as a separate process, never linked.
-* **ODA File Converter** — the official free Open Design Alliance tool,
-  https://www.opendesign.com/guestfiles/oda_file_converter. Installed by hand,
-  GUI-oriented, but the reference implementation if LibreDWG ever mangles a
-  drawing.
 
-`convert_dwg_to_dxf()` picks whichever is on PATH unless told otherwise. If
-neither is, it raises a clear error rather than failing obscurely deep in ezdxf.
+`convert_dwg_to_dxf()` picks whichever is on PATH unless told otherwise,
+preferring ODA. If neither is, it raises a clear error rather than failing
+obscurely deep in ezdxf.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -52,6 +77,7 @@ Backend = Literal["auto", "libredwg", "oda"]
 
 LIBREDWG_CANDIDATES = ["dwg2dxf"]
 ODA_CONVERTER_CANDIDATES = ["ODAFileConverter", "ODAFileConverter.exe"]
+XVFB_RUN_CANDIDATES = ["xvfb-run"]
 
 
 class DwgConverterNotFoundError(RuntimeError):
@@ -83,11 +109,12 @@ def _find_oda_converter() -> str:
 
 
 def available_backend() -> Backend | None:
-    """Which converter is usable right now, preferring the installable one."""
-    if _which(LIBREDWG_CANDIDATES):
-        return "libredwg"
+    """Which converter is usable right now, preferring ODA -- see this
+    module's docstring for why (REGION/3DSOLID recovery, organizer sign-off)."""
     if _which(ODA_CONVERTER_CANDIDATES):
         return "oda"
+    if _which(LIBREDWG_CANDIDATES):
+        return "libredwg"
     return None
 
 
@@ -142,6 +169,19 @@ def convert_with_oda(
     ODA File Converter operates on directories, not single files, so we point
     it at the parent directory of `dwg_path` with a wildcard filter and only
     return the one output file we expect.
+
+    It is a Qt6 GUI application under the hood -- even its command-line mode
+    opens a (normally invisible) window and refuses to start without a
+    working X server, `qt.qpa.xcb: could not connect to display`. Wrapped in
+    `xvfb-run -a` when that's on PATH (true inside `infra/Dockerfile.backend`,
+    which installs both), which starts a throwaway virtual display, picks a
+    free display number itself (`-a`, safe for concurrent calls), and tears
+    it down after. `XDG_RUNTIME_DIR` is set to a directory this process can
+    create/own -- Qt only warns and falls back on its own if it's unset, but
+    setting it explicitly avoids depending on that fallback existing/being
+    writable in every environment this runs in. Where `xvfb-run` isn't on
+    PATH (a native macOS/Windows install, which has a real display already),
+    the command runs unwrapped, same as before.
     """
     dwg_path = Path(dwg_path)
     output_dir = Path(output_dir)
@@ -160,11 +200,35 @@ def convert_with_oda(
         "1",  # audit each file: yes
         dwg_path.name,
     ]
-    subprocess.run(cmd, check=True, capture_output=True)
+
+    xvfb_run = _which(XVFB_RUN_CANDIDATES)
+    if xvfb_run:
+        cmd = [xvfb_run, "-a", *cmd]
+
+    env = os.environ.copy()
+    env.setdefault("XDG_RUNTIME_DIR", "/tmp/greenproject-xdg-runtime")
+    Path(env["XDG_RUNTIME_DIR"]).mkdir(parents=True, exist_ok=True)
+    os.chmod(env["XDG_RUNTIME_DIR"], 0o700)
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        # Same reasoning as convert_with_libredwg: ODA echoes drawing paths
+        # and diagnostics straight from the file, not guaranteed UTF-8 for a
+        # Russian-locale AutoCAD export.
+        errors="replace",
+        env=env,
+    )
 
     expected_output = output_dir / (dwg_path.stem + ".dxf")
+    # Exit code, not the contract -- same reasoning as convert_with_libredwg's
+    # dwg2dxf: ODA can print audit warnings and still produce a usable file.
     if not expected_output.exists():
-        raise RuntimeError(f"ODA File Converter did not produce expected output: {expected_output}")
+        raise RuntimeError(
+            f"ODA File Converter did not produce {expected_output}. "
+            f"exit={result.returncode} stderr={result.stderr.strip()[:500]}"
+        )
     return expected_output
 
 
