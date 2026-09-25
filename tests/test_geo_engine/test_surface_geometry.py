@@ -24,11 +24,97 @@ HATCH gap above but for a different entity type.
 """
 
 import ezdxf
+import ezdxf.acis.api as acis_api
 import pytest
+from ezdxf.render import MeshBuilder
 
-from geo_engine.io.dxf_reader import MOSGEOTREST_LAYER_MAP, _entity_to_geometry, read_dxf
+from geo_engine.io.dxf_reader import MOSGEOTREST_LAYER_MAP, _entity_to_geometry, _region_to_geometry, read_dxf
 
 BUILDING_LAYER = "Здания"
+
+
+def _region_entity(doc, faces, layer="0", dxftype="REGION"):
+    """A REGION/3DSOLID entity carrying a *real* ACIS payload, built the same
+    way `_region_to_geometry`'s own docstring measures against real ODA
+    output: `body_from_mesh` + `export_dxf` round-trip through ezdxf's own
+    ACIS writer, not a hand-typed byte string standing in for one. Each item
+    in `faces` is one flat (z=0) polygon's vertex ring.
+    """
+    mesh = MeshBuilder()
+    for face in faces:
+        mesh.add_face([(x, y, 0) for x, y in face])
+    body = acis_api.body_from_mesh(mesh)
+    entity = doc.modelspace().new_entity(dxftype, dxfattribs={"layer": layer})
+    acis_api.export_dxf(entity, [body])
+    return entity
+
+
+class TestRegionGeometry:
+    """REGION/3DSOLID as real polygon geometry — see `_region_to_geometry`'s
+    own docstring for the full story (LibreDWG loses this entirely, ODA
+    preserves it, verified against real REGION-bearing xrefs on "2. Песчаный
+    переулок"). These tests exercise the shapely reconstruction itself
+    against synthetic-but-real ACIS payloads, not the real pilot data.
+    """
+
+    def test_a_flat_region_becomes_a_polygon_with_the_right_area(self):
+        doc = ezdxf.new("R2018")
+        entity = _region_entity(doc, [[(0, 0), (10, 0), (10, 10), (0, 10)]])
+
+        geometry = _region_to_geometry(entity)
+
+        assert geometry.geom_type == "Polygon"
+        assert geometry.area == pytest.approx(100.0)
+
+    def test_two_disjoint_faces_on_one_body_union_into_a_multipolygon(self):
+        doc = ezdxf.new("R2018")
+        entity = _region_entity(
+            doc, [[(0, 0), (10, 0), (10, 10), (0, 10)], [(20, 0), (25, 0), (25, 5), (20, 5)]]
+        )
+
+        geometry = _region_to_geometry(entity)
+
+        assert geometry.geom_type == "MultiPolygon"
+        assert geometry.area == pytest.approx(100.0 + 25.0)
+
+    def test_a_3dsolid_entity_is_read_the_same_way_as_region(self):
+        doc = ezdxf.new("R2018")
+        entity = _region_entity(doc, [[(0, 0), (10, 0), (10, 10), (0, 10)]], dxftype="3DSOLID")
+
+        geometry = _entity_to_geometry(entity)
+
+        assert geometry.geom_type == "Polygon"
+        assert geometry.area == pytest.approx(100.0)
+
+    def test_a_region_with_no_acis_payload_is_skipped_not_crashed(self):
+        """Live case: LibreDWG converts a real bureau REGION to a 0-byte ACIS
+        payload (verified directly, not assumed) — this must degrade the same
+        way an unreadable HATCH boundary does (silently absent), not raise,
+        since the file otherwise reads fine."""
+        doc = ezdxf.new("R2018")
+        entity = doc.modelspace().new_entity("REGION", dxfattribs={"layer": "0"})
+
+        assert entity.acis_data == b""
+        assert _region_to_geometry(entity) is None
+
+    def test_a_region_on_a_mapped_layer_reaches_read_dxf_as_the_right_zone_type(self, tmp_path):
+        """End-to-end, same shape as TestHatchGeometry above: a REGION on a
+        real, already-classified layer name must come out the other end of
+        `read_dxf` as that zone type with real polygon area — no new
+        colour-based classification needed, the existing layer_map already
+        does the job once the geometry branch exists at all."""
+        doc = ezdxf.new("R2018")
+        _region_entity(doc, [[(0, 0), (10, 0), (10, 10), (0, 10)]], layer="Газопровод")
+
+        path = tmp_path / "region_gas.dxf"
+        doc.saveas(str(path))
+
+        utilities, _ = read_dxf(path, layer_map=MOSGEOTREST_LAYER_MAP)
+
+        gas = [u for u in utilities if u.object_type == "gas_pipe"]
+        assert len(gas) == 1
+        assert gas[0].geometry.geom_type == "Polygon"
+        assert gas[0].geometry.area == pytest.approx(100.0)
 
 
 class TestHatchGeometry:
