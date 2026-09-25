@@ -4,12 +4,14 @@ Separate from test_pilot_dataset.py on purpose: this is about the converter
 wrapper, not about the dataset, and it builds its own inputs.
 """
 
+import shutil
+
 import pytest
 
 from geo_engine.io.dwg_convert import (
+    LIBREDWG_CANDIDATES,
     DwgConverterNotFoundError,
     ODAConverterNotFoundError,
-    available_backend,
     convert_dwg_to_dxf,
     convert_with_libredwg,
 )
@@ -27,7 +29,10 @@ def test_unknown_backend_is_rejected_by_name(tmp_path):
         convert_dwg_to_dxf(tmp_path / "x.dwg", tmp_path, backend="autocad")
 
 
-@pytest.mark.skipif(available_backend() != "libredwg", reason="LibreDWG not on PATH")
+@pytest.mark.skipif(
+    not any(shutil.which(candidate) for candidate in LIBREDWG_CANDIDATES),
+    reason="LibreDWG not on PATH",
+)
 def test_a_file_dwg2dxf_cannot_read_raises_a_runtime_error(tmp_path):
     """Regression for a real crash: dwg2dxf echoes paths and strings straight
     out of the drawing, and in files written by Russian-locale AutoCAD those are
@@ -35,6 +40,12 @@ def test_a_file_dwg2dxf_cannot_read_raises_a_runtime_error(tmp_path):
     *diagnostics* of a file it was correctly refusing — a UnicodeDecodeError
     where the caller expected a normal "this file did not convert". Hit live on
     the pilot street's Xrefs/Освещение.dwg.
+
+    Gated on LibreDWG's own presence, not on `available_backend()`'s pick —
+    since ODA became the preferred backend, a machine with both installed
+    would otherwise skip this LibreDWG-specific regression forever, even
+    though the function under test (`convert_with_libredwg`) is called
+    directly here and doesn't care which backend is "preferred".
     """
     broken = tmp_path / "Освещение.dwg"
     broken.write_bytes(b"AC1032" + b"\x00\x9c\xd1\x82" * 64)
