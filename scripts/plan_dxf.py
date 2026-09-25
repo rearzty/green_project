@@ -276,8 +276,26 @@ def main(argv: list[str] | None = None) -> int:
         print(f"1/5 Чтение чертежа: {args.input}")
         main_drawing, bundle = resolve_inputs(args.input, workdir)
         print(f"     файлов в бандле: {len(bundle)}")
+
+        unreadable: list[Path] = []
+
+        def _warn_and_track(path: Path, error: Exception) -> None:
+            # Same message _warn_unreadable already prints (kept identical so
+            # existing output/tests don't see a format change) -- the only
+            # addition is remembering *which* files this run lost, so the
+            # territory line below can say something more useful than "here
+            # is a plausible-looking small number" when one of those files
+            # might have carried the real boundary.
+            print(f"  ! не прочитан {path.name}: {type(error).__name__}: {str(error)[:120]}", file=sys.stderr)
+            unreadable.append(path)
+
         utilities, zones = read_dxf_bundle(
-            bundle, layer_map=COMBINED_LAYER_MAP, stitch_dashes=True, drop_origin=True, reconstruct_footprints=True
+            bundle,
+            layer_map=COMBINED_LAYER_MAP,
+            stitch_dashes=True,
+            drop_origin=True,
+            reconstruct_footprints=True,
+            on_error=_warn_and_track,
         )
         by_type = Counter(u.object_type for u in utilities)
         print(f"     сетей: {sum(by_type.values())} ({', '.join(f'{k}: {v}' for k, v in by_type.most_common())})")
@@ -287,6 +305,26 @@ def main(argv: list[str] | None = None) -> int:
         except MissingTerritoryError as error:
             raise SystemExit(f"\nОШИБКА: {error}") from error
         print(f"2/5 Граница участка: {territory.geom_type}, площадь {territory.area:,.0f} м²".replace(",", " "))
+        if unreadable:
+            # Found live, «10. Старый Гай ул»: the file carrying the real
+            # boundary failed to parse (DXFStructureError), a different,
+            # readable file in the same bundle still had a small fragment of
+            # a "territory" layer on it, and the run quietly finished with a
+            # 633 m² "site" instead of the real multi-hectare street -- no
+            # error, no crash, a plausible-looking report that was simply
+            # wrong. This can't be answered with a size heuristic (there is
+            # no street-agnostic "too small"), so it doesn't try to guess --
+            # it just makes the correlation a human would have to dig for
+            # explicit: some input was lost, here is the number that came out
+            # anyway, go judge for yourself whether that number looks right
+            # for this street.
+            names = ", ".join(p.name for p in unreadable)
+            print(
+                f"  ! ВНИМАНИЕ: {len(unreadable)} файл(ов) бандла не прочитаны ({names}) — "
+                f"если граница участка (или другой существенный контур) лежала именно там, "
+                f"площадь выше может быть занижена, а не просто грубой.",
+                file=sys.stderr,
+            )
 
         existing_greenery = [z.geometry for z in zones if z.zone_type == "existing_greenery"]
         if args.scoring == "ml":
