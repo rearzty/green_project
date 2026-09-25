@@ -36,7 +36,7 @@ from backend.app.services.edit_service import (
     validate_items,
     validate_plan,
 )
-from backend.app.services.geo_io import planting_item_to_geojson_feature
+from backend.app.services.geo_io import display_crs, planting_item_to_geojson_feature
 
 router = APIRouter(prefix="/api/projects/{project_id}/plans/{plan_id}", tags=["edit"])
 
@@ -60,8 +60,8 @@ async def patch_item(item_id: str, patch: ItemPatch, plan: PlanDep) -> GeoJSONFe
     item = get_item_or_404(plan, item_id)
     geometry_dict = patch.geometry.model_dump() if patch.geometry is not None else None
     with _edit_errors():
-        updated = apply_item_patch(item, geometry_dict, patch.planting_type, patch.species, plan.project.source_crs)
-    return planting_item_to_geojson_feature(updated, plan.project.source_crs)
+        updated = apply_item_patch(item, geometry_dict, patch.planting_type, patch.species, display_crs(plan.project))
+    return planting_item_to_geojson_feature(updated, display_crs(plan.project))
 
 
 @router.delete("/items/{item_id}", status_code=204)
@@ -73,14 +73,14 @@ async def remove_item(item_id: str, plan: PlanDep) -> None:
 @router.post("/items/delete", response_model=ItemsDeleteResult)
 async def delete_items_route(request: ItemIdsRequest, plan: PlanDep) -> ItemsDeleteResult:
     with _edit_errors():
-        snapshots = delete_items(plan, request.ids, plan.project.source_crs)
+        snapshots = delete_items(plan, request.ids, display_crs(plan.project))
     return ItemsDeleteResult(deleted_items=snapshots, item_count=plan.item_count)
 
 
 @router.post("/items/retype", response_model=ItemsRetypeResult)
 async def retype_items_route(request: ItemsRetypeRequest, plan: PlanDep) -> ItemsRetypeResult:
     with _edit_errors():
-        previous, skipped = retype_items(plan, [(change.id, change.planting_type) for change in request.changes], plan.project.source_crs)
+        previous, skipped = retype_items(plan, [(change.id, change.planting_type) for change in request.changes], display_crs(plan.project))
     return ItemsRetypeResult(previous_items=previous, skipped_ids=skipped)
 
 
@@ -92,7 +92,7 @@ async def move_items_route(request: ItemsMoveRequest, plan: PlanDep) -> ItemsMov
             request.ids,
             (request.from_point.x, request.from_point.y),
             (request.to_point.x, request.to_point.y),
-            plan.project.source_crs,
+            display_crs(plan.project),
         )
     return ItemsMoveResult(items=moved)
 
@@ -102,7 +102,7 @@ async def restore_items_route(request: ItemsRestoreRequest, plan: PlanDep) -> It
     """Undo's counterpart to item deletion -- recreates the exact items in
     `request.items` (a delete's `deleted_items` sent right back)."""
     with _edit_errors():
-        restore_items(plan, [f.model_dump() for f in request.items], plan.project.source_crs)
+        restore_items(plan, [f.model_dump() for f in request.items], display_crs(plan.project))
     return ItemsRestoreResult(item_count=plan.item_count)
 
 

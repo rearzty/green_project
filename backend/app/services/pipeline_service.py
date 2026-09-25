@@ -153,7 +153,7 @@ async def ensure_materialized(plan: Plan) -> Plan:
 
     norms = _effective_norms(load_norms(settings.planting_norms_path), plan.tree_spacing_m, plan.shrub_spacing_m)
     utilities, zones = layers_to_domain(plan.project.layers)
-    territory = territory_polygon(zones)
+    territory = territory_polygon(zones, utilities)
     existing_greenery = _existing_greenery(zones)
     scorer = build_scorer(plan.scoring_mode, norms, existing_greenery)
 
@@ -211,7 +211,7 @@ async def generate_plan(
 
     norms = _effective_norms(load_norms(settings.planting_norms_path), tree_spacing_m, shrub_spacing_m)
     utilities, zones = layers_to_domain(project.layers)
-    territory = territory_polygon(zones)
+    territory = territory_polygon(zones, utilities)
     existing_greenery = _existing_greenery(zones)
     scorer = build_scorer(scoring_mode, norms, existing_greenery)
 

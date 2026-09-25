@@ -11,6 +11,12 @@ import { SEASON_PALETTES, ZONE_COLORS, type Season } from "@/lib/mapStyle";
 export interface ThreeDViewProps {
   layers?: GeoJSONFeatureCollection;
   plan?: GeoJSONFeatureCollection;
+  /** See MapView.tsx's own crsVerified doc -- when false, `layers`/`plan`
+   * carry raw local metres, not WGS84 degrees, and buildScene3DData must
+   * skip its usual equirectangular approximation (see plan3d.ts's
+   * makeLocalProjector) or it'll scale those metres by a bogus
+   * cos(latitude) factor. */
+  crsVerified?: boolean;
   /** Cosmetic tree/shrub/lawn/sky tint -- see SEASON_PALETTES (mapStyle.ts).
    * A full scene rebuild is cheap enough (~130ms at 33,789 items, measured
    * this session's stress test) that season is just another dependency of
@@ -384,7 +390,7 @@ function saveStoredCamera(key: string, position: THREE.Vector3, target: THREE.Ve
  * lib/plan3d.ts for how the GeoJSON is turned into local-meter geometry
  * (including what's deliberately left out -- zoning, utilities, real
  * building heights we don't have). */
-export default function ThreeDView({ layers, plan, season = "summer", storageKey }: ThreeDViewProps) {
+export default function ThreeDView({ layers, plan, crsVerified, season = "summer", storageKey }: ThreeDViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [norms, setNorms] = useState<PlantingNorms | undefined>(undefined);
   // Distinct from `norms` itself being set -- without this, the very first
@@ -418,7 +424,10 @@ export default function ThreeDView({ layers, plan, season = "summer", storageKey
     };
   }, []);
 
-  const data = useMemo(() => (plan && normsReady ? buildScene3DData(layers, plan, norms) : null), [layers, plan, norms, normsReady]);
+  const data = useMemo(
+    () => (plan && normsReady ? buildScene3DData(layers, plan, norms, crsVerified ?? true) : null),
+    [layers, plan, norms, normsReady, crsVerified]
+  );
   const overItemLimit = (data?.totalItemCount ?? 0) > MAX_3D_ITEMS;
 
   useEffect(() => {

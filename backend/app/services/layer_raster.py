@@ -47,7 +47,8 @@ from fastapi.concurrency import run_in_threadpool
 from PIL import Image, ImageDraw
 from shapely.geometry.base import BaseGeometry
 
-from backend.app.services.geo_io import _transformer_to_wgs84, db_to_shape
+from backend.app.services.geo_io import _transformer_to_wgs84, db_to_shape, display_crs, layers_to_domain
+from geo_engine.territory import MissingTerritoryError, territory_polygon
 
 
 class _LayerLike(Protocol):
@@ -74,6 +75,11 @@ _ZONE_COLORS = {
     # patterns) -- a lighter stone than road/building so it reads as related
     # hardscape without being mistaken for either.
     "sidewalk": "#a8a29e",
+    # Existing lawn (Заливки.dwg's "гзн" surface-fill code) -- deliberately a
+    # paler lime than existing_greenery's forest-green: this is real ground
+    # cover, not a hard obstacle (see layer_rules.py), and shouldn't read as
+    # the same "don't plant here" category on the map.
+    "existing_lawn": "#bef264",
 }
 _ZONING_CATEGORY_COLORS = {
     "residential": "#a78bfa",
@@ -89,6 +95,7 @@ _LAYER_TYPE_LABELS = {
     "existing_greenery": "Существующая зелень",
     "utility": "Инженерные сети",
     "sidewalk": "Тротуары",
+    "existing_lawn": "Существующий газон",
 }
 _ZONING_CATEGORY_LABELS = {
     "residential": "Зонирование: жилая",
@@ -108,6 +115,20 @@ _ZONING_PREFIX = "zoning:"
 # the same way, which is exactly what the per-group process pool below
 # (_PARALLEL_RENDER_THRESHOLD) exists to absorb.
 _MAX_CANVAS_PX = 6000
+
+# How far past the (clustered) territory boundary the canvas still extends,
+# in metres -- generous enough to show the surrounding street/block context
+# (adjacent buildings, the utilities a setback is actually measured against)
+# without letting the frame balloon to fit whatever the file's largest stray
+# fragment happens to be. Live case, 4. Харьковская улица: "unknown" alone
+# has a fragment spanning tens of kilometres, and "utility"/"lighting_pole"
+# each have one straggler thousands of metres past where every other
+# category (building/road/existing_greenery/territory) agrees the real site
+# is -- anchoring the canvas on the union of every layer let any single one
+# of these silently set the frame for everything else, which is also why
+# the whole picture read as "blurry": the same _MAX_CANVAS_PX pixel budget
+# spread over an area dozens of times bigger than the real site.
+_CONTEXT_MARGIN_M = 150.0
 # "building" wider than the default: most of the real dataset's building
 # outlines don't actually close into a polygon even after
 # geometry_cleanup.reconstruct_closed_footprints()'s snap-and-polygonize pass
@@ -183,8 +204,12 @@ class LayerRasterGroup:
 
 @dataclass
 class LayerRaster:
-    # ((south, west), (north, east)) in WGS84, or None for an empty project —
-    # same shape react-leaflet's <ImageOverlay bounds=.../> expects directly.
+    # ((south, west), (north, east)) -- same shape react-leaflet's
+    # <ImageOverlay bounds=.../> expects directly. WGS84 degrees when the
+    # project's CRS is verified; otherwise raw local-unit numbers (see
+    # geo_io.py::display_crs), which the frontend renders under Leaflet's
+    # CRS.Simple instead of the real-world WGS84/Mercator CRS. None for an
+    # empty project.
     bounds: tuple[tuple[float, float], tuple[float, float]] | None
     groups: list[LayerRasterGroup]
 
@@ -241,12 +266,25 @@ def _draw_geometry(draw: ImageDraw.ImageDraw, geom: BaseGeometry, to_px, color: 
             width = _LINE_WIDTH_PX.get(group_key, _DEFAULT_LINE_WIDTH_PX)
             draw.line(points, fill=color, width=width)
     elif gtype == "Polygon":
-        # Interior rings (courtyards/holes) aren't punched out -- this is a
-        # backdrop, not a precision fill, and real holes are rare in this
-        # dataset's buildings/zones; not worth the extra compositing pass.
         points = [to_px(x, y) for x, y in geom.exterior.coords]
         if len(points) >= 3:
             draw.polygon(points, fill=(*color, _FILL_ALPHA), outline=color)
+        # Interior rings ARE punched out -- live case, «1. Олимпийская
+        # деревня»: territory_polygon() now genuinely returns a Polygon
+        # with 8 real holes (courtyards excluded from the work scope, see
+        # geo_engine/territory.py::_combine_with_holes), not the solid blob
+        # this used to assume was the common case. Drawing on an RGBA
+        # canvas, fill=(0,0,0,0) actually clears those pixels back to
+        # transparent (not just "no-op paint") -- since "territory" paints
+        # first (see the bottom of this module), a hole here lets whatever
+        # real content another group draws for that courtyard (building/
+        # road/lawn) show through unobstructed by the blue tint, instead of
+        # painting blue first and hoping a later, unrelated group happens
+        # to fully cover it.
+        for interior in geom.interiors:
+            hole_points = [to_px(x, y) for x, y in interior.coords]
+            if len(hole_points) >= 3:
+                draw.polygon(hole_points, fill=(0, 0, 0, 0))
     elif gtype.startswith("Multi") or gtype == "GeometryCollection":
         for part in geom.geoms:
             _draw_geometry(draw, part, to_px, color, group_key)
@@ -308,14 +346,45 @@ def render_layer_raster(layers: list[_LayerLike], source_crs: str | None) -> Lay
 
     entries = [(layer_group_key(layer), db_to_shape(layer.geometry)) for layer in layers]
 
-    # Same exclusion as MapView.tsx's extentBounds: a zoning polygon's real
-    # shape can span a whole neighbourhood, so letting it set the canvas
-    # would zoom the actual site down to a speck. Zoning is still drawn --
-    # just clipped to whatever falls inside the canvas everything else defines.
-    bound_geoms = [geom for key, geom in entries if not key.startswith(_ZONING_PREFIX)]
-    if not bound_geoms:
-        bound_geoms = [geom for _, geom in entries]
-    minx, miny, maxx, maxy = _bounds_of(bound_geoms)
+    # The map's "territory" must show the SAME boundary buildable_area()/
+    # candidates actually work from, not every raw zone_type="territory"
+    # fragment on the layer -- territory_polygon() clusters away pieces with
+    # no real infrastructure near them (a stray xref in another CRS, or --
+    # live case, 4. Харьковская улица -- an isolated ~54,000 m2 polygon with
+    # zero utilities or other zones anywhere near it). Rendering the raw list
+    # instead put that discarded piece on the map as a second, unrelated blue
+    # blob floating in empty space, which is exactly what confused a live
+    # user, and also dragged the canvas bounds out to cover the empty space
+    # between the two, making everything else render blurrier than it needs
+    # to for no reason (same pixel budget, spread over a much bigger area --
+    # see _MAX_CANVAS_PX below).
+    entries = [(key, geom) for key, geom in entries if key != "territory"]
+    utilities, zones = layers_to_domain(layers)
+    territory_geom = None
+    try:
+        territory_geom = territory_polygon(zones, utilities)
+        entries.append(("territory", territory_geom))
+    except MissingTerritoryError:
+        pass  # nothing to show; other groups still render on their own bounds
+
+    if territory_geom is not None and not territory_geom.is_empty:
+        # Anchored on the real work boundary plus a fixed context margin --
+        # see _CONTEXT_MARGIN_M for why this replaced "union of every layer".
+        tminx, tminy, tmaxx, tmaxy = territory_geom.bounds
+        minx, miny = tminx - _CONTEXT_MARGIN_M, tminy - _CONTEXT_MARGIN_M
+        maxx, maxy = tmaxx + _CONTEXT_MARGIN_M, tmaxy + _CONTEXT_MARGIN_M
+    else:
+        # No resolvable territory to anchor on -- fall back to the union of
+        # every non-zoning layer (same exclusion as MapView.tsx's old
+        # client-side extentBounds: a zoning polygon's real shape can span a
+        # whole neighbourhood, so letting it set the canvas would zoom the
+        # actual site down to a speck). Zoning is still drawn either way --
+        # just clipped to whatever falls inside the canvas everything else
+        # defines.
+        bound_geoms = [geom for key, geom in entries if not key.startswith(_ZONING_PREFIX)]
+        if not bound_geoms:
+            bound_geoms = [geom for _, geom in entries]
+        minx, miny, maxx, maxy = _bounds_of(bound_geoms)
 
     _, px_w, px_h, scale = _make_pixel_transform(minx, miny, maxx, maxy, _MAX_CANVAS_PX)
     bounds = _wgs84_bounds(minx, miny, maxx, maxy, source_crs)
@@ -337,7 +406,20 @@ def render_layer_raster(layers: list[_LayerLike], source_crs: str | None) -> Lay
         LayerRasterGroup(key=key, label=_group_label(key), color=_group_color(key), count=len(geoms), png=pngs[key])
         for key, geoms in by_group.items()
     ]
-    groups.sort(key=lambda g: g.label)
+    # Paint order, not just list order: MapView.tsx renders one <ImageOverlay>
+    # per group in this exact array order, and later ImageOverlays paint over
+    # earlier ones. Plain alphabetical-by-label sorting put "Территория"
+    # (blue solid fill over the whole work boundary) after "Здания" on real
+    # data -- the territory wash then painted OVER the building outlines,
+    # visually burying them under a uniform blue even though buildable_area()
+    # correctly excludes them from the actual generated plan underneath.
+    # Found live: a user screenshot showing a big blue rectangle with no
+    # visible buildings, right where the real "Проектное решение" reference
+    # plan shows two building footprints. Territory is a backdrop -- it must
+    # paint first (bottom), same idea as a basemap sitting under everything
+    # else -- everything else keeps its existing alphabetical order among
+    # itself, only territory's position is pinned.
+    groups.sort(key=lambda g: (g.key != "territory", g.label))
     return LayerRaster(bounds=bounds, groups=groups)
 
 
@@ -357,7 +439,7 @@ async def get_layer_raster(project) -> LayerRaster:
             _cache.move_to_end(project.id)
             return _cache[project.id]
 
-    result = await run_in_threadpool(render_layer_raster, project.layers, project.source_crs)
+    result = await run_in_threadpool(render_layer_raster, project.layers, display_crs(project))
 
     with _lock:
         _cache[project.id] = result
