@@ -201,6 +201,75 @@ class TestTerritoryPolygon:
         assert territory.intersection(island).area == pytest.approx(island.area)
 
 
+class TestAsPolygonal:
+    """`_as_polygonal()` -- the fix for a live crash on «18. Кустанайская
+    улица»: `_combine_with_holes()`'s `unary_union`/`difference` calls
+    occasionally hand back a `GeometryCollection` (GEOS folding a degenerate
+    LineString/Point sliver in alongside the real area) instead of a clean
+    polygon, and `GeometryCollection.boundary` is `None` in shapely -- not an
+    exception -- which crashed `patterns.py::territory_guide()` several calls
+    downstream with a bare `AttributeError` on `None.buffer(...)`.
+
+    Reproducing the exact GEOS floating-point trigger synthetically (adjacent-
+    square union, identical- and near-identical-polygon difference) wasn't
+    found to be practical, so this tests the fix function directly against a
+    hand-built collection of the same shape GEOS is known to produce on real
+    data, plus the `.boundary is None` mechanism itself, confirmed directly
+    against shapely.
+    """
+
+    def test_a_line_fragment_is_dropped_and_the_polygon_kept(self):
+        from shapely.geometry import GeometryCollection, LineString, Polygon
+
+        from geo_engine.territory import _as_polygonal
+
+        polygon = Polygon([(0, 0), (100, 0), (100, 100), (0, 100)])
+        collection = GeometryCollection([polygon, LineString([(0, 0), (1, 1)])])
+        assert collection.boundary is None  # the actual crash mechanism this guards against
+
+        result = _as_polygonal(collection)
+
+        assert result.geom_type == "Polygon"
+        assert result.area == polygon.area
+        assert result.boundary is not None
+
+    def test_multiple_polygonal_parts_are_unioned(self):
+        from shapely.geometry import GeometryCollection, Point, Polygon
+
+        from geo_engine.territory import _as_polygonal
+
+        north = Polygon([(0, 100), (100, 100), (100, 200), (0, 200)])
+        south = Polygon([(0, 0), (100, 0), (100, 50), (0, 50)])
+        collection = GeometryCollection([north, south, Point(500, 500)])
+
+        result = _as_polygonal(collection)
+
+        assert result.geom_type == "MultiPolygon"
+        assert result.area == pytest.approx(north.area + south.area)
+
+    def test_a_non_collection_geometry_passes_through_unchanged(self):
+        from shapely.geometry import Polygon
+
+        from geo_engine.territory import _as_polygonal
+
+        polygon = Polygon([(0, 0), (100, 0), (100, 100), (0, 100)])
+        assert _as_polygonal(polygon) is polygon
+
+    def test_an_all_degenerate_collection_is_returned_as_is(self):
+        """Should never happen (the real area can't vanish), but if it did,
+        returning the input as-is is safer than raising from inside a helper
+        two modules away from the actual data."""
+        from shapely.geometry import GeometryCollection, LineString, Point
+
+        from geo_engine.territory import _as_polygonal
+
+        collection = GeometryCollection([LineString([(0, 0), (1, 1)]), Point(5, 5)])
+
+        result = _as_polygonal(collection)
+
+        assert result is collection
+
+
 class TestTerritoryClustering:
     """Отбрасывание контуров, которые участку не принадлежат.
 
