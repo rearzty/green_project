@@ -70,6 +70,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Literal
 
@@ -167,8 +168,22 @@ def convert_with_oda(
     """Convert a single DWG file to DXF using the ODA File Converter CLI.
 
     ODA File Converter operates on directories, not single files, so we point
-    it at the parent directory of `dwg_path` with a wildcard filter and only
-    return the one output file we expect.
+    it at an isolated, throwaway directory holding a *copy* of just this one
+    file, filtered by the unconditionally-safe `*.dwg` -- not at
+    `dwg_path.parent` filtered by `dwg_path.name`, which was the original
+    approach here and hung for 300+s on a real pilot filename: "10. Старый
+    Гай ул" delivers utility sheets named by survey-batch id, literally
+    `output[1-8]_3_ДЖКХ-24_02797kl.dwg` (the brackets are the batch id, not a
+    glob). ODA's own file-filter argument evidently runs that name through a
+    wildcard/regex engine (Qt's, most likely, though this is inferred from
+    behaviour, not confirmed from ODA's source) that tries to match `[1-8]`
+    as a character class against a name that only contains it literally, and
+    never resolves -- confirmed directly, not guessed: the exact same
+    directory and file converts in well under a minute once the filter is
+    changed to plain `*.dwg`. Since the only defence against an unknown set
+    of future glob metacharacters in a real filename is to never build a
+    filter out of one, every call gets its own private input directory
+    instead of trying to escape the name.
 
     It is a Qt6 GUI application under the hood -- even its command-line mode
     opens a (normally invisible) window and refuses to start without a
@@ -176,12 +191,16 @@ def convert_with_oda(
     `xvfb-run -a` when that's on PATH (true inside `infra/Dockerfile.backend`,
     which installs both), which starts a throwaway virtual display, picks a
     free display number itself (`-a`, safe for concurrent calls), and tears
-    it down after. `XDG_RUNTIME_DIR` is set to a directory this process can
-    create/own -- Qt only warns and falls back on its own if it's unset, but
-    setting it explicitly avoids depending on that fallback existing/being
-    writable in every environment this runs in. Where `xvfb-run` isn't on
-    PATH (a native macOS/Windows install, which has a real display already),
-    the command runs unwrapped, same as before.
+    it down after. `XDG_RUNTIME_DIR` gets its own throwaway directory per
+    call, for the same reason as the isolated input directory above --
+    `dxf_reader.py::resolve_bundle_inputs()` converts a bundle's files
+    through a `ThreadPoolExecutor` of up to 8 workers, so several of these
+    run genuinely concurrently, and a directory shared across calls (the
+    original approach) is exactly the kind of state concurrent invocations
+    of the same external GUI toolkit have no business sharing, confirmed-safe
+    or not. Where `xvfb-run` isn't on PATH (a native macOS/Windows install,
+    which has a real display already), the command runs unwrapped, same as
+    before.
     """
     dwg_path = Path(dwg_path)
     output_dir = Path(output_dir)
@@ -189,37 +208,42 @@ def convert_with_oda(
 
     executable = oda_executable or _find_oda_converter()
 
-    # ODAFileConverter <in_dir> <out_dir> <out_version> <out_type> <recurse> <audit> [filter]
-    cmd = [
-        executable,
-        str(dwg_path.parent),
-        str(output_dir),
-        output_version,
-        "DXF",
-        "0",  # recurse subdirectories: no
-        "1",  # audit each file: yes
-        dwg_path.name,
-    ]
+    with tempfile.TemporaryDirectory(prefix="oda_in_") as isolated_dir_str, tempfile.TemporaryDirectory(
+        prefix="oda_xdg_"
+    ) as xdg_runtime_dir:
+        isolated_dir = Path(isolated_dir_str)
+        shutil.copy2(dwg_path, isolated_dir / dwg_path.name)
 
-    xvfb_run = _which(XVFB_RUN_CANDIDATES)
-    if xvfb_run:
-        cmd = [xvfb_run, "-a", *cmd]
+        # ODAFileConverter <in_dir> <out_dir> <out_version> <out_type> <recurse> <audit> [filter]
+        cmd = [
+            executable,
+            str(isolated_dir),
+            str(output_dir),
+            output_version,
+            "DXF",
+            "0",  # recurse subdirectories: no
+            "1",  # audit each file: yes
+            "*.dwg",
+        ]
 
-    env = os.environ.copy()
-    env.setdefault("XDG_RUNTIME_DIR", "/tmp/greenproject-xdg-runtime")
-    Path(env["XDG_RUNTIME_DIR"]).mkdir(parents=True, exist_ok=True)
-    os.chmod(env["XDG_RUNTIME_DIR"], 0o700)
+        xvfb_run = _which(XVFB_RUN_CANDIDATES)
+        if xvfb_run:
+            cmd = [xvfb_run, "-a", *cmd]
 
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        # Same reasoning as convert_with_libredwg: ODA echoes drawing paths
-        # and diagnostics straight from the file, not guaranteed UTF-8 for a
-        # Russian-locale AutoCAD export.
-        errors="replace",
-        env=env,
-    )
+        env = os.environ.copy()
+        env["XDG_RUNTIME_DIR"] = xdg_runtime_dir
+        os.chmod(xdg_runtime_dir, 0o700)
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            # Same reasoning as convert_with_libredwg: ODA echoes drawing paths
+            # and diagnostics straight from the file, not guaranteed UTF-8 for a
+            # Russian-locale AutoCAD export.
+            errors="replace",
+            env=env,
+        )
 
     expected_output = output_dir / (dwg_path.stem + ".dxf")
     # Exit code, not the contract -- same reasoning as convert_with_libredwg's
