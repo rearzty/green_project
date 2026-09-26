@@ -189,7 +189,22 @@ def merge_dashed_lines(
 
     candidates: list[tuple[float, int, int]] = []
     for a, (point_a, part_a, end_a) in enumerate(endpoints):
-        for b in tree.query(Point(point_a).buffer(gap_tolerance_m)):
+        # A bounding box, not a buffered circle. STRtree.query() with the
+        # default predicate=None only ever compares bounding boxes (confirmed
+        # against shapely's own docstring: "the bounding box of each input
+        # geometry intersects the bounding box of a tree geometry") -- a
+        # buffered Point and a box of the same extent have an identical
+        # bounding box, so this returns exactly the same candidate indices a
+        # true circular buffer would, without paying GEOS to construct and
+        # polygon-approximate that circle. Measured live with cProfile on a
+        # real 91,767-utility bundle: this single line's buffer() calls
+        # (100,892 of them, one per endpoint) cost ~4.3s of a ~16s stitch
+        # pass -- the exact-distance check right below already filters the
+        # bbox-only candidates down to the true gap_tolerance_m radius, so
+        # nothing here ever relied on the query shape being a real circle.
+        x, y = point_a
+        query_box = shapely.box(x - gap_tolerance_m, y - gap_tolerance_m, x + gap_tolerance_m, y + gap_tolerance_m)
+        for b in tree.query(query_box):
             b = int(b)
             if b <= a:
                 continue

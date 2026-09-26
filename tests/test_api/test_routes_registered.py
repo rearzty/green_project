@@ -29,6 +29,7 @@ def test_expected_routes_are_registered():
     paths = _collect_paths(app.routes)
     assert "/health" in paths
     assert "/api/projects" in paths
+    assert "/api/projects/upload/{job_id}" in paths
     assert "/api/projects/{project_id}" in paths
     assert "/api/projects/{project_id}/generate" in paths
     assert "/api/projects/{project_id}/generate/{job_id}" in paths
