@@ -110,12 +110,43 @@ function postJson<T>(path: string, body: unknown): Promise<T> {
   return request(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 }
 
-export async function uploadProject(name: string, file: File, sourceCrs?: string): Promise<{ project_id: string }> {
+interface ProjectUploadJobStatus {
+  status: "pending" | "done" | "error";
+  project_id: string | null;
+  error: string | null;
+}
+
+function startUpload(name: string, file: File, sourceCrs?: string): Promise<{ job_id: string }> {
   const form = new FormData();
   form.append("name", name);
   form.append("file", file);
   if (sourceCrs) form.append("source_crs", sourceCrs);
   return request("/api/projects", { method: "POST", body: form });
+}
+
+function getUploadStatus(jobId: string): Promise<ProjectUploadJobStatus> {
+  return request(`/api/projects/upload/${jobId}`);
+}
+
+const UPLOAD_POLL_INTERVAL_MS = 700;
+
+/** Upload runs as a background job server-side -- DWG conversion + bundle
+ * parsing can take well over a hundred seconds on a real multi-file ZIP (see
+ * CLAUDE.md), too long to hold one HTTP request open for. This starts the
+ * job (the file's own bytes still go up in this call -- that part is
+ * genuinely tied to the request), polls status until it finishes, and
+ * resolves to the same `{ project_id }` shape the old synchronous endpoint
+ * returned -- same signature/return shape as before, so call sites don't
+ * need to change, mirroring generatePlan()'s own polling-behind-one-Promise
+ * pattern. */
+export async function uploadProject(name: string, file: File, sourceCrs?: string): Promise<{ project_id: string }> {
+  const { job_id } = await startUpload(name, file, sourceCrs);
+  for (;;) {
+    const status = await getUploadStatus(job_id);
+    if (status.status === "error") throw new ApiError(status.error ?? "Не удалось загрузить проект.", 0);
+    if (status.status === "done" && status.project_id) return { project_id: status.project_id };
+    await new Promise((resolve) => setTimeout(resolve, UPLOAD_POLL_INTERVAL_MS));
+  }
 }
 
 export async function getProject(projectId: string): Promise<ProjectOut> {

@@ -17,6 +17,7 @@ from geo_engine.io.dwg_convert import (
     convert_dwg_to_dxf,
     convert_with_libredwg,
     convert_with_oda,
+    convert_with_oda_batch,
 )
 
 
@@ -135,3 +136,106 @@ class TestOdaFilenameIsolation:
 
         assert captured["isolated_dir"] != source.parent
         assert captured["contents"] == ["a.dwg"]
+
+
+class TestOdaBatchConversion:
+    """`convert_with_oda_batch` -- one ODA invocation over several DWG files
+    instead of one call per file. Measured live on 8 real pilot xref files
+    (20-40 KB each): 8 sequential `convert_with_oda()` calls took 3.91s
+    (0.49s/file average, dominated by Qt6+xvfb startup on files this small);
+    one batched call over the same 8 took 0.56s -- ~7x faster. These tests
+    mock `subprocess.run`, same reasoning as TestOdaFilenameIsolation above:
+    check the mechanism, not a real ODA/Qt/X11 stack.
+    """
+
+    def test_same_basename_from_different_source_folders_does_not_collide(self, tmp_path):
+        """Two different xref subfolders in a real bundle can legitimately
+        name a sheet the same thing (e.g. two survey orders both delivering
+        `up.dwg`). Copying them into one flat batch directory unrenamed would
+        let the second silently overwrite the first before ODA ever runs."""
+        folder_a = tmp_path / "order_a"
+        folder_b = tmp_path / "order_b"
+        folder_a.mkdir()
+        folder_b.mkdir()
+        source_a = folder_a / "up.dwg"
+        source_b = folder_b / "up.dwg"
+        source_a.write_bytes(b"content A")
+        source_b.write_bytes(b"content B")
+        output_dir = tmp_path / "out"
+        captured: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            isolated_dir = Path(cmd[-7])
+            captured["contents"] = sorted(p.name for p in isolated_dir.iterdir())
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for dwg in isolated_dir.iterdir():
+                (output_dir / (dwg.stem + ".dxf")).write_text(f"fake dxf for {dwg.name}")
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with patch("geo_engine.io.dwg_convert.subprocess.run", side_effect=fake_run):
+            result = convert_with_oda_batch([source_a, source_b], output_dir, oda_executable="fake-oda")
+
+        # Both copies survived under distinct names in the isolated directory.
+        assert len(captured["contents"]) == 2
+        assert captured["contents"][0] != captured["contents"][1]
+        # And the returned mapping correctly points each ORIGINAL path at its
+        # own converted output, not the other file's.
+        assert set(result) == {source_a, source_b}
+        assert result[source_a].read_text() != result[source_b].read_text()
+
+    def test_one_bad_file_does_not_take_the_rest_of_the_batch_down(self, tmp_path):
+        good = tmp_path / "good.dwg"
+        bad = tmp_path / "bad.dwg"
+        good.write_bytes(b"fine")
+        bad.write_bytes(b"corrupt")
+        output_dir = tmp_path / "out"
+
+        def fake_run(cmd, **kwargs):
+            isolated_dir = Path(cmd[-7])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for dwg in isolated_dir.iterdir():
+                if "bad" in dwg.name:
+                    continue  # ODA silently produced nothing for this one
+                (output_dir / (dwg.stem + ".dxf")).write_text("fake dxf")
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": "audit warning"})()
+
+        with patch("geo_engine.io.dwg_convert.subprocess.run", side_effect=fake_run):
+            result = convert_with_oda_batch([good, bad], output_dir, oda_executable="fake-oda")
+
+        assert set(result) == {good}
+        assert bad not in result
+
+    def test_the_whole_batch_producing_nothing_raises_with_the_captured_stderr(self, tmp_path):
+        """An empty result for every file in the batch is not 'every file
+        happened to be corrupt' -- almost certainly the converter itself
+        failed to run at all, so this must not look identical to N individual
+        per-file failures."""
+        source = tmp_path / "a.dwg"
+        source.write_bytes(b"content")
+        output_dir = tmp_path / "out"
+
+        def fake_run(cmd, **kwargs):
+            return type("Result", (), {"returncode": 1, "stdout": "", "stderr": "xvfb-run: error: Xvfb failed"})()
+
+        with patch("geo_engine.io.dwg_convert.subprocess.run", side_effect=fake_run):
+            with pytest.raises(RuntimeError, match="Xvfb failed"):
+                convert_with_oda_batch([source], output_dir, oda_executable="fake-oda")
+
+    def test_the_filter_argument_is_always_a_plain_wildcard(self, tmp_path):
+        source = tmp_path / "output[1-8]_weird_name.dwg"
+        source.write_bytes(b"content")
+        output_dir = tmp_path / "out"
+        captured: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            isolated_dir = Path(cmd[-7])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for dwg in isolated_dir.iterdir():
+                (output_dir / (dwg.stem + ".dxf")).write_text("fake dxf")
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with patch("geo_engine.io.dwg_convert.subprocess.run", side_effect=fake_run):
+            convert_with_oda_batch([source], output_dir, oda_executable="fake-oda")
+
+        assert captured["cmd"][-1] == "*.dwg"

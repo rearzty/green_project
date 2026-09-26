@@ -1,12 +1,30 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel
 
 
 class ProjectCreateResponse(BaseModel):
     project_id: str
+
+
+ProjectUploadJobState = Literal["pending", "done", "error"]
+
+
+class ProjectUploadJobOut(BaseModel):
+    """POST /api/projects starts a background job instead of blocking the
+    request for however long DWG conversion + bundle parsing takes -- see
+    backend/app/services/project_jobs.py."""
+
+    job_id: str
+
+
+class ProjectUploadJobStatus(BaseModel):
+    status: ProjectUploadJobState
+    project_id: str | None = None
+    error: str | None = None
 
 
 class ProjectOut(BaseModel):
