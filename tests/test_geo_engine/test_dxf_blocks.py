@@ -151,6 +151,86 @@ def test_insert_on_a_mapped_layer_still_explodes_fully(tmp_path):
     assert isinstance(utilities[0].geometry, LineString)
 
 
+def test_a_block_on_an_unmapped_layer_still_explodes_if_its_content_is_classifiable(tmp_path):
+    """Live data-loss bug, "20. Макеева С. ул": a real building outline
+    (layer "Здания", a mapped layer) lived inside a block referenced on
+    layer "0" -- ordinary, unremarkable AutoCAD practice (placing a block
+    reference on layer "0" so its content keeps its own layers/colours), not
+    a sign the content is decorative. The short-circuit above only ever
+    checked the INSERT's own layer, never what is actually inside the block,
+    and threw the whole building away as one unclassified insertion point.
+    `building`/`existing_greenery`/`power_line_corridor` all went from 0 (not
+    under-counted -- entirely absent) to real numbers once fixed. Uses a
+    synthetic building block on layer "0" for the same reason the unmapped-
+    layer test above uses a synthetic layer: pins the mechanism, not the one
+    real name it was found on.
+    """
+    doc = ezdxf.new(setup=True)
+    doc.layers.add(name="Здания")
+    building_block = doc.blocks.new(name="BuildingBlock")
+    building_block.add_lwpolyline([(0, 0), (10, 0), (10, 10), (0, 10)], close=True, dxfattribs={"layer": "Здания"})
+    doc.modelspace().add_blockref("BuildingBlock", (0, 0), dxfattribs={"layer": "0"})
+
+    path = tmp_path / "building_on_layer_zero.dxf"
+    doc.saveas(str(path))
+
+    _, zones = read_dxf(path, layer_map=MOSGEOTREST_LAYER_MAP)
+    buildings = [z for z in zones if z.zone_type == "building"]
+
+    assert len(buildings) == 1
+    assert buildings[0].geometry.geom_type == "Polygon"
+    assert buildings[0].geometry.area == pytest.approx(100.0)
+
+
+def test_the_block_content_check_is_still_memoized_per_block_not_per_instance(tmp_path):
+    """The fix above must not give up the original optimisation's real win:
+    a block with genuinely unclassifiable content, referenced many times
+    (the live MGTS-well case this short-circuit was built for), is still
+    inspected once -- not re-exploded, and not re-scanned, per instance.
+    """
+    unmapped_layer = "XYZ_random_layer_99"
+    doc = ezdxf.new(setup=True)
+    doc.layers.add(name=unmapped_layer)
+    symbol = doc.blocks.new(name="*U9")
+    for i in range(20):
+        symbol.add_line((i, 0), (i, 1), dxfattribs={"layer": unmapped_layer})
+    msp = doc.modelspace()
+    for i in range(5):
+        msp.add_blockref("*U9", (i * 10, 10), dxfattribs={"layer": unmapped_layer})
+
+    path = tmp_path / "many_wells.dxf"
+    doc.saveas(str(path))
+
+    utilities, zones = read_dxf(path, layer_map=MOSGEOTREST_LAYER_MAP)
+
+    assert utilities == []
+    assert len(zones) == 5
+    assert all(z.zone_type == "unknown" for z in zones)
+
+
+def test_classifiable_content_nested_two_blocks_deep_is_still_found(tmp_path):
+    """The container layer test recurses through nested INSERTs (the same
+    MicroStation two-level pattern `_drawing_with_nested_block` above
+    exercises for the "explode at all" question) -- it must not stop at the
+    first level when deciding whether a block is worth exploding either."""
+    doc = ezdxf.new(setup=True)
+    doc.layers.add(name="Здания")
+    inner = doc.blocks.new(name="InnerBuilding")
+    inner.add_lwpolyline([(0, 0), (10, 0), (10, 10), (0, 10)], close=True, dxfattribs={"layer": "Здания"})
+    outer = doc.blocks.new(name="OuterWrapper")
+    outer.add_blockref("InnerBuilding", (0, 0), dxfattribs={"layer": "0"})
+    doc.modelspace().add_blockref("OuterWrapper", (0, 0), dxfattribs={"layer": "0"})
+
+    path = tmp_path / "nested_building_on_layer_zero.dxf"
+    doc.saveas(str(path))
+
+    _, zones = read_dxf(path, layer_map=MOSGEOTREST_LAYER_MAP)
+    buildings = [z for z in zones if z.zone_type == "building"]
+
+    assert len(buildings) == 1
+    assert buildings[0].geometry.geom_type == "Polygon"
+
+
 def test_symbol_layers_are_a_subset_of_what_the_map_knows_about():
     """Not every symbol layer needs a mapping, but a symbol layer that *is*
     mapped must stay mapped — otherwise its objects quietly become "unknown".
