@@ -36,6 +36,7 @@ import ezdxf.recover
 import ezdxf.lldxf.encoding
 import ezdxf.entities.mtext
 import ezdxf.acis.api
+import ezdxf.sections.acdsdata
 from shapely.geometry import LineString, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
@@ -87,6 +88,37 @@ ezdxf.lldxf.encoding._decode = _decode_dxf_char_or_keep_literal
 # utilities/zones), so an unrecognised column type is safe to treat as "no
 # special column layout" (`NONE`) instead of letting it abort the file.
 ezdxf.entities.mtext.ColumnType._missing_ = classmethod(lambda cls, value: cls.NONE)
+
+# Live performance bug, found on "4. Харьковская улица" (a real coverage-fill
+# xref, 6503 REGION entities in one 60.7 МБ file): every entity.sab access --
+# what _region_to_geometry() below triggers once per REGION/3DSOLID via
+# ezdxf.acis.api.load_dxf() -- makes ezdxf.sections.acdsdata.AcDsDataSection
+# .find_acis_record() do a LINEAR SCAN through the whole ACDSDATA section
+# looking for a matching handle. One file with N ACIS entities therefore
+# costs O(N²), not O(N), and it is not a small effect: measured directly on
+# this file, per-entity cost grows from 8.3ms (entities 0-200) to 18.0ms
+# (entities 6000-6200) as the scan gets longer, and REGION-to-geometry
+# conversion alone took 104s of this file's 106s read -- almost the entire
+# per-file bottleneck of the whole 19-file bundle read (103s of a 224.5s
+# CLI run). Patched here, not fixed upstream: build the handle -> record
+# index once per section (O(N)) and reuse it, invalidating only when
+# `entities`'s length actually changes (a write path -- set_acis_data/
+# new_acis_data/del_acis_data -- appending or removing a record) -- turns
+# every lookup into O(1) and the whole document's ACIS reads into O(N).
+def _indexed_find_acis_record(self, handle: str):
+    entities = self.entities
+    index = getattr(self, "_greenproject_acis_index", None)
+    if index is None or getattr(self, "_greenproject_acis_index_len", -1) != len(entities):
+        index = {}
+        for record in self.acdsrecords:
+            if ezdxf.sections.acdsdata.is_acis_data(record):
+                index[ezdxf.sections.acdsdata.acis_entity_handle(record)] = record
+        self._greenproject_acis_index = index
+        self._greenproject_acis_index_len = len(entities)
+    return index.get(handle)
+
+
+ezdxf.sections.acdsdata.AcDsDataSection.find_acis_record = _indexed_find_acis_record
 
 from geo_engine.io.geometry_cleanup import (
     DEFAULT_DANGLE_BUFFER_M,
@@ -813,13 +845,25 @@ def _read_one_bundle_file(
     drop_origin: bool,
     use_layer_rules: bool,
     reconstruct_footprints: bool = False,
-) -> tuple[list[Utility], list[Zone]]:
+) -> tuple[list[Utility], list[Zone], int]:
     """One file's read_dxf call, module-level and picklable so it can run in
     a worker process (see read_dxf_bundle). Raises straight through --
     deciding a failed file's fate via `on_error` happens in the main
     process, which is iterating futures and already has that callback; a
-    worker process has no way to call back into it."""
-    return read_dxf(
+    worker process has no way to call back into it.
+
+    Opens the document itself (once) and hands it to `read_dxf()` via its
+    `doc` parameter, rather than letting `read_dxf()` open it a second time
+    -- the entity count this needs for `pick_base_drawing` (see
+    `read_dxf_bundle`'s `on_file_read`) comes for free from a document
+    that's already sitting in memory in this same worker process, instead of
+    the CLI re-reading every bundle file from scratch afterwards purely to
+    count entities (measured live, on a real bundle: 16.7s of otherwise
+    unexplained CLI time on "4. Харьковская улица", 19 files).
+    """
+    doc = read_document(path)
+    entity_count = len(doc.modelspace())
+    utilities, zones = read_dxf(
         path,
         layer_map=layer_map,
         explode_blocks=explode_blocks,
@@ -828,7 +872,9 @@ def _read_one_bundle_file(
         drop_origin=drop_origin,
         use_layer_rules=use_layer_rules,
         reconstruct_footprints=reconstruct_footprints,
+        doc=doc,
     )
+    return utilities, zones, entity_count
 
 
 def read_dxf_bundle(
@@ -841,6 +887,7 @@ def read_dxf_bundle(
     use_layer_rules: bool = True,
     reconstruct_footprints: bool = False,
     on_error: Callable[[Path, Exception], None] | None = _warn_unreadable,
+    on_file_read: Callable[[Path, int], None] | None = None,
 ) -> tuple[list[Utility], list[Zone]]:
     """Read several DXF files as one drawing.
 
@@ -872,6 +919,14 @@ def read_dxf_bundle(
     combined utilities/zones lists -- and which file's error gets reported
     when several fail -- don't depend on which process happened to finish
     first.
+
+    `on_file_read`, when given, is called once per successfully-read file
+    with `(path, entity_count)` -- `entity_count` comes from the same open
+    document this read already paid to parse, not a second pass over the
+    file. `scripts/plan_dxf.py::main()` uses this to feed `pick_base_drawing`
+    without `pick_base_drawing` (or anything else) ever opening these files
+    again just to count entities -- that redundant second read used to cost
+    16.7s on its own on a real 19-file bundle ("4. Харьковская улица").
     """
     paths = [Path(p) for p in paths]
     utilities: list[Utility] = []
@@ -896,7 +951,7 @@ def read_dxf_bundle(
             for future in futures:
                 path = futures[future]
                 try:
-                    file_utilities, file_zones = future.result()
+                    file_utilities, file_zones, entity_count = future.result()
                 except Exception as error:  # noqa: BLE001 — судьбу решает вызывающий
                     if on_error is None:
                         raise
@@ -904,18 +959,19 @@ def read_dxf_bundle(
                     continue
                 utilities.extend(file_utilities)
                 zones.extend(file_zones)
+                if on_file_read is not None:
+                    on_file_read(path, entity_count)
     else:
         for path in paths:
             try:
-                file_utilities, file_zones = read_dxf(
-                    path,
-                    layer_map=layer_map,
-                    explode_blocks=explode_blocks,
-                    symbol_layers=symbol_layers,
-                    stitch_dashes=False,
-                    drop_origin=drop_origin,
-                    use_layer_rules=use_layer_rules,
-                    reconstruct_footprints=reconstruct_footprints,
+                file_utilities, file_zones, entity_count = _read_one_bundle_file(
+                    Path(path),
+                    layer_map,
+                    explode_blocks,
+                    symbol_layers,
+                    drop_origin,
+                    use_layer_rules,
+                    reconstruct_footprints,
                 )
             except Exception as error:  # noqa: BLE001 — судьбу решает вызывающий
                 if on_error is None:
@@ -924,6 +980,8 @@ def read_dxf_bundle(
                 continue
             utilities.extend(file_utilities)
             zones.extend(file_zones)
+            if on_file_read is not None:
+                on_file_read(Path(path), entity_count)
 
     if stitch_dashes:
         utilities = stitch_utility_lines(utilities)
@@ -1084,6 +1142,7 @@ def read_dxf(
     drop_origin: bool = False,
     use_layer_rules: bool = True,
     reconstruct_footprints: bool = False,
+    doc=None,
 ) -> tuple[list[Utility], list[Zone]]:
     """Parse a DXF file's modelspace into Utility and Zone lists, keyed by
     layer name via `layer_map` (defaults to DEFAULT_LAYER_MAP).
@@ -1096,9 +1155,15 @@ def read_dxf(
     `use_layer_rules` включает распознавание слоя по образцу имени, когда
     дословной записи в карте нет (см. layer_rules). По умолчанию включено:
     без него читались семь улиц пилота из девятнадцати.
+
+    `doc`, when given, is an already-opened ezdxf document to read instead of
+    opening `path` again -- `_read_one_bundle_file()` uses this to count a
+    bundle file's entities (for `pick_base_drawing`) from the same open
+    document this function would otherwise open a second time for.
     """
     layer_map = layer_map or DEFAULT_LAYER_MAP
-    doc = read_document(Path(path))
+    if doc is None:
+        doc = read_document(Path(path))
     msp = doc.modelspace()
 
     utilities: list[Utility] = []

@@ -7,6 +7,7 @@ demo. So the CLI is covered like a product surface, not like a helper script.
 
 import csv
 import json
+from pathlib import Path
 
 import ezdxf
 import pytest
@@ -342,7 +343,54 @@ def test_an_unreadable_bundle_member_warns_that_the_territory_may_be_short(tmp_p
 
 
 class TestBaseDrawingChoice:
-    """Какой файл бандла становится холстом для слоя результата."""
+    """Какой файл бандла становится холстом для слоя результата.
+
+    `pick_base_drawing` takes the entity counts `read_dxf_bundle`'s
+    `on_file_read` already collected while doing the real read -- it no
+    longer opens any file itself, so these are plain dict-in-Path-out tests,
+    not real DXF fixtures on disk (see `test_on_file_read_...` below for the
+    wiring that actually produces this dict from real files).
+    """
+
+    def test_the_most_substantial_drawing_wins(self):
+        """Не первый в словаре и не самый большой по байтам: у бандла бывают
+        файлы-заглушки в пару объектов, и копия такой заглушки со слоем
+        результата формально проходит, но эксперт открывает её и не видит своей
+        подосновы — ровно то, ради чего результат и пишется поверх исходника.
+        """
+        from scripts.plan_dxf import pick_base_drawing
+
+        stub, real = Path("stub.dxf"), Path("real.dxf")
+
+        assert pick_base_drawing({stub: 2, real: 50}) == real
+
+    def test_a_file_missing_from_the_dict_is_never_picked(self):
+        """Живой случай: главный чертёж улицы (76 МБ) не открывается ни
+        readfile, ни recover ни в одном режиме — внутри испорченная
+        юникод-последовательность. `read_dxf_bundle`'s `on_error` catches
+        that during the real read and `on_file_read` simply never fires for
+        it -- it never becomes a dict entry, so it can't win here either.
+        """
+        from scripts.plan_dxf import pick_base_drawing
+
+        real = Path("real.dxf")
+
+        assert pick_base_drawing({real: 20}) == real
+
+    def test_nothing_readable_yields_none(self):
+        from scripts.plan_dxf import pick_base_drawing
+
+        assert pick_base_drawing({}) is None
+
+
+class TestOnFileReadWiring:
+    """`read_dxf_bundle(on_file_read=...)` -- the actual entity-count source
+    `pick_base_drawing` now runs on, exercised against real DXF files (not
+    the dict `TestBaseDrawingChoice` above hands it directly), to catch a
+    regression in the wiring itself: `_read_one_bundle_file` opening the
+    document once and handing it to `read_dxf` via the new `doc=` parameter,
+    instead of `read_dxf` opening `path` a second time.
+    """
 
     def _drawing(self, path, entity_count, layer="Газопровод"):
         doc = ezdxf.new(setup=True)
@@ -353,37 +401,40 @@ class TestBaseDrawingChoice:
         doc.saveas(str(path))
         return path
 
-    def test_the_most_substantial_readable_drawing_wins(self, tmp_path):
-        """Не первый открывшийся и не самый большой по байтам: у бандла бывают
-        файлы-заглушки в пару объектов, и копия такой заглушки со слоем
-        результата формально проходит, но эксперт открывает её и не видит своей
-        подосновы — ровно то, ради чего результат и пишется поверх исходника.
-        """
-        from scripts.plan_dxf import pick_base_drawing
+    def test_entity_counts_are_reported_for_every_readable_file(self, tmp_path):
+        from geo_engine.io.dxf_reader import read_dxf_bundle
 
-        stub = self._drawing(tmp_path / "stub.dxf", 2)
-        real = self._drawing(tmp_path / "real.dxf", 50)
+        small = self._drawing(tmp_path / "small.dxf", 2)
+        large = self._drawing(tmp_path / "large.dxf", 50)
 
-        assert pick_base_drawing([stub, real]) == real
+        counts: dict[Path, int] = {}
+        read_dxf_bundle([small, large], on_file_read=counts.__setitem__)
 
-    def test_an_unreadable_drawing_is_skipped(self, tmp_path):
-        """Живой случай: главный чертёж улицы (76 МБ) не открывается ни
-        readfile, ни recover ни в одном режиме — внутри испорченная
-        юникод-последовательность. Терять из-за неё весь прогон незачем:
-        исходник нужен только как холст.
-        """
-        from scripts.plan_dxf import pick_base_drawing
+        assert counts == {small: 2, large: 50}
+
+    def test_an_unreadable_file_is_reported_to_on_error_not_on_file_read(self, tmp_path):
+        from geo_engine.io.dxf_reader import read_dxf_bundle
 
         broken = tmp_path / "broken.dxf"
         broken.write_text("это не DXF", encoding="utf-8")
         real = self._drawing(tmp_path / "real.dxf", 20)
 
-        assert pick_base_drawing([broken, real]) == real
+        counts: dict[Path, int] = {}
+        errors: list[Path] = []
+        read_dxf_bundle([broken, real], on_error=lambda p, e: errors.append(p), on_file_read=counts.__setitem__)
 
-    def test_nothing_readable_yields_none(self, tmp_path):
-        from scripts.plan_dxf import pick_base_drawing
+        assert counts == {real: 20}
+        assert errors == [broken]
 
-        broken = tmp_path / "broken.dxf"
-        broken.write_text("мусор", encoding="utf-8")
+    def test_this_still_works_with_a_single_file_bundle(self, tmp_path):
+        """read_dxf_bundle has a separate non-parallel branch for exactly one
+        path -- on_file_read must fire there too, not only through the
+        ProcessPoolExecutor branch."""
+        from geo_engine.io.dxf_reader import read_dxf_bundle
 
-        assert pick_base_drawing([broken]) is None
+        only = self._drawing(tmp_path / "only.dxf", 7)
+
+        counts: dict[Path, int] = {}
+        read_dxf_bundle([only], on_file_read=counts.__setitem__)
+
+        assert counts == {only: 7}
