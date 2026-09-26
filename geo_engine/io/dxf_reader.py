@@ -26,7 +26,7 @@ from __future__ import annotations
 import math
 import os
 import sys
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from collections.abc import Callable
 from typing import Iterable, Iterator, Literal
@@ -234,6 +234,19 @@ MOSGEOTREST_LAYER_MAP: LayerMap = {
 #   in an unbound xref. Since pipeline_service._territory_polygon() *requires*
 #   zone_type="territory", a DXF import of this dataset still needs the site
 #   outline supplied another way. Open question, not a mapping we can guess.
+# * "Люки" / "Колодцы" (already in SYMBOL_LAYERS below) — checked against
+#   every available norm (SP 42.13330.2016 table 9.1, 743-PP tables 3.6.1/
+#   3.6.2, MGSN 1.02-02, SP 82.13330.2016, GOST 21.508-2020) and none gives a
+#   planting setback FROM a manhole/hatch. The one real hit (MGSN 1.02-02
+#   §6.4.3) is a rule about where the manhole itself may sit, scoped to
+#   school/kindergarten plots, not a tree/shrub distance. Confirmed live on
+#   "4. Харьковская улица" that this isn't a data gap either: the raw survey
+#   layer is bare ARC+TEXT (no INSERT block, no network-type marker — the
+#   TEXT is just a spot elevation), while the actual pipe it sits on is
+#   already present and already classified elsewhere (water_pipe/sewer/
+#   cable_line already have real setbacks_m entries) — a manhole is an access
+#   point on an already-protected line, not an independent structure with its
+#   own clearance. Left as "unknown" on purpose, see CLAUDE.md.
 
 # Layers whose INSERTs are point symbols: the insertion point *is* the object,
 # and exploding them yields the little circles and ticks the symbol is drawn
@@ -750,11 +763,62 @@ def dxf_bundle_paths(main_path: str | Path, xref_dirname: str | None = None) -> 
     return [p for p in paths if p.is_file()]
 
 
-# Caps concurrent dwg2dxf/ODA subprocesses -- a real bundle rarely has more
-# than a few dozen DWG files, and beyond a handful of concurrent conversions
-# the limiting factor becomes disk I/O and the converter's own startup cost,
-# not anything more threads would help with.
-_MAX_CONVERT_WORKERS = 8
+def _bundle_pool_worker_count(n_files: int) -> int:
+    """How many workers to convert/read a bundle's files with.
+
+    Was hardcoded to 8 for both the DWG->DXF thread pool and the DXF-read
+    process pool. 8 is not an arbitrary number -- it is this project's brief's
+    own guaranteed *minimum* target hardware (ТЗ, "Программно-аппаратные
+    требования": "не менее 8 логических ядер"), so the hardcode happened to
+    exactly match the floor and silently left every core above 8 idle on any
+    machine with more. Confirmed live on the dev container (12 cores): both
+    pools topped out at ~800% CPU during their busy bursts, nowhere near the
+    1200% available.
+
+    `usable` only drops below the machine's full core count once there is
+    real headroom above the brief's floor, so an exactly-8-core deployment
+    (the guaranteed worst case) keeps today's already-tested full-throttle
+    behaviour bit-for-bit, and a beefier box (this dev container, or whatever
+    a pilot deployment actually runs on) gets to use the rest instead of
+    leaving it idle. One core is held back above that floor for the event
+    loop / other concurrent requests -- a background upload should not be
+    able to starve the server it is running inside of.
+    """
+    cores = os.cpu_count() or 1
+    usable = cores - 1 if cores > 8 else cores
+    return max(1, min(n_files, usable))
+
+
+def _lpt_partition(paths: list[Path], num_bins: int) -> list[list[Path]]:
+    """Greedy longest-processing-time-first bin assignment: sort by file size
+    descending, then always add the next file to whichever bin currently has
+    the smallest running total size.
+
+    Needed specifically for *batched* conversion (see convert_with_oda_batch),
+    where the caller has to decide bin membership up front before dispatch --
+    unlike a plain per-file task queue, which a thread/process pool already
+    load-balances on its own as workers free up (sorting the queue itself by
+    size descending is sufficient there, no explicit bins needed).
+
+    A flat `sorted(..., reverse=True)` guarantees only that the single
+    biggest file starts first -- it says nothing about how evenly the *rest*
+    divide up. A bundle with one dominant file and many small ones needs that
+    file isolated in its own bin from the start, or it ends up sharing a bin
+    with several small ones and finishing later than bins that got an even
+    spread by luck -- exactly the "~800% CPU falling to ~90% for one file's
+    own long tail" trace measured live on a real 33-file bundle (see
+    _bundle_pool_worker_count's docstring for the CPU numbers).
+    """
+    if num_bins <= 1 or len(paths) <= 1:
+        return [list(paths)] if paths else []
+    ordered = sorted(paths, key=lambda p: p.stat().st_size, reverse=True)
+    bins: list[list[Path]] = [[] for _ in range(min(num_bins, len(ordered)))]
+    totals = [0] * len(bins)
+    for path in ordered:
+        target = min(range(len(bins)), key=lambda i: totals[i])
+        bins[target].append(path)
+        totals[target] += path.stat().st_size
+    return bins
 
 
 class BundleResolutionError(RuntimeError):
@@ -799,6 +863,44 @@ def _other_bundle_members(source: Path, main: Path) -> list[Path]:
     return sorted(p for p in found if "PaxHeader" not in p.parts)
 
 
+def _discover_bundle_members(source: Path) -> tuple[Path, list[Path]]:
+    """(main file, every file belonging to the bundle including main), before
+    any DWG->DXF conversion.
+
+    Extracted out of what used to be three branches inline in
+    `resolve_bundle_inputs()` (a project folder, a lone .dwg, a lone .dxf) so
+    `resolve_and_read_bundle()` -- which needs the exact same file selection,
+    just without materializing the fully-converted file list before reading
+    is allowed to start -- picks files the same way instead of drifting apart
+    from this one over time.
+    """
+    if source.is_dir():
+        candidates = sorted(p for p in source.iterdir() if p.suffix.lower() in (".dxf", ".dwg"))
+        if not candidates:
+            # A real delivery's top level holds the drawing directly -- zero
+            # files here usually means this is an umbrella folder one level
+            # above the actual project folder (live case: "Исходные данные"
+            # for a street holds three unrelated subfolders -- permits,
+            # dendrology survey, and the actual "<id>_Генплан... - Standard"
+            # drawing set -- none of them at this level). Listing what *is*
+            # here turns "no files found" into "look one level down, into one
+            # of these" instead of a dead end.
+            subdirs = sorted(p.name for p in source.iterdir() if p.is_dir())
+            hint = f" Есть подпапки: {', '.join(subdirs)} — чертёж, вероятно, в одной из них." if subdirs else ""
+            raise BundleResolutionError(f"В каталоге {source} нет ни одного .dxf/.dwg файла.{hint}")
+        # Largest file in the folder root, not by name: real deliveries name
+        # sheets after survey order numbers, not "main.dxf".
+        main = max(candidates, key=lambda p: p.stat().st_size)
+        return main, [main, *_other_bundle_members(source, main)]
+
+    if source.suffix.lower() == ".dwg":
+        # The (still unconverted) file has no Xrefs/ of its own to look
+        # inside -- look next to the original instead.
+        return source, [source, *dxf_bundle_paths(source)[1:]]
+
+    return source, dxf_bundle_paths(source)
+
+
 def resolve_bundle_inputs(
     source: str | Path,
     workdir: str | Path,
@@ -830,15 +932,59 @@ def resolve_bundle_inputs(
     def convert_each(paths: list[Path]) -> list[Path]:
         if not paths:
             return []
-        # Each conversion is an independent subprocess call (dwg2dxf/ODA)
-        # with no shared state between files -- running them one at a time
-        # was pure serialized wall-clock, not CPU contention (measured: 33
-        # DWG files in one real bundle took 10.3s sequentially). Threads,
-        # not processes: subprocess.run() releases the GIL for however long
-        # the external converter runs, so there's no Python-level CPU work
-        # here for a process pool to actually parallelize across cores --
-        # threads already overlap the wait for free, at a fraction of a
-        # process pool's spawn cost.
+
+        # Real, unmocked ODA conversions batch several files into one
+        # invocation instead of one call per file -- see
+        # convert_with_oda_batch's docstring: measured live, ~7x fewer
+        # Qt6+xvfb startups for the same files, because that fixed per-call
+        # cost otherwise dominates a small xref file's conversion time. Only
+        # taken when using the real default converter (a caller-supplied
+        # `convert` override -- tests, mainly -- has no directory-batch
+        # equivalent to call) and when ODA is actually the active backend
+        # (LibreDWG's dwg2dxf is a cheap native CLI with no comparable
+        # per-call GUI-startup tax to amortize, so it keeps the plain
+        # per-file path below).
+        if convert is _default_dwg_convert:
+            from geo_engine.io.dwg_convert import available_backend, convert_with_oda_batch
+
+            if available_backend() == "oda":
+                dwg_paths = [p for p in paths if p.suffix.lower() == ".dwg"]
+                batch_results: dict[Path, Path] = {}
+                if dwg_paths:
+                    bins = _lpt_partition(dwg_paths, _bundle_pool_worker_count(len(dwg_paths)))
+                    with ThreadPoolExecutor(max_workers=len(bins)) as pool:
+                        futures = {pool.submit(convert_with_oda_batch, chunk, workdir): chunk for chunk in bins}
+                        for future in futures:
+                            chunk = futures[future]
+                            try:
+                                batch_results.update(future.result())
+                            except RuntimeError as error:
+                                # The whole bin failed to run at all (see
+                                # convert_with_oda_batch's docstring) -- every
+                                # file in it stays unconverted, same as any
+                                # individual failure below.
+                                for path in chunk:
+                                    warnings.append(f"пропущен {path.name}: {error}")
+
+                converted = []
+                for path in paths:  # canonical order, not bin/dispatch order
+                    if path.suffix.lower() != ".dwg":
+                        converted.append(path)
+                    elif path in batch_results:
+                        converted.append(batch_results[path])
+                    else:
+                        warnings.append(
+                            f"пропущен {path.name}: ODA File Converter не создал файл для этого чертежа"
+                        )
+                return converted
+
+        # Fallback: LibreDWG backend, or a caller-supplied `convert` (tests).
+        # No batch API for either, so still one call per file -- but largest
+        # files first (a flat descending sort is enough here, unlike the
+        # explicit bins above: a thread pool already hands the next queued
+        # task to whichever worker frees up first, which for a
+        # decreasing-size queue *is* greedy LPT scheduling at runtime) and
+        # sized to the machine's real core count, not a hardcoded 8.
         results: dict[Path, Path | RuntimeError] = {}
 
         def attempt(path: Path) -> None:
@@ -847,11 +993,12 @@ def resolve_bundle_inputs(
             except RuntimeError as error:
                 results[path] = error
 
-        with ThreadPoolExecutor(max_workers=min(len(paths), _MAX_CONVERT_WORKERS)) as pool:
-            list(pool.map(attempt, paths))
+        ordered = sorted(paths, key=lambda p: p.stat().st_size, reverse=True)
+        with ThreadPoolExecutor(max_workers=_bundle_pool_worker_count(len(ordered))) as pool:
+            list(pool.map(attempt, ordered))
 
         converted = []
-        for path in paths:
+        for path in paths:  # canonical order, not dispatch order
             outcome = results[path]
             if isinstance(outcome, RuntimeError):
                 # One unreadable xref must not sink the whole bundle -- but it
@@ -864,39 +1011,10 @@ def resolve_bundle_inputs(
                 converted.append(outcome)
         return converted
 
-    if source.is_dir():
-        candidates = sorted(p for p in source.iterdir() if p.suffix.lower() in (".dxf", ".dwg"))
-        if not candidates:
-            # A real delivery's top level holds the drawing directly -- zero
-            # files here usually means this is an umbrella folder one level
-            # above the actual project folder (live case: "Исходные данные"
-            # for a street holds three unrelated subfolders -- permits,
-            # dendrology survey, and the actual "<id>_Генплан... - Standard"
-            # drawing set -- none of them at this level). Listing what *is*
-            # here turns "no files found" into "look one level down, into one
-            # of these" instead of a dead end.
-            subdirs = sorted(p.name for p in source.iterdir() if p.is_dir())
-            hint = f" Есть подпапки: {', '.join(subdirs)} — чертёж, вероятно, в одной из них." if subdirs else ""
-            raise BundleResolutionError(f"В каталоге {source} нет ни одного .dxf/.dwg файла.{hint}")
-        # Largest file in the folder root, not by name: real deliveries name
-        # sheets after survey order numbers, not "main.dxf".
-        main = max(candidates, key=lambda p: p.stat().st_size)
-        converted_main = convert_if_needed(main)
-        return converted_main, [converted_main, *convert_each(_other_bundle_members(source, main))], warnings
-
-    converted_main = convert_if_needed(source)
-    if source.suffix.lower() == ".dwg":
-        # The converted copy has no Xrefs/ of its own -- look next to the
-        # original.
-        siblings = dxf_bundle_paths(source)
-        return converted_main, [converted_main, *convert_each(siblings[1:])], warnings
-    return converted_main, dxf_bundle_paths(converted_main), warnings
-
-
-# Caps worker processes for parallel bundle reading -- a real bundle rarely
-# has more than a few dozen files, so this is really just "don't outrun the
-# machine's own core count".
-_MAX_READ_WORKERS = 8
+    main, all_members = _discover_bundle_members(source)
+    converted_main = convert_if_needed(main)
+    others = [p for p in all_members if p != main]
+    return converted_main, [converted_main, *convert_each(others)], warnings
 
 
 def _read_one_bundle_file(
@@ -995,10 +1113,19 @@ def read_dxf_bundle(
     zones: list[Zone] = []
 
     if len(paths) > 1:
-        worker_count = min(len(paths), _MAX_READ_WORKERS, os.cpu_count() or 1)
+        worker_count = _bundle_pool_worker_count(len(paths))
+        # Largest files first: a size-descending submission queue is greedy
+        # LPT scheduling at runtime (the pool hands the next queued task to
+        # whichever worker frees up first), so the file that would otherwise
+        # be the lone survivor after every other worker has gone idle instead
+        # starts immediately alongside everything else. Collection below
+        # still walks the ORIGINAL `paths` order, not this one, so the
+        # documented "same order paths was given" guarantee is unaffected by
+        # how submission was scheduled.
+        ordered = sorted(paths, key=lambda p: p.stat().st_size, reverse=True)
         with ProcessPoolExecutor(max_workers=worker_count) as pool:
-            futures = {
-                pool.submit(
+            future_by_path = {
+                path: pool.submit(
                     _read_one_bundle_file,
                     path,
                     layer_map,
@@ -1007,11 +1134,11 @@ def read_dxf_bundle(
                     drop_origin,
                     use_layer_rules,
                     reconstruct_footprints,
-                ): path
-                for path in paths
+                )
+                for path in ordered
             }
-            for future in futures:
-                path = futures[future]
+            for path in paths:  # canonical order, not dispatch order
+                future = future_by_path[path]
                 try:
                     file_utilities, file_zones, entity_count = future.result()
                 except Exception as error:  # noqa: BLE001 — судьбу решает вызывающий
@@ -1193,6 +1320,139 @@ def _add_closed_road_polygons(zones: list[Zone]) -> list[Zone]:
             layer_note = targeted[0].attrs or {}
             zones.extend(Zone(geometry=g, zone_type=road_type, attrs=layer_note) for g in extra_polygons)
     return zones
+
+
+def resolve_and_read_bundle(
+    source: str | Path,
+    workdir: str | Path,
+    layer_map: LayerMap | None = None,
+    convert: Callable[[Path, Path], Path] | None = None,
+    explode_blocks: bool = True,
+    symbol_layers: frozenset[str] | None = None,
+    stitch_dashes: bool = False,
+    drop_origin: bool = False,
+    use_layer_rules: bool = True,
+    reconstruct_footprints: bool = False,
+    on_error: Callable[[Path, Exception], None] | None = _warn_unreadable,
+) -> tuple[list[Utility], list[Zone], list[str]]:
+    """`resolve_bundle_inputs()` followed by `read_dxf_bundle()`, overlapped
+    instead of sequential.
+
+    Measured live on a real 33-file/52MB bundle ("1. Олимпийская деревня"):
+    conversion (25.3s -- an external GUI subprocess, ODA under xvfb, mostly
+    waiting on its own startup and the OS) and reading (94.7s -- real
+    Python/shapely CPU work) are two fully independent resources that
+    `resolve_bundle_inputs()` followed by `read_dxf_bundle()` nonetheless
+    pays for back to back (120s total), because the first function cannot
+    return anything until *every* file has finished converting. Nothing
+    stops file 1's read from starting the moment file 1 finishes converting
+    while file 30 is still being converted -- this function does exactly
+    that: a bundle member that is already `.dxf` needs no conversion and is
+    handed to the read pool immediately; each `.dwg` is handed off to it the
+    moment its own conversion completes (`as_completed`, not "after the
+    whole batch"). In the best case this brings the wall-clock for the two
+    stages together down towards `max(convert, read)` instead of their sum.
+
+    Result order is still deterministic and independent of which file
+    happens to finish first -- the same guarantee `read_dxf_bundle` documents
+    for itself -- because results are collected keyed by source path and only
+    concatenated in `_discover_bundle_members`'s canonical order at the end,
+    never in completion order.
+
+    The main file's own conversion is a hard failure (propagates), same as
+    `resolve_bundle_inputs`; every other bundle member's conversion failure
+    is a soft warning (collected and returned, not raised), also matching
+    `resolve_bundle_inputs` -- one bad xref must not sink the whole street.
+    Read failures go through `on_error`, matching `read_dxf_bundle`.
+
+    Used by the web upload path (`project_service.py`), which has no need for
+    "which file was main" once reading is done (`_` already discarded it
+    before this function existed) -- unlike `resolve_bundle_inputs`, this one
+    does not return the main file's path. `scripts/plan_dxf.py` keeps its own
+    separate resolution (see `resolve_bundle_inputs`'s docstring) and does not
+    use this function -- it still needs `pick_base_drawing()`'s per-file
+    entity counts, which this function does not expose.
+    """
+    source = Path(source)
+    workdir = Path(workdir)
+    convert = convert or _default_dwg_convert
+    warnings: list[str] = []
+
+    def convert_if_needed(path: Path) -> Path:
+        return convert(path, workdir) if path.suffix.lower() == ".dwg" else path
+
+    main, all_members = _discover_bundle_members(source)
+    converted_main = convert_if_needed(main)  # hard failure, same as resolve_bundle_inputs
+    others = [p for p in all_members if p != main]
+
+    def submit_read(pool: ProcessPoolExecutor, dxf_path: Path) -> Future:
+        return pool.submit(
+            _read_one_bundle_file,
+            dxf_path,
+            layer_map,
+            explode_blocks,
+            symbol_layers,
+            drop_origin,
+            use_layer_rules,
+            reconstruct_footprints,
+        )
+
+    utilities: list[Utility] = []
+    zones: list[Zone] = []
+
+    with ProcessPoolExecutor(max_workers=_bundle_pool_worker_count(len(all_members))) as read_pool:
+        # The main file needs no waiting -- already converted above -- so its
+        # read starts immediately, overlapped with every other file below
+        # instead of just being "first in line" the way the old sequential
+        # resolve-then-read left it.
+        pending: dict[Path, Future] = {main: submit_read(read_pool, converted_main)}
+
+        dwg_others = [p for p in others if p.suffix.lower() == ".dwg"]
+        already_dxf = [p for p in others if p.suffix.lower() != ".dwg"]
+        for path in already_dxf:
+            pending[path] = submit_read(read_pool, path)
+
+        if dwg_others:
+            # Largest first (LPT), same reasoning as resolve_bundle_inputs's
+            # convert_each fallback path -- a decreasing-size submission
+            # queue is greedy LPT scheduling at runtime for a plain
+            # thread-per-file pool. Deliberately NOT the batched-ODA path
+            # convert_each uses: batching would delay *every* file in a bin
+            # until the whole bin's ODA call returns, which defeats the
+            # entire point here of starting each file's read the moment
+            # *that* file's own conversion is done.
+            ordered = sorted(dwg_others, key=lambda p: p.stat().st_size, reverse=True)
+            with ThreadPoolExecutor(max_workers=_bundle_pool_worker_count(len(ordered))) as convert_pool:
+                convert_futures = {convert_pool.submit(convert_if_needed, path): path for path in ordered}
+                for future in as_completed(convert_futures):
+                    original = convert_futures[future]
+                    try:
+                        dxf_path = future.result()
+                    except RuntimeError as error:
+                        warnings.append(f"пропущен {original.name}: {error}")
+                        continue
+                    pending[original] = submit_read(read_pool, dxf_path)
+
+        for path in all_members:  # canonical order, not completion order
+            future = pending.get(path)
+            if future is None:
+                continue  # conversion failed and was already warned about above
+            try:
+                file_utilities, file_zones, _entity_count = future.result()
+            except Exception as error:  # noqa: BLE001 — судьбу решает вызывающий
+                if on_error is None:
+                    raise
+                on_error(path, error)
+                continue
+            utilities.extend(file_utilities)
+            zones.extend(file_zones)
+
+    if stitch_dashes:
+        utilities = stitch_utility_lines(utilities)
+    if reconstruct_footprints:
+        zones = _add_closed_road_polygons(zones)
+
+    return utilities, zones, warnings
 
 
 def read_dxf(

@@ -48,8 +48,7 @@ from geo_engine.io.dxf_reader import (
     COMBINED_LAYER_MAP,
     BundleResolutionError,
     read_dxf,
-    read_dxf_bundle,
-    resolve_bundle_inputs,
+    resolve_and_read_bundle,
 )
 from geo_engine.io.shp_geojson_reader import read_vector_file
 from geo_engine.model import Utility, Zone
@@ -62,17 +61,25 @@ class UnsupportedFileTypeError(ValueError):
 
 
 def _parse_dxf_bundle(path: Path, workdir: Path) -> tuple[list[Utility], list[Zone], str | None]:
-    """One drawing or a whole project folder -- resolve_bundle_inputs handles
-    both, so a lone .dwg and a .zip full of them share this path."""
-    _, bundle, warnings = resolve_bundle_inputs(path, workdir)
+    """One drawing or a whole project folder -- resolve_and_read_bundle
+    handles both, so a lone .dwg and a .zip full of them share this path.
+
+    `resolve_and_read_bundle` (not the older resolve_bundle_inputs +
+    read_dxf_bundle two-step) overlaps DWG->DXF conversion with reading
+    instead of waiting for the whole bundle to finish converting before
+    reading anything -- see its docstring. This is the only caller that
+    matters for that overlap: the web upload is exactly the path a slow,
+    fully-sequential resolve-then-read was measured live to cost tens of
+    seconds on a real multi-file bundle.
+    """
+    utilities, zones, warnings = resolve_and_read_bundle(
+        path, workdir, layer_map=COMBINED_LAYER_MAP, stitch_dashes=True, drop_origin=True, reconstruct_footprints=True
+    )
     for warning in warnings:
         # Not fatal -- one unreadable xref shouldn't sink the whole upload --
         # but worth keeping somewhere a developer can find it; nothing in the
         # API response surfaces per-file warnings today.
         print(f"  ! {warning}")
-    utilities, zones = read_dxf_bundle(
-        bundle, layer_map=COMBINED_LAYER_MAP, stitch_dashes=True, drop_origin=True, reconstruct_footprints=True
-    )
     return utilities, zones, None
 
 

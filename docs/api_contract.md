@@ -4,8 +4,10 @@
 
 | Метод | Путь | Описание |
 |---|---|---|
-| `POST` | `/api/projects` | Загрузка территории (`multipart/form-data`: `name`, `file` — DXF/GeoJSON/SHP, опц. `source_crs`) → `{project_id}`. `source_crs` можно не указывать для GeoJSON/SHP в градусах (WGS84) — определяется автоматически и перепроецируется в UTM (см. CLAUDE.md); для DXF и любой другой метрической CRS `source_crs` по-прежнему обязателен |
-| `GET` | `/api/projects/{project_id}` | Метаданные проекта + все слои (коммуникации, здания, зонирование, территория) в виде `FeatureCollection` |
+| `POST` | `/api/projects` | Загрузка территории (`multipart/form-data`: `name`, `file` — DXF/DWG/ZIP/GeoJSON/SHP, опц. `source_crs`) — запускает DWG-конвертацию + разбор бандла как **фоновую задачу** (на реальном многофайловом ZIP — от десятков секунд до нескольких минут, см. CLAUDE.md) → `202 {job_id}`. `source_crs` можно не указывать для GeoJSON/SHP в градусах (WGS84) — определяется автоматически и перепроецируется в UTM (см. CLAUDE.md); для DXF/DWG/ZIP и любой другой метрической CRS `source_crs` по-прежнему обязателен |
+| `GET` | `/api/projects/upload/{job_id}` | Статус фоновой задачи загрузки → `{status: "pending"\|"done"\|"error", project_id, error}`. Фронт опрашивает это, затем забирает проект обычным `GET .../{project_id}` |
+| `GET` | `/api/projects/{project_id}` | Метаданные проекта (без слоёв — см. `/layers` ниже) |
+| `GET` | `/api/projects/{project_id}/layers` | Все слои (коммуникации, здания, зонирование, территория) в виде `FeatureCollection` — отдельный, лениво запрашиваемый эндпоинт (только 3D-вид), на реальном масштабе может быть десятки МБ |
 | `POST` | `/api/projects/{project_id}/generate` | Запускает генерацию как **фоновую задачу** (не ждёт её здесь — на реальном масштабе может занять десятки секунд) → `202 {job_id}` |
 | `GET` | `/api/projects/{project_id}/generate/{job_id}` | Статус фоновой задачи генерации → `{status: "pending"\|"done"\|"error", plan_id, error}`. Фронт опрашивает это, затем забирает план обычным `GET .../plans/{plan_id}` — создаёт **новый** `Plan` (не перезаписывает предыдущий), помечает его `is_current` |
 | `GET` | `/api/projects/{project_id}/plans` | История всех планов проекта (не только текущий) — `[{plan_id, scoring_mode, created_at, is_current, item_count}]`, без геометрии (для списка/переключателя в UI) |
