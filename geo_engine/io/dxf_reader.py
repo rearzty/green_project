@@ -551,8 +551,68 @@ def iter_entities(
     explosion would collapse a real utility down to a single insertion point
     instead of its true geometry. Only genuinely unclassifiable layers (map
     silent AND rules silent) short-circuit when this is on.
+
+    Live data-loss bug, found on "20. Макеева С. ул": the short-circuit above
+    only ever checked the INSERT's OWN layer, never what layer the block's
+    CONTENT sits on -- and placing a block reference on layer "0" while its
+    real content keeps its own layers/colours is ordinary, unremarkable
+    AutoCAD practice, not a sign the content is decorative. This street's
+    "Здания"/"Части зданий" (building outlines, 219 entities, real polygon
+    area once reconstructed) lived inside exactly such a block, referenced
+    on layer "0" -- unmapped, unclassifiable by name -- and the short-circuit
+    threw the whole building away as a single unclassified insertion point.
+    Confirmed directly, not guessed: `building`/`existing_greenery`/
+    `power_line_corridor` zones on this street went from 0/0/0 (every one of
+    those object types entirely absent, not just under-counted) to 239/13/27
+    once block content was actually inspected. `_block_has_classifiable_content()`
+    below closes this without giving up the original optimization's real
+    win: it inspects each unique block DEFINITION once (memoized by block
+    name, recursing into nested INSERTs up to the same depth limit as
+    explosion itself), not once per INSTANCE -- the 18-instances-of-one-
+    decorative-symbol case this short-circuit was built for still costs one
+    inspection, not eighteen, and still short-circuits correctly, because
+    that block's content genuinely has nothing classifiable in it either way.
     """
     symbol_layers = SYMBOL_LAYERS if symbol_layers is None else symbol_layers
+    block_content_memo: dict[str, bool] = {}
+
+    def _entity_contributes(entity) -> bool:
+        """Would this entity, if reached, resolve to something other than
+        `object_type="unknown"`? A symbol-layer INSERT is a real single-point
+        feature in its own right (existing tree/well/lamp); anything else is
+        judged by the same layer_map/layer_rules test `walk()` itself uses."""
+        entity_layer = normalize_layer(entity.dxf.layer)
+        if entity.dxftype() == "INSERT" and (entity_layer in symbol_layers or is_symbol_layer(entity_layer)):
+            return True
+        if layer_map is not None and entity_layer in layer_map:
+            return True
+        return use_layer_rules and classify_layer(entity_layer) is not None
+
+    def _block_has_classifiable_content(entity, depth: int) -> bool:
+        if layer_map is None:
+            return False
+        block_name = entity.dxf.name
+        if block_name in block_content_memo:
+            return block_content_memo[block_name]
+        # Recursion guard first, so a cycle or excessive nesting can't loop
+        # forever computing its own memo entry.
+        block_content_memo[block_name] = False
+        if depth >= _MAX_BLOCK_DEPTH:
+            return False
+        doc = entity.doc
+        block = doc.blocks.get(block_name) if doc is not None else None
+        if block is None:
+            return False
+        found = False
+        for child in block:
+            if _entity_contributes(child):
+                found = True
+                break
+            if child.dxftype() == "INSERT" and _block_has_classifiable_content(child, depth + 1):
+                found = True
+                break
+        block_content_memo[block_name] = found
+        return found
 
     def walk(entities, depth: int) -> Iterator:
         for entity in entities:
@@ -564,7 +624,9 @@ def iter_entities(
                 yield entity
                 continue
             if layer_map is not None and layer not in layer_map:
-                if not use_layer_rules or classify_layer(layer) is None:
+                if (not use_layer_rules or classify_layer(layer) is None) and not _block_has_classifiable_content(
+                    entity, depth
+                ):
                     yield entity
                     continue
             if not explode_blocks or depth >= _MAX_BLOCK_DEPTH:
