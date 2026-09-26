@@ -117,6 +117,79 @@ class TestRegionGeometry:
         assert gas[0].geometry.area == pytest.approx(100.0)
 
 
+class TestAcisDataLookupIsIndexed:
+    """Live perf bug, found on "4. Харьковская улица": every REGION/3DSOLID's
+    `entity.sab` access -- what `_region_to_geometry()`'s `ezdxf.acis.api.
+    load_dxf()` call triggers once per entity -- made ezdxf's own
+    `AcDsDataSection.find_acis_record()` do a linear scan through the whole
+    ACDSDATA section, so a document with N ACIS entities cost O(N²) to read,
+    not O(N). Measured directly: 104s of a 106s file read, on a real 60.7 МБ
+    file with 6503 REGION entities -- almost the entire per-file bottleneck
+    of the whole bundle read. Patched with a handle -> record index built
+    once per section and reused (`_indexed_find_acis_record`, applied at
+    import time in dxf_reader.py, same place/style as this module's other
+    ezdxf patches) -- 104s -> 3.9s on that same real file, ~27x, with
+    byte-identical lookups spot-checked against the original linear scan
+    across the start/middle/end of the list (0 mismatches over 150 checked).
+
+    These tests exercise the patched function directly against a real
+    multi-entity ACDSDATA section (built the same way TestRegionGeometry
+    builds its ACIS payloads: `body_from_mesh()` + `export_dxf()`, not a
+    hand-typed byte string), not a timing assertion -- a wall-clock threshold
+    here would either be too loose to catch a real O(N²) regression or too
+    tight to survive a slow CI runner. What actually matters and is safe to
+    assert unconditionally: every entity's own data is still found, correctly,
+    including after the ACDSDATA section grows.
+    """
+
+    def _region_with_acis(self, doc, tag: float):
+        entity = doc.modelspace().new_entity("REGION", dxfattribs={"layer": "0"})
+        mesh = MeshBuilder()
+        mesh.add_face([(0, 0, 0), (tag, 0, 0), (tag, tag, 0), (0, tag, 0)])
+        body = acis_api.body_from_mesh(mesh)
+        acis_api.export_dxf(entity, [body])
+        return entity
+
+    def test_every_entitys_own_data_is_found_correctly(self):
+        """Not just "a lookup succeeds" -- each of several entities in the
+        same document must get back *its own* data, not a neighbour's
+        (the failure mode an off-by-one or a stale index would produce)."""
+        doc = ezdxf.new("R2018")
+        entities = [self._region_with_acis(doc, tag=float(n)) for n in (3, 7, 11, 19)]
+
+        for entity, expected_side in zip(entities, (3.0, 7.0, 11.0, 19.0)):
+            geometry = _region_to_geometry(entity)
+            assert geometry.area == pytest.approx(expected_side * expected_side)
+
+    def test_lookup_still_works_after_the_acdsdata_section_grows(self):
+        """The index invalidates on `len(entities)` change -- built once for
+        the first two entities, then a third is added (growing the section)
+        and must still resolve correctly, not miss because of a stale index
+        built before it existed."""
+        doc = ezdxf.new("R2018")
+        first = self._region_with_acis(doc, tag=5.0)
+        second = self._region_with_acis(doc, tag=8.0)
+
+        assert _region_to_geometry(first).area == pytest.approx(25.0)
+        assert _region_to_geometry(second).area == pytest.approx(64.0)
+
+        third = self._region_with_acis(doc, tag=13.0)
+        assert _region_to_geometry(third).area == pytest.approx(169.0)
+        # The first two must still resolve correctly too, not just the new one.
+        assert _region_to_geometry(first).area == pytest.approx(25.0)
+        assert _region_to_geometry(second).area == pytest.approx(64.0)
+
+    def test_a_handle_with_no_acis_record_is_not_found(self):
+        """A REGION that legitimately carries no ACIS payload (the LibreDWG
+        0-byte case `_region_to_geometry`'s own tests cover) must not be
+        confused with a real record by the indexed lookup either."""
+        doc = ezdxf.new("R2018")
+        self._region_with_acis(doc, tag=4.0)
+        empty = doc.modelspace().new_entity("REGION", dxfattribs={"layer": "0"})
+
+        assert doc.acdsdata.find_acis_record(empty.dxf.handle) is None
+
+
 class TestHatchGeometry:
     def test_a_simple_polyline_boundary_hatch_becomes_a_polygon(self, tmp_path):
         doc = ezdxf.new(setup=True)

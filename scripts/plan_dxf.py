@@ -16,18 +16,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import tempfile
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from geo_engine.compliance import explain_items, report_payload, unverified_sources, write_trace_csv
 from geo_engine.io.dxf_reader import (
     COMBINED_LAYER_MAP,
     BundleResolutionError,
-    read_document,
     read_dxf_bundle,
     resolve_bundle_inputs,
 )
@@ -67,20 +64,7 @@ def resolve_inputs(source: Path, workdir: Path) -> tuple[Path, list[Path]]:
     return main, bundle
 
 
-def _open_and_count(path: Path) -> tuple[Path, int | None, str | None]:
-    """Opens one bundle file and counts its modelspace entities, or reports
-    why it couldn't. Module-level and picklable so it can run in a worker
-    process (see pick_base_drawing) -- returns the failure as data rather
-    than raising, since a worker process has no way to call back into the
-    caller's own stderr-printing loop."""
-    try:
-        doc = read_document(path)
-    except Exception as error:  # noqa: BLE001 — годится любой открывающийся
-        return path, None, type(error).__name__
-    return path, sum(1 for _ in doc.modelspace()), None
-
-
-def pick_base_drawing(candidates: list[Path]) -> Path | None:
+def pick_base_drawing(entity_counts: dict[Path, int]) -> Path | None:
     """Самый крупный чертёж, который реально открывается.
 
     Исходник нужен только как холст: результат пишется в его копию отдельным
@@ -94,40 +78,28 @@ def pick_base_drawing(candidates: list[Path]) -> Path | None:
     "backslash-U-plus", на которой падает декодер ezdxf. Остальные файлы бандла при этом читаются, и план по
     ним строится полностью.
 
-    Каждое открытие независимо от остальных — то же самое чтение, что уже
-    параллелится в `read_dxf_bundle`, просто здесь бандл перечитывается
-    заново только ради подсчёта сущностей. Раньше это был последовательный
-    цикл — замерено на реальном бандле (33 файла, «1. Олимпийская деревня»):
-    81.2с, самый большой необъяснённый кусок времени всего CLI-прогона (см.
-    docs/worklog.md), при том что параллельное чтение того же бандла в
-    read_dxf_bundle заняло 61с. `ProcessPoolExecutor.map` возвращает
-    результаты в порядке `ordered`, не в порядке завершения — порядок
-    перебора (и, значит, какой файл выигрывает при равном числе сущностей)
-    остаётся ровно таким же, как в последовательной версии.
+    `entity_counts` приходит уже готовым из `read_dxf_bundle(on_file_read=...)`
+    в `main()` ниже — по одной записи на каждый файл, который реально
+    прочитался (неоткрывшиеся туда просто не попадают, тем же путём, каким
+    `on_error` уже печатает про них при самом чтении). Раньше эта функция
+    сама открывала каждый файл бандла ЕЩЁ РАЗ — то же самое чтение, что уже
+    параллелится в `read_dxf_bundle`, просто ради подсчёта сущностей.
+    Замерено на реальном бандле (33 файла, «1. Олимпийская деревня»): 81.2с
+    последовательно, позже с параллелизацией — всё равно отдельный
+    полноценный второй проход по всем файлам (16.7с на 19-файловом бандле
+    «4. Харьковская улица», где перечитывать было уже нечего быстрее). Раз
+    `_read_one_bundle_file()` и так открывает документ, чтобы его прочитать,
+    посчитать `len(doc.modelspace())` там же — это уже открытые в памяти
+    сущности, не новый файловый ввод-вывод, так что второй проход по
+    бандлу этой функции больше не нужен вообще.
     """
-    ordered = sorted(set(candidates), key=lambda p: p.stat().st_size, reverse=True)
-    if not ordered:
+    if not entity_counts:
         return None
-
-    if len(ordered) > 1:
-        worker_count = min(len(ordered), os.cpu_count() or 1)
-        with ProcessPoolExecutor(max_workers=worker_count) as pool:
-            results = list(pool.map(_open_and_count, ordered))
-    else:
-        results = [_open_and_count(p) for p in ordered]
-
-    best, best_count = None, -1
-    for path, count, error_name in results:
-        if count is None:
-            print(f"  ! как основу не использовать {path.name}: {error_name}", file=sys.stderr)
-            continue
-        # Не первый открывшийся, а самый содержательный: у бандла бывают
-        # файлы-заглушки в пару объектов, и копия такой заглушки со слоем
-        # результата формально проходит, но эксперт открывает её и не видит
-        # своей подосновы — ровно то, ради чего результат и пишется поверх.
-        if count > best_count:
-            best, best_count = path, count
-    return best
+    # Не первый в списке и не самый большой по байтам, а самый содержательный:
+    # у бандла бывают файлы-заглушки в пару объектов, и копия такой заглушки
+    # со слоем результата формально проходит, но эксперт открывает её и не
+    # видит своей подосновы — ровно то, ради чего результат и пишется поверх.
+    return max(entity_counts, key=entity_counts.get)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -289,6 +261,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  ! не прочитан {path.name}: {type(error).__name__}: {str(error)[:120]}", file=sys.stderr)
             unreadable.append(path)
 
+        # Filled in by read_dxf_bundle's on_file_read as a side effect of the
+        # read it's doing anyway -- see pick_base_drawing's docstring for why
+        # this replaces a second, independent open-every-file-again pass.
+        entity_counts: dict[Path, int] = {}
+
         utilities, zones = read_dxf_bundle(
             bundle,
             layer_map=COMBINED_LAYER_MAP,
@@ -296,6 +273,7 @@ def main(argv: list[str] | None = None) -> int:
             drop_origin=True,
             reconstruct_footprints=True,
             on_error=_warn_and_track,
+            on_file_read=entity_counts.__setitem__,
         )
         by_type = Counter(u.object_type for u in utilities)
         print(f"     сетей: {sum(by_type.values())} ({', '.join(f'{k}: {v}' for k, v in by_type.most_common())})")
@@ -393,7 +371,7 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"5/5 Запись результата на слои {args.prefix}$*")
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        base = pick_base_drawing([main_drawing, *bundle])
+        base = pick_base_drawing(entity_counts)
         if base is None:
             raise SystemExit(
                 "\nОШИБКА: ни один чертёж бандла не открывается — не в копию чего писать результат."
