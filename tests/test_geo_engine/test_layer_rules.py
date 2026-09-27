@@ -13,7 +13,6 @@ import pytest
 
 from geo_engine.io.layer_rules import (
     classify_layer,
-    classify_planting_layer,
     is_annotation_layer,
     is_symbol_layer,
     normalize_name,
@@ -251,30 +250,16 @@ class TestAnnotationLayers:
         """
         assert is_annotation_layer(layer)
         assert classify_layer(layer) is None
-        assert classify_planting_layer(layer) is None
 
 
 class TestDesignedPlantings:
-    @pytest.mark.parametrize(
-        "layer, expected",
-        [
-            ("52 Проектируемые деревья", "tree"),
-            ("52 Проектируемые кустарники", "shrub"),
-            ("!Посадка_Дерево", "tree"),
-            ("!Посадка_Куст", "shrub"),
-            ("ГП_ПБ_Озеленение_Посадка_Деревья", "tree"),
-            ("ГП_ПБ_Озеленение_Посадка_Кустарники_Сирень", "shrub"),
-            ("оникс_ГП_посадки_Деревья", "tree"),
-            ("ПРОЕКТИРУЕМЫЕ ДЕРЕВЬЯ", "tree"),
-        ],
-    )
-    def test_all_six_conventions_found_in_the_pilot_are_recognized(self, layer, expected):
-        assert classify_planting_layer(layer) == expected
-
     def test_designed_plantings_are_not_constraints(self):
-        """Проектная посадка — чужой результат, с которым можно сравнивать
-        свой, а не препятствие, которое надо обойти. Попади она в
-        classify_layer — buildable_area вычитала бы чужой проект.
+        """Слои чужого проекта (уже спроектированные деревья/кустарники на
+        соседних чертежах той же улицы) — не ограничение и не зона, а
+        результат чужого проекта: попади они в `classify_layer`,
+        `buildable_area` вычитала бы чужой проект из своей же площадки (живая
+        находка, см. CLAUDE.md — «Газон устраиваемый»/«Газон_Рулонный» на
+        4. Харьковской улице).
         """
         for layer in ("52 Проектируемые деревья", "!Посадка_Дерево"):
             assert classify_layer(layer) is None
