@@ -253,17 +253,6 @@ SYMBOL_PATTERNS = (
 
 _SYMBOL = re.compile("|".join(SYMBOL_PATTERNS))
 
-# Проектные (новые) посадки. Это НЕ ограничение и не зона — это результат
-# чужого проекта. Нужны отдельно: как эталон для сверки и как размеченные
-# примеры для обучения ранжирования.
-PLANTING_RULES: tuple[tuple[str, str], ...] = (
-    (r"(проектируем|посадк|посадки|высажив|новы\w* посадк).*(куст|кустарник)", "shrub"),
-    (r"(куст|кустарник).*(проектируем|посадк|высажив)", "shrub"),
-    (r"(проектируем|посадк|посадки|высажив|новы\w* посадк).*(дерев)", "tree"),
-    (r"(дерев).*(проектируем|посадк|высажив)", "tree"),
-    (r"дендроплан \(растени", "tree"),
-)
-
 
 def is_annotation_layer(name: str) -> bool:
     """Слой оформления, а не объектов."""
@@ -291,18 +280,3 @@ def classify_layer(name: str) -> tuple[Kind, str] | None:
     return None
 
 
-def classify_planting_layer(name: str) -> str | None:
-    """Тип посадки, если слой несёт ПРОЕКТНЫЕ (новые) посадки.
-
-    Отделено от `classify_layer` намеренно: проектная посадка — не
-    ограничение, которое надо обойти, а результат, с которым можно сравнивать
-    свой. Смешивать их в одной карте означало бы вычитать чужой проект из
-    своей buildable-area.
-    """
-    normalized = normalize_name(name)
-    if not normalized or _ANNOTATION.search(normalized):
-        return None
-    for pattern, planting_type in PLANTING_RULES:
-        if re.search(pattern, normalized):
-            return planting_type
-    return None
