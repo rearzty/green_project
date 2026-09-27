@@ -191,7 +191,35 @@ def _fit_row_species(
     берётся отсюда, а не из `type_norms.spacing_for`. Не применяется, если
     пользователь сам задал интервал этому типу (`keep_spacing_for`) — явная
     настройка пользователя не должна тихо подменяться дефолтом изгороди.
+
+    **Перебор пропускается целиком, если `planting_type` не в
+    `CROWN_SPACING_TYPES` (т.е. не "tree").** Не эвристика, а прямое следствие
+    того, что уже проверяют `resolve_setback()` (только `planting_type ==
+    "tree"` вообще смотрит на `species`) и `norms_for_species()` (`return
+    norms` без изменений при том же условии, см. её докстринг) — для
+    кустарника/газона КАЖДАЯ порода палитры даёт побитово одинаковые
+    `exclusion`/`buildable`/`guides`/`rows`, так что цикл по палитре считает
+    одно и то же по многу раз. Живая находка на реальной улице («4.
+    Харьковская», палитра кустарника — 9 пород): полный перебор занял 422.9с
+    на построение ОДНОГО ряда — почти весь этот один вызов
+    `_compute_planting_rows(['shrub'])`, который сам доминировал в 195-секундной
+    веб-генерации плана, — при том что все 9 проходов возвращали идентичный
+    результат. Один проход вместо девяти не меняет выбор (`best`'s
+    tie-break — первый при равенстве `len(rows)`, а у всех проходов оно и так
+    равно) и не меняет геометрию — только убирает восьмикратно избыточную
+    работу.
+
+    Возвращает `exclusion`/`buildable` победившей породы вместе с
+    ней самой — не только для внутреннего использования: `_plan_type_items`
+    раньше пересчитывала `build_exclusion_zone()` ЕЩЁ РАЗ сразу после этого
+    вызова, той же породой/нормами, только чтобы получить то же самое
+    значение — на том же прогоне (после фикса выше) это был второй из трёх
+    вызовов `shapely.union_all()` по ~21с каждый на 265 тыс. объектов улицы.
+    Отдавая уже посчитанное наружу, вызывающий код просто переиспользует
+    результат вместо третьего пересчёта того же самого.
     """
+    if planting_type not in CROWN_SPACING_TYPES:
+        palette = palette[:1]
     best = None
     for candidate_species in palette or [None]:
         type_norms = norms
@@ -220,7 +248,7 @@ def _fit_row_species(
             zoning_zones=zones,
         )
         if best is None or len(rows) > len(best[2]):
-            best = (candidate_species, type_norms, rows, guides)
+            best = (candidate_species, type_norms, rows, guides, exclusion, buildable)
     return best
 
 
@@ -455,20 +483,7 @@ def _plan_type_items(
     if planting_type not in keep_spacing_for:
         type_norms = norms_for_species(norms, planting_type, species, catalogue)
 
-    exclusion = build_exclusion_zone(
-        utilities,
-        zones,
-        planting_type,
-        type_norms,
-        species,
-        catalogue.crown_reference_diameter_m,
-    )
-    margin = type_norms.territory_margin_for(planting_type)
-    buildable = buildable_area(territory, exclusion, zones, territory_margin_m=margin)
-    spacing = type_norms.spacing_for(planting_type)
-
     selected: list[PlantingItem] = []
-    remaining = buildable
     row_items: list[PlantingItem] = []
     group_items: list[PlantingItem] = []
 
@@ -480,7 +495,23 @@ def _plan_type_items(
         # Замерено: дуб (крона 10 м) дал 14 деревьев там, где узкая крона
         # даёт сотни. Проектировщик в таком месте берёт породу поуже —
         # здесь это делается перебором палитры по фактическому результату.
-        species, type_norms, rows, guides = _fit_row_species(
+        #
+        # Ниже НЕ строится предварительный exclusion/buildable под species
+        # (палитра[0]) до этого вызова, хотя раньше строился именно так —
+        # `_fit_row_species` либо перебирает палитру заново (для дерева, где
+        # порода определяет отступ), либо использует ровно ту же породу и
+        # нормы, что и был бы построен здесь (для кустарника/газона, см.
+        # `_fit_row_species`'s докстринг про CROWN_SPACING_TYPES) — в обоих
+        # случаях предварительная сборка была чистым расходом: либо её тут
+        # же перекрывает результат перебора, либо она побитово совпадает с
+        # тем, что уже посчитает `_fit_row_species`. Живая находка на
+        # реальной улице («4. Харьковская»): `build_exclusion_zone()` —
+        # ~21с на `shapely.union_all()` по 265 тыс. объектов улицы за один
+        # вызов, и раньше он вызывался здесь бесполезно ДО перебора, а
+        # затем ЕЩЁ РАЗ сразу после (см. следующий комментарий) — на
+        # кустарнике (без перебора после фикса выше) это было 2 из 3
+        # одинаковых пересчётов одного и того же результата.
+        species, type_norms, rows, guides, exclusion, buildable = _fit_row_species(
             [species] if override else palette,
             planting_type,
             zones,
@@ -492,12 +523,11 @@ def _plan_type_items(
             row_pitch_override_m=IN_ROW_PITCH_M.get(planting_type),
         )
         spacing = type_norms.spacing_for(planting_type)
-        exclusion = build_exclusion_zone(
-            utilities, zones, planting_type, type_norms, species, catalogue.crown_reference_diameter_m
-        )
-        buildable = buildable_area(
-            territory, exclusion, zones, territory_margin_m=type_norms.territory_margin_for(planting_type)
-        )
+        # НЕ пересчитывается заново: `_fit_row_species` уже вернула
+        # exclusion/buildable для победившей породы — тем же вызовом
+        # build_exclusion_zone/buildable_area, что здесь раньше стоял
+        # повторно, на тех же аргументах. Третий из трёх одинаковых
+        # пересчётов, устранённый тем же фиксом.
         remaining = buildable
         row_items = greedy_select(rows, score_fn, type_norms)
         for item in row_items:
@@ -510,6 +540,24 @@ def _plan_type_items(
         # НЕ идёт в `selected` -- ряд больше не делит бюджет плотности с
         # россыпью, см. docstring `_limit_by_density`/`_limit_row_and_group_by_density`
         # и итоговый return этой функции.
+    else:
+        # Ряд не запрошен (pattern="scatter"/"group", planting_type не
+        # входит в ROW_PLANTING_TYPES) -- сюда `_fit_row_species` не
+        # вызывается вообще, поэтому exclusion/buildable под выбранную
+        # (первую из палитры, если не задана явно) породу строятся здесь и
+        # только здесь, единственный раз для всей функции.
+        exclusion = build_exclusion_zone(
+            utilities,
+            zones,
+            planting_type,
+            type_norms,
+            species,
+            catalogue.crown_reference_diameter_m,
+        )
+        margin = type_norms.territory_margin_for(planting_type)
+        buildable = buildable_area(territory, exclusion, zones, territory_margin_m=margin)
+        spacing = type_norms.spacing_for(planting_type)
+        remaining = buildable
 
     seed = zlib.crc32(f"{plan_key}:{planting_type}".encode())
 
