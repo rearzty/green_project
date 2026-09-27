@@ -377,7 +377,20 @@ def main(argv: list[str] | None = None) -> int:
                 "\nОШИБКА: ни один чертёж бандла не открывается — не в копию чего писать результат."
             )
         if base != main_drawing:
-            print(f"     основа: {base.name} (главный чертёж не читается)")
+            if main_drawing in entity_counts:
+                # Live find, "6. Камчатская улица": this branch used to print
+                # "главный чертёж не читается" unconditionally whenever a
+                # different file won -- but the main drawing here read fine
+                # (4249 entities), it just lost to a raw geodetic-survey xref
+                # with 93823. "Wasn't picked" and "couldn't be read" are
+                # different facts, and the old message asserted the wrong one.
+                print(
+                    f"     основа: {base.name} (содержательнее главного чертежа: "
+                    f"{entity_counts[base]} объектов против {entity_counts[main_drawing]} "
+                    f"у {main_drawing.name}, который тоже прочитан)"
+                )
+            else:
+                print(f"     основа: {base.name} (главный чертёж не читается)")
         write_dxf(items, args.output, base_dxf=base, records=records, prefix=args.prefix)
 
     report_path = args.report or args.output.with_suffix(".report.json")

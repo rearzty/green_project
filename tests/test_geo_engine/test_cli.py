@@ -383,6 +383,45 @@ class TestBaseDrawingChoice:
         assert pick_base_drawing({}) is None
 
 
+def test_a_readable_but_less_substantial_main_drawing_is_not_reported_as_unreadable(tmp_path, capsys):
+    """Live find, "6. Камчатская улица": the printed message used to say
+    "главный чертёж не читается" (main drawing unreadable) any time a
+    DIFFERENT file won `pick_base_drawing`'s "most entities" contest --
+    including here, where the real main drawing (АПОТ, 4249 entities) read
+    perfectly fine and simply lost to a raw geodetic-survey xref with 93823.
+    "Wasn't picked as base" and "couldn't be read" are different facts about
+    two different files, and the old message conflated them, telling the
+    user something false about a file that was never actually broken.
+    """
+    site = tmp_path / "site"
+    (site / "Xrefs").mkdir(parents=True)
+
+    main_doc = ezdxf.new(setup=True)
+    main_doc.layers.add(name="Газопровод")
+    for i in range(5):
+        main_doc.modelspace().add_lwpolyline([(i, 45), (i + 1, 45)], dxfattribs={"layer": "Газопровод"})
+    main_doc.saveas(str(site / "main.dxf"))
+
+    xref = ezdxf.new(setup=True)
+    xref.layers.add(name="!Граница работ")
+    xref.layers.add(name="Съёмка")
+    xref.modelspace().add_lwpolyline(
+        [(0, 0), (120, 0), (120, 90), (0, 90)], close=True, dxfattribs={"layer": "!Граница работ"}
+    )
+    for i in range(200):  # far more raw entities than the main drawing carries
+        xref.modelspace().add_lwpolyline([(i, 1), (i, 2)], dxfattribs={"layer": "Съёмка"})
+    xref.saveas(str(site / "Xrefs" / "survey.dxf"))
+
+    out = tmp_path / "plan.dxf"
+    exit_code = main(["--input", str(site), "--output", str(out), "--types", "tree"])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "survey.dxf" in captured.out
+    assert "который тоже прочитан" in captured.out
+    assert "не читается" not in captured.out
+
+
 class TestOnFileReadWiring:
     """`read_dxf_bundle(on_file_read=...)` -- the actual entity-count source
     `pick_base_drawing` now runs on, exercised against real DXF files (not
