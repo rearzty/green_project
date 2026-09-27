@@ -160,14 +160,42 @@ def merge_dashed_lines(
     endpoint-to-endpoint, across a gap, and only when the two pieces are
     collinear -- so crossings are left alone.
 
-    Returns a list of LineStrings; input that is not line-like is ignored.
+    Exact-duplicate dashes are dropped before chaining starts. Live find on
+    "6. Камчатская улица": a `cable_line` layer where every single dash (and
+    even some already-long runs) exists as a byte-identical second copy --
+    almost certainly an artifact of how the DWG->DXF conversion flattened
+    this layer's linetype, not a real second cable. Left in, a duplicate
+    dash sits exactly 0 m from its twin, which is *closer* than the ~0.5 m
+    gap to the true next dash -- `_is_continuation()`'s collinearity check
+    then genuinely passes (a duplicate's own endpoint, read in the opposite
+    coordinate direction, looks like a valid anti-parallel continuation of
+    itself), so the chain walks onto the duplicate and immediately back,
+    producing a mathematically exact 180-degree reversal (confirmed
+    `cos_angle == -1.000` between consecutive segments) instead of a clean
+    line. Buffering that reversed spike then leaves a real gap in the
+    exclusion zone next to the real cable -- caught live as a shrub landing
+    0.03-0.11 m from a power cable where 743-ПП/СП 42.13330.2016 both
+    require 0.7 m. Dropping exact duplicates first removes the zero-distance
+    false continuation without touching any genuinely distinct dash; two
+    dashes that are merely close (a real tight parallel run) still differ in
+    at least one coordinate and are unaffected. Coordinates are compared as
+    given (this is CAD-export data, not independently-digitized traces, so a
+    true duplicate is bit-identical, not merely close) and in both
+    directions, since a duplicate could in principle be stored reversed.
     """
     parts: list[list[tuple[float, float]]] = []
+    seen: set[tuple[tuple[float, float], ...]] = set()
     for geometry in lines:
         for line in _flatten_lines(geometry):
             coords = [(float(x), float(y)) for x, y in line.coords]
-            if len(coords) >= 2:
-                parts.append(coords)
+            if len(coords) < 2:
+                continue
+            key = tuple(coords)
+            reversed_key = tuple(reversed(coords))
+            if key in seen or reversed_key in seen:
+                continue
+            seen.add(key)
+            parts.append(coords)
     if not parts:
         return []
 
