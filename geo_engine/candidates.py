@@ -61,12 +61,6 @@ class ZoningIndex:
         return None
 
 
-def _clearance(geom: BaseGeometry, exclusion_zone: BaseGeometry | None) -> float:
-    if exclusion_zone is None or exclusion_zone.is_empty:
-        return float("inf")
-    return geom.distance(exclusion_zone)
-
-
 def _boundary_segments(geom: BaseGeometry) -> list[LineString]:
     """Every polygon part of `geom`, cut into individual 2-point edge
     segments -- vectorized per ring (one `shapely.linestrings()` call over
@@ -276,24 +270,41 @@ def generate_area_candidates(
     zoning_zones: list[Zone] | None = None,
 ) -> list[PlantingCandidate]:
     """Each sub-polygon of buildable_area becomes one whole-area candidate,
-    for area-planted types (lawn)."""
+    for area-planted types (lawn).
+
+    Clearance is looked up through `ExclusionIndex`, not the naive
+    `_clearance()`/`geom.distance(exclusion_zone)` this used to call per
+    polygon -- the exact same unindexed-composite-geometry cost that
+    `ExclusionIndex` was already built to fix for `fill_group()`'s curtains
+    (see its docstring), just never wired in here. Confirmed live profiling
+    lawn generation on a real street (4. Харьковская, 62,070 buffered
+    setback objects): 324 raw `shapely.distance()` calls against the full
+    composite exclusion zone cost **63.1s of 238.2s total** (26%) for only
+    162 sub-polygons -- `buildable_area`'s own sub-polygons are guaranteed
+    outside every exclusion part by construction (it's
+    `territory.difference(exclusion_zone)`), exactly the precondition
+    `ExclusionIndex.distance()`'s docstring requires. Batched `.distances()`
+    (one vectorized STRtree.query_nearest() call), not `.distance()` in a
+    loop, for the same reason `fill_group()`/`compliance.py` already batch
+    it. Regression: tests/test_geo_engine/test_candidates.py::TestGenerateAreaCandidatesClearance.
+    """
     zoning_index = ZoningIndex(zoning_zones)
-    candidates: list[PlantingCandidate] = []
+    exclusion_index = ExclusionIndex(exclusion_zone)
     min_area = norms.min_candidate_area_m2.get(planting_type, 0.0)
 
-    for polygon in _iter_polygons(buildable_area):
-        if polygon.area < min_area:
-            continue
-        candidates.append(
-            PlantingCandidate(
-                geometry=polygon,
-                planting_type=planting_type,
-                clearance_m=_clearance(polygon, exclusion_zone),
-                area_m2=polygon.area,
-                zoning=zoning_index.category_at(polygon),
-            )
+    polygons = [p for p in _iter_polygons(buildable_area) if p.area >= min_area]
+    clearances = exclusion_index.distances(polygons)
+
+    return [
+        PlantingCandidate(
+            geometry=polygon,
+            planting_type=planting_type,
+            clearance_m=clearance,
+            area_m2=polygon.area,
+            zoning=zoning_index.category_at(polygon),
         )
-    return candidates
+        for polygon, clearance in zip(polygons, clearances)
+    ]
 
 
 def generate_candidates(

@@ -203,3 +203,53 @@ class TestExclusionIndex:
         # 2s here is generous headroom on a much smaller synthetic case
         # while still catching a regression back to an unindexed path.
         assert elapsed < 2.0, f"distances() for {len(points)} points took {elapsed:.2f}s -- looks like the unindexed path again"
+
+
+class TestGenerateAreaCandidatesClearance:
+    """Regression for `generate_area_candidates()` (lawn's only candidate
+    path) calling the naive `geom.distance(exclusion_zone)` per sub-polygon
+    instead of going through `ExclusionIndex`, the same class of bug already
+    fixed for `fill_group()`'s curtains (see TestExclusionIndex above) --
+    just never wired in here. Confirmed live profiling a real street (4.
+    Харьковская, 62,070 buffered setback objects): 63.1s of lawn's 238.2s
+    total (26%) was 324 unindexed `shapely.distance()` calls against the
+    full composite exclusion zone, for only 162 sub-polygons.
+    """
+
+    def test_clearance_matches_naive_distance_for_each_sub_polygon(self):
+        from geo_engine.candidates import generate_area_candidates
+
+        exclusion = Polygon([(0, 0), (0, 10), (10, 10), (10, 0)])
+        # Two disjoint lawn-sized sub-polygons on either side of the
+        # exclusion square, at different distances from it.
+        near = Polygon([(15, 0), (15, 10), (25, 10), (25, 0)])
+        far = Polygon([(-30, 0), (-30, 10), (-20, 10), (-20, 0)])
+        buildable = MultiPolygon([near, far])
+
+        candidates = generate_area_candidates(buildable, exclusion, "lawn", NORMS)
+
+        assert len(candidates) == 2
+        by_geometry = {c.geometry.wkt: c for c in candidates}
+        assert by_geometry[near.wkt].clearance_m == pytest.approx(near.distance(exclusion))
+        assert by_geometry[far.wkt].clearance_m == pytest.approx(far.distance(exclusion))
+
+    def test_empty_exclusion_zone_gives_infinite_clearance(self):
+        from geo_engine.candidates import generate_area_candidates
+
+        buildable = Polygon([(0, 0), (0, 10), (10, 10), (10, 0)])
+        candidates = generate_area_candidates(buildable, Polygon(), "lawn", NORMS)
+
+        assert len(candidates) == 1
+        assert candidates[0].clearance_m == float("inf")
+
+    def test_sub_polygons_below_the_minimum_area_are_still_dropped(self):
+        from geo_engine.candidates import generate_area_candidates
+
+        tiny = Polygon([(0, 0), (0, 1), (1, 1), (1, 0)])  # 1 m^2, below lawn's 4.0 m^2 floor
+        big = Polygon([(20, 0), (20, 10), (30, 10), (30, 0)])
+        buildable = MultiPolygon([tiny, big])
+
+        candidates = generate_area_candidates(buildable, Polygon(), "lawn", NORMS)
+
+        assert len(candidates) == 1
+        assert candidates[0].area_m2 == pytest.approx(100.0)
