@@ -230,3 +230,124 @@ class TestLimitByDensity:
         limited = _limit_by_density(items, area_m2=100, density_per_ha=1)
         assert len(limited) == 1
         assert limited[0].score == 3.0
+
+
+class TestFitRowSpeciesSkipsRedundantPaletteForNonTreeTypes:
+    """Живая находка, «4. Харьковская улица»: `_fit_row_species()`'s перебор
+    палитры пород для кустарника пересчитывал `build_exclusion_zone()` +
+    `buildable_area()` + ряд заново на КАЖДУЮ породу палитры (9 пород),
+    хотя ни одна из них не меняет результат -- `resolve_setback()` и
+    `norms_for_species()` оба применяют породу только при
+    `planting_type == "tree"` (см. их докстринги). На реальных данных это
+    было 422.9с на один вызов `_compute_planting_rows(['shrub'])`,
+    доминировавших в 195-секундной веб-генерации плана. После фикса — 216.45с,
+    тот же результат (2740 позиций) побитово.
+
+    Это не совсем "мал масштаб, эффект не виден" -- фикс проверяется не по
+    времени (синтетика слишком мала, чтобы секунды были измеримы), а по
+    ЧИСЛУ вызовов `build_exclusion_zone`, что доказывает механизм напрямую,
+    а не просто совпадение по времени.
+    """
+
+    def test_shrub_only_builds_the_exclusion_zone_once_not_per_species(self, synthetic_scene, monkeypatch):
+        import geo_engine.buffers as buffers_mod
+        from geo_engine.planner import _fit_row_species
+        from geo_engine.species import load_catalogue
+
+        catalogue = load_catalogue()
+        shrub_palette = catalogue.shrub
+        assert len(shrub_palette) > 1, "test needs a multi-species palette to be meaningful"
+
+        call_count = 0
+        real_build_exclusion_zone = buffers_mod.build_exclusion_zone
+
+        def counting_build_exclusion_zone(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return real_build_exclusion_zone(*args, **kwargs)
+
+        monkeypatch.setattr("geo_engine.planner.build_exclusion_zone", counting_build_exclusion_zone)
+
+        _fit_row_species(
+            shrub_palette,
+            "shrub",
+            synthetic_scene["zones"],
+            synthetic_scene["territory"],
+            synthetic_scene["utilities"],
+            NORMS,
+            keep_spacing_for=(),
+            catalogue=catalogue,
+        )
+
+        assert call_count == 1, "shrub species loop must not rebuild an identical exclusion zone per species"
+
+    def test_tree_still_tries_every_species_in_the_palette(self, synthetic_scene, monkeypatch):
+        """The optimization must not accidentally clip TREE's palette too --
+        tree setbacks genuinely depend on species (crown-diameter scaling,
+        heat-network minimums), so every candidate still has to be tried."""
+        import geo_engine.buffers as buffers_mod
+        from geo_engine.planner import _fit_row_species
+        from geo_engine.species import load_catalogue
+
+        catalogue = load_catalogue()
+        tree_palette = catalogue.tree
+        assert len(tree_palette) > 1, "test needs a multi-species palette to be meaningful"
+
+        call_count = 0
+        real_build_exclusion_zone = buffers_mod.build_exclusion_zone
+
+        def counting_build_exclusion_zone(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return real_build_exclusion_zone(*args, **kwargs)
+
+        monkeypatch.setattr("geo_engine.planner.build_exclusion_zone", counting_build_exclusion_zone)
+
+        _fit_row_species(
+            tree_palette,
+            "tree",
+            synthetic_scene["zones"],
+            synthetic_scene["territory"],
+            synthetic_scene["utilities"],
+            NORMS,
+            keep_spacing_for=(),
+            catalogue=catalogue,
+        )
+
+        assert call_count == len(tree_palette)
+
+    def test_shrub_result_matches_trying_the_whole_palette_by_hand(self, synthetic_scene):
+        """Not just "fewer calls" -- the actual returned (species, norms, rows,
+        guides) must be identical to what the old exhaustive loop would have
+        picked, since every candidate in the palette is provably equivalent
+        for a non-tree planting type."""
+        from geo_engine.planner import _fit_row_species
+        from geo_engine.species import load_catalogue
+
+        catalogue = load_catalogue()
+        shrub_palette = catalogue.shrub
+
+        fast = _fit_row_species(
+            shrub_palette,
+            "shrub",
+            synthetic_scene["zones"],
+            synthetic_scene["territory"],
+            synthetic_scene["utilities"],
+            NORMS,
+            keep_spacing_for=(),
+            catalogue=catalogue,
+        )
+        first_only = _fit_row_species(
+            shrub_palette[:1],
+            "shrub",
+            synthetic_scene["zones"],
+            synthetic_scene["territory"],
+            synthetic_scene["utilities"],
+            NORMS,
+            keep_spacing_for=(),
+            catalogue=catalogue,
+        )
+
+        assert fast[0] == first_only[0]  # species picked
+        assert len(fast[2]) == len(first_only[2])  # same number of row candidates
+        assert [c.geometry.wkt for c in fast[2]] == [c.geometry.wkt for c in first_only[2]]
