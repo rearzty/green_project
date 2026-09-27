@@ -113,6 +113,75 @@ def test_default_gap_tolerance_covers_the_measured_pilot_gaps():
     assert DEFAULT_DASH_GAP_M > 0.55
 
 
+class TestDuplicateDashes:
+    """Live find, "6. Камчатская улица": a real `cable_line` layer where every
+    dash exists as a byte-identical second copy (23 duplicate pairs found in
+    one small neighborhood, including already-long runs, not just short
+    dashes). A duplicate sits 0 m from its twin -- closer than the ~0.5 m gap
+    to the true next dash -- and `_is_continuation()`'s collinearity check
+    genuinely passes for a duplicate read in the opposite direction, so the
+    old code chained onto the duplicate and back, producing a mathematically
+    exact 180-degree reversal (`cos_angle == -1.000` measured live between
+    consecutive output segments) instead of a straight line. Buffering that
+    reversed spike left a real gap in the exclusion zone next to the actual
+    cable: a shrub was placed 0.03-0.11 m from a power cable where 0.7 m is
+    required (743-ПП / СП 42.13330.2016).
+    """
+
+    def _has_reversal(self, line: LineString) -> bool:
+        coords = list(line.coords)
+        for i in range(len(coords) - 2):
+            (x0, y0), (x1, y1), (x2, y2) = coords[i], coords[i + 1], coords[i + 2]
+            d1, d2 = (x1 - x0, y1 - y0), (x2 - x1, y2 - y1)
+            len1, len2 = (d1[0] ** 2 + d1[1] ** 2) ** 0.5, (d2[0] ** 2 + d2[1] ** 2) ** 0.5
+            if len1 < 1e-9 or len2 < 1e-9:
+                continue
+            cos_angle = (d1[0] * d2[0] + d1[1] * d2[1]) / (len1 * len2)
+            if cos_angle < -0.999:
+                return True
+        return False
+
+    def test_every_dash_duplicated_still_merges_cleanly_with_no_reversal(self):
+        segments = _dashed_line((0, 0), (1, 0), n_dashes=6)
+        doubled = segments + [LineString(s.coords) for s in segments]
+
+        merged = merge_dashed_lines(doubled)
+
+        assert len(merged) == 1
+        assert merged[0].length == 6 * DASH_M + 5 * GAP_M
+        assert not self._has_reversal(merged[0])
+
+    def test_exact_duplicate_of_a_single_line_is_dropped_not_doubled(self):
+        line = LineString([(0, 0), (1, 0)])
+        duplicate = LineString([(0, 0), (1, 0)])
+
+        merged = merge_dashed_lines([line, duplicate])
+
+        assert len(merged) == 1
+        assert merged[0].length == 1.0
+
+    def test_reversed_duplicate_is_also_dropped(self):
+        line = LineString([(0, 0), (1, 0)])
+        reversed_duplicate = LineString([(1, 0), (0, 0)])
+
+        merged = merge_dashed_lines([line, reversed_duplicate])
+
+        assert len(merged) == 1
+
+    def test_two_genuinely_sequential_dashes_are_not_mistaken_for_duplicates(self):
+        """Two real, distinct dashes of an ordinary dashed line (not
+        coordinate-identical to each other) must still stitch together
+        normally -- deduplication must never fire on merely-collinear
+        neighbors, only on true coordinate-for-coordinate copies."""
+        first = LineString([(0, 0), (1, 0)])
+        second = LineString([(1.5, 0), (2.5, 0)])
+
+        merged = merge_dashed_lines([first, second])
+
+        assert len(merged) == 1
+        assert merged[0].length == pytest.approx(2.5)
+
+
 def test_origin_artifacts_are_dropped_and_real_content_is_kept():
     legend = Point(0.0, 0.0).buffer(0.2)
     surveyed = LineString([(700.0, 14500.0), (720.0, 14500.0)])
