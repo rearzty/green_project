@@ -382,35 +382,112 @@ class TestBaseDrawingChoice:
 
         assert pick_base_drawing({}) is None
 
+    def test_a_substantial_main_drawing_is_preferred_even_if_another_file_has_more_entities(self):
+        """Live find, "6. Камчатская улица": a genuine, readable main
+        drawing (4249 entities) lost the old "most entities" contest to a
+        raw geodetic-survey xref (93823 entities) -- the expert's own
+        project drawing should win as long as it's clearly not a stub,
+        regardless of how much richer some other bundle file is.
+        """
+        from scripts.plan_dxf import _MIN_SUBSTANTIAL_ENTITIES, pick_base_drawing
 
-def test_a_readable_but_less_substantial_main_drawing_is_not_reported_as_unreadable(tmp_path, capsys):
-    """Live find, "6. Камчатская улица": the printed message used to say
-    "главный чертёж не читается" (main drawing unreadable) any time a
-    DIFFERENT file won `pick_base_drawing`'s "most entities" contest --
-    including here, where the real main drawing (АПОТ, 4249 entities) read
-    perfectly fine and simply lost to a raw geodetic-survey xref with 93823.
-    "Wasn't picked as base" and "couldn't be read" are different facts about
-    two different files, and the old message conflated them, telling the
-    user something false about a file that was never actually broken.
+        main_drawing, survey = Path("main.dxf"), Path("survey.dxf")
+
+        assert pick_base_drawing(
+            {main_drawing: _MIN_SUBSTANTIAL_ENTITIES, survey: _MIN_SUBSTANTIAL_ENTITIES * 100}, main_drawing
+        ) == main_drawing
+
+    def test_a_stub_like_main_drawing_still_loses_to_the_richer_file(self):
+        """The floor exists so a main drawing that reads but is genuinely
+        almost empty (a stub/title-block -- the original reason this
+        function never just took "the main file" unconditionally) still
+        loses to a real alternative."""
+        from scripts.plan_dxf import _MIN_SUBSTANTIAL_ENTITIES, pick_base_drawing
+
+        main_drawing, real = Path("main.dxf"), Path("real.dxf")
+
+        assert pick_base_drawing({main_drawing: _MIN_SUBSTANTIAL_ENTITIES - 1, real: 50}, main_drawing) == real
+
+    def test_an_unreadable_main_drawing_falls_back_to_the_most_substantial_file(self):
+        """`main_drawing` not being a key in `entity_counts` at all (it
+        never read) must fall back exactly like passing no `main_drawing`."""
+        from scripts.plan_dxf import pick_base_drawing
+
+        main_drawing, real = Path("main.dxf"), Path("real.dxf")
+
+        assert pick_base_drawing({real: 50}, main_drawing) == real
+
+    def test_no_main_drawing_given_falls_back_to_the_old_behavior(self):
+        from scripts.plan_dxf import pick_base_drawing
+
+        stub, real = Path("stub.dxf"), Path("real.dxf")
+
+        assert pick_base_drawing({stub: 2, real: 50}, main_drawing=None) == real
+
+
+def _site_with_main_and_survey_xref(tmp_path, main_entity_count):
+    """A bundle shaped like the "6. Камчатская улица" live find: a main
+    drawing with a real boundary/utility, plus an xref carrying a raw
+    geodetic survey with far more raw entities than the main drawing.
+
+    Everything sits well away from (0, 0): a boundary vertex or a tiny
+    utility segment planted at the literal origin would trip the unrelated
+    `drop_origin` legend/title-block cleanup (`read_dxf_bundle(...,
+    drop_origin=True)`, always on in `main()`) and get silently dropped --
+    a real trap this fixture hit once, not a property this test cares about.
     """
     site = tmp_path / "site"
     (site / "Xrefs").mkdir(parents=True)
 
     main_doc = ezdxf.new(setup=True)
     main_doc.layers.add(name="Газопровод")
-    for i in range(5):
-        main_doc.modelspace().add_lwpolyline([(i, 45), (i + 1, 45)], dxfattribs={"layer": "Газопровод"})
+    main_doc.layers.add(name="!Граница работ")
+    main_doc.modelspace().add_lwpolyline(
+        [(1000, 1000), (1120, 1000), (1120, 1090), (1000, 1090)], close=True, dxfattribs={"layer": "!Граница работ"}
+    )
+    for i in range(main_entity_count - 1):  # -1: the boundary polyline above already counts as one
+        main_doc.modelspace().add_lwpolyline(
+            [(1000 + i, 1045), (1000 + i + 1, 1045)], dxfattribs={"layer": "Газопровод"}
+        )
     main_doc.saveas(str(site / "main.dxf"))
 
     xref = ezdxf.new(setup=True)
-    xref.layers.add(name="!Граница работ")
     xref.layers.add(name="Съёмка")
-    xref.modelspace().add_lwpolyline(
-        [(0, 0), (120, 0), (120, 90), (0, 90)], close=True, dxfattribs={"layer": "!Граница работ"}
-    )
-    for i in range(200):  # far more raw entities than the main drawing carries
-        xref.modelspace().add_lwpolyline([(i, 1), (i, 2)], dxfattribs={"layer": "Съёмка"})
+    for i in range(200):  # far more raw entities than any realistic main_entity_count here
+        xref.modelspace().add_lwpolyline([(1000 + i, 1001), (1000 + i, 1002)], dxfattribs={"layer": "Съёмка"})
     xref.saveas(str(site / "Xrefs" / "survey.dxf"))
+    return site
+
+
+def test_a_substantial_main_drawing_wins_over_a_richer_survey_xref(tmp_path, capsys):
+    """Live find, "6. Камчатская улица": the real main drawing (АПОТ, 4249
+    entities, a genuine project plan) lost `pick_base_drawing`'s old "most
+    entities" contest to a raw geodetic-survey xref (93823 entities, mostly
+    relief/red-line clutter) -- the expert would open the exported DXF and
+    see their result on top of raw survey squiggles instead of their own
+    project drawing, even though that drawing read perfectly fine.
+    `pick_base_drawing` must now prefer a main drawing that clears the
+    "not a stub" floor regardless of how much richer some other file is.
+    """
+    site = _site_with_main_and_survey_xref(tmp_path, main_entity_count=30)  # well above the stub floor
+
+    out = tmp_path / "plan.dxf"
+    exit_code = main(["--input", str(site), "--output", str(out), "--types", "tree"])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "survey.dxf" not in captured.out  # the survey xref must not have been picked as base
+    assert "основа:" not in captured.out  # no message at all -- the main drawing itself won, nothing to explain
+
+
+def test_a_stub_like_main_drawing_still_loses_to_the_richer_file(tmp_path, capsys):
+    """The other half of the same tension: a main drawing that reads fine
+    but is genuinely almost empty (a stub/title-block, the original reason
+    `pick_base_drawing` never just took "the main file" unconditionally)
+    must still lose to a real, substantial alternative -- preferring the
+    main drawing is conditional on it clearing the stub floor, not absolute.
+    """
+    site = _site_with_main_and_survey_xref(tmp_path, main_entity_count=3)  # below the stub floor
 
     out = tmp_path / "plan.dxf"
     exit_code = main(["--input", str(site), "--output", str(out), "--types", "tree"])
@@ -418,8 +495,8 @@ def test_a_readable_but_less_substantial_main_drawing_is_not_reported_as_unreada
     assert exit_code == 0
     captured = capsys.readouterr()
     assert "survey.dxf" in captured.out
-    assert "который тоже прочитан" in captured.out
-    assert "не читается" not in captured.out
+    assert "главный чертёж почти пуст" in captured.out
+    assert "не читается" not in captured.out  # it DID read -- just wasn't substantial
 
 
 class TestOnFileReadWiring:
