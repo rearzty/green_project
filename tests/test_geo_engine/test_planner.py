@@ -351,3 +351,45 @@ class TestFitRowSpeciesSkipsRedundantPaletteForNonTreeTypes:
         assert fast[0] == first_only[0]  # species picked
         assert len(fast[2]) == len(first_only[2])  # same number of row candidates
         assert [c.geometry.wkt for c in fast[2]] == [c.geometry.wkt for c in first_only[2]]
+
+
+class TestParallelPlanFallback:
+    """Развал пула процессов не должен уносить улицу.
+
+    Живой отказ на «1. Олимпийская деревня» (421 126 м², 48 857 сетей):
+    типы посадки считаются параллельно, два воркера разом не помещаются в
+    память, один убивается ядром — и наружу выходило
+    `BrokenProcessPool: A process in the process pool was terminated
+    abruptly`. По этому сообщению пользователю нечего делать, а улица
+    терялась целиком, хотя последовательный путь в коде уже был.
+    """
+
+    def test_a_broken_pool_falls_back_to_sequential(self, monkeypatch):
+        from concurrent.futures.process import BrokenProcessPool
+
+        from shapely.geometry import box
+
+        from geo_engine import planner
+        from geo_engine.model import Zone
+        from geo_engine.norms import load_norms
+
+        territory = box(0, 0, 200, 200)
+        zones = [Zone(geometry=territory, zone_type="territory")]
+
+        class _ExplodingPool:
+            def __init__(self, *a, **kw): ...
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def submit(self, *a, **kw):
+                raise BrokenProcessPool("воркер убит")
+
+        monkeypatch.setattr(planner, "ProcessPoolExecutor", _ExplodingPool)
+        # Порог параллелизма должен быть пройден, иначе ветка не та.
+        monkeypatch.setattr(planner, "_PARALLEL_PLAN_THRESHOLD", 0)
+
+        items = planner.plan_items(
+            "fallback", [], zones, territory, ["tree"],
+            lambda c: [(1.0, "тест") for _ in c], load_norms(),
+        )
+
+        assert items, "последовательный пересчёт обязан дать результат"
