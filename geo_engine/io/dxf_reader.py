@@ -35,6 +35,8 @@ import ezdxf
 import ezdxf.recover
 import ezdxf.lldxf.encoding
 import ezdxf.entities.mtext
+import ezdxf.layouts.layouts
+import ezdxf.lldxf.const
 import ezdxf.acis.api
 import ezdxf.sections.acdsdata
 from shapely.geometry import LineString, Point, Polygon
@@ -88,6 +90,44 @@ ezdxf.lldxf.encoding._decode = _decode_dxf_char_or_keep_literal
 # utilities/zones), so an unrecognised column type is safe to treat as "no
 # special column layout" (`NONE`) instead of letting it abort the file.
 ezdxf.entities.mtext.ColumnType._missing_ = classmethod(lambda cls, value: cls.NONE)
+
+# Живой отказ на «12. Наташинский пр-д» (`04.Графическая часть.dxf`):
+# загрузка документа падала `KeyError: 'ГЕНПЛАН2.1'`, файл целиком
+# пропускался, а вместе с ним терялась граница участка — то есть улица
+# переставала считаться из-за одной записи в таблице лейаутов.
+#
+# Это дефект контракта внутри самого ezdxf, а не порча данных.
+# `Layouts.get_layout_by_key()` на каждом пути отказа аккуратно поднимает
+# `DXFKeyError` — и вызывающий `DXFGraphic.get_layout()` ловит ровно его,
+# после чего корректно деградирует до `None`. Но ПОСЛЕДНЯЯ строка
+# (`return self.get(dxf_layout.dxf.name)`) обращается к словарю
+# `self._layouts` напрямую и бросает ГОЛЫЙ `KeyError`, мимо собственного
+# контракта функции: имя лейаута есть в записи блока, но самого лейаута в
+# словаре нет. Этот `KeyError` проходит сквозь обработчик вызывающего и
+# убивает загрузку целиком — причём в пост-обработке MTEXT-колонок, то есть
+# на пути, который `ezdxf.recover` уже не страхует.
+#
+# Патч восстанавливает контракт, а не меняет поведение: тот же отказ теперь
+# выглядит как `DXFKeyError`, вызывающий его ловит, `get_layout()` возвращает
+# `None`, и закрытие колонок уходит в свою же ветку `else`
+# (`mtext.dxf.owner = None`). Многоколоночная разметка MTEXT — косметика,
+# которую этот пайплайн вообще не читает (извлекается только геометрия), ровно
+# как и в патче `ColumnType` выше.
+_original_get_layout_by_key = ezdxf.layouts.layouts.Layouts.get_layout_by_key
+
+
+def _get_layout_by_key_honouring_contract(self, layout_key):
+    try:
+        return _original_get_layout_by_key(self, layout_key)
+    except ezdxf.lldxf.const.DXFKeyError:
+        raise
+    except KeyError as error:
+        raise ezdxf.lldxf.const.DXFKeyError(
+            f'Layout with key "{layout_key}" does not exist.'
+        ) from error
+
+
+ezdxf.layouts.layouts.Layouts.get_layout_by_key = _get_layout_by_key_honouring_contract
 
 # Live performance bug, found on "4. Харьковская улица" (a real coverage-fill
 # xref, 6503 REGION entities in one 60.7 МБ file): every entity.sab access --
