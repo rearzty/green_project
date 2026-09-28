@@ -95,7 +95,24 @@ def territory_polygon(zones: list[Zone], utilities: list[Utility] | None = None)
             f"(суммарно {sum(g.area for g in dropped):,.0f} м²)".replace(",", " "),
             file=sys.stderr,
         )
-    return kept[0] if len(kept) == 1 else _combine_with_holes(kept)
+    result = kept[0] if len(kept) == 1 else _combine_with_holes(kept)
+    if result.is_empty or result.area <= 0:
+        # Вторая, независимая защита от того же класса отказа. Слой границы в
+        # чертеже ЕСТЬ, но после кластеризации и вычитания дырок от него не
+        # осталось площади — а дальше по пайплайну пустая территория даёт
+        # пустой план, и CLI рапортует «Готово» с кодом возврата 0. Живьём на
+        # «4. Харьковская улица» так и было: отчёт с нулём посадок, нулём
+        # нарушений и успешным завершением, то есть пользователь получал молча
+        # неверный результат вместо ошибки. Конкретную причину там починила
+        # дедупликация контуров (см. `_without_duplicates`), но сам по себе
+        # успех на пустой территории — отдельный дефект, и закрывать его надо
+        # отдельно: следующая такая геометрия придёт с другой улицы.
+        raise MissingTerritoryError(
+            "Граница участка в чертеже есть, но после объединения контуров от неё "
+            "не осталось площади — план построить нельзя. Так бывает, когда контуры "
+            "накладываются друг на друга и взаимно вычитаются как внутренние кольца."
+        )
+    return result
 
 
 def _as_polygonal(geometry: BaseGeometry) -> BaseGeometry:
@@ -128,6 +145,43 @@ def _as_polygonal(geometry: BaseGeometry) -> BaseGeometry:
     if not polygonal:
         return geometry
     return polygonal[0] if len(polygonal) == 1 else unary_union(polygonal)
+
+
+# Насколько близкими должны быть площади двух контуров, чтобы считать их одним
+# и тем же. Не ноль: один и тот же контур, пришедший из разных файлов бандла,
+# может отличаться в последних знаках после конвертации DWG->DXF.
+_DUPLICATE_AREA_TOLERANCE = 1e-6
+
+
+def _without_duplicates(pieces: list[BaseGeometry]) -> list[BaseGeometry]:
+    """Убрать повторы одного и того же контура.
+
+    Живой отказ на «4. Харьковская улица», и он тихий — самый опасный вид.
+    Бандл ссылается на один чертёж четырежды, поэтому в `territory_polygon`
+    приходят четыре копии каждого контура: {54 370, 863, 56, 0} м² по четыре
+    штуки. Дубликат по определению содержится в уже собранном результате на
+    100 %, логика дырок принимает его за внутреннее кольцо и ВЫЧИТАЕТ только
+    что добавленное; следующая копия добавляет обратно, и на чётном числе
+    копий остаётся ровно ноль. Итог: `territory_polygon` возвращала полигон
+    площадью 0 м², план выходил пустым, а CLI при этом рапортовал «Готово» с
+    кодом возврата 0 — то есть пользователь получал молча неверный результат,
+    а не ошибку.
+
+    Сравнение по площади и габариту, а потом `equals` — порядок не случайный:
+    `equals` топологическое и дорогое, а дешёвый ключ отсекает почти всё до
+    него. Контуров тут единицы-десятки, но на них же и строится вся
+    территория, так что перестраховка дешевле ошибки.
+    """
+    unique: list[BaseGeometry] = []
+    for piece in pieces:
+        key = (round(piece.area, 6), tuple(round(v, 6) for v in piece.bounds))
+        if any(
+            key == (round(seen.area, 6), tuple(round(v, 6) for v in seen.bounds)) and piece.equals(seen)
+            for seen in unique
+        ):
+            continue
+        unique.append(piece)
+    return unique
 
 
 def _combine_with_holes(pieces: list[BaseGeometry]) -> BaseGeometry:
@@ -163,7 +217,7 @@ def _combine_with_holes(pieces: list[BaseGeometry]) -> BaseGeometry:
     fully inside the other, so both go through the plain union branch,
     exactly as before this function existed.
     """
-    by_area_desc = sorted(pieces, key=lambda g: -g.area)
+    by_area_desc = _without_duplicates(sorted(pieces, key=lambda g: -g.area))
     result = by_area_desc[0]
     for piece in by_area_desc[1:]:
         if piece.area <= 0:
