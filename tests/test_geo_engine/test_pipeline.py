@@ -263,3 +263,66 @@ def test_generate_point_candidates_differs_across_seeds(synthetic_scene):
     b = generate_candidates(buildable, exclusion, "tree", NORMS, zoning_zones=zones, seed=2)
 
     assert [c.geometry.coords[:] for c in a] != [c.geometry.coords[:] for c in b]
+
+
+class TestInvalidHardObstacles:
+    """Невалидный полигон среди твёрдых препятствий не должен уносить улицу.
+
+    Живой отказ на «13. Харьковский проезд»: весь прогон падал с
+    `TopologyException: side location conflict`, отчёта не было вообще.
+    Замер по этой улице: твёрдых препятствий 921, из них невалидных **7
+    (0,76 %)**, все `Self-intersection`. Обмерные чертежи рисуют здания
+    полилиниями, которые сходятся не идеально, а
+    `reconstruct_closed_footprints()` собирает из них полигоны — часть колец
+    выходит с самопересечением, и считать оверлей на таком входе GEOS не
+    обязан.
+    """
+
+    @staticmethod
+    def _bowtie():
+        """Самопересекающийся контур — та же болезнь, что на реальных данных."""
+        from shapely.geometry import Polygon
+
+        bad = Polygon([(0, 0), (10, 10), (10, 0), (0, 10)])
+        assert not bad.is_valid, "фикстура обязана быть невалидной"
+        return bad
+
+    def test_union_survives_a_self_intersecting_polygon(self):
+        from geo_engine.buffers import valid_polygonal_union
+
+        result = valid_polygonal_union([box(20, 20, 30, 30), self._bowtie()])
+
+        assert not result.is_empty
+        assert result.is_valid
+        assert result.area > 100, "квадрат 10x10 плюс починенный контур"
+
+    def test_repair_does_not_leak_non_areal_parts(self):
+        """`make_valid` разворачивает самопересечение в GeometryCollection с
+        линиями внутри, а смешанная размерность второго операнда
+        `difference()` — отдельный краш, который уже чинили (17. Грузинская
+        М ул). Вернуть его этой правкой было бы обидно.
+        """
+        from geo_engine.buffers import valid_polygonal_union
+
+        result = valid_polygonal_union([self._bowtie()])
+
+        assert result.geom_type in ("Polygon", "MultiPolygon"), result.geom_type
+
+    def test_empty_input_is_not_an_error(self):
+        from geo_engine.buffers import valid_polygonal_union
+
+        assert valid_polygonal_union([]).is_empty
+
+    def test_buildable_area_survives_an_invalid_building(self):
+        norms = load_norms()
+        territory = box(0, 0, 100, 100)
+        zones = [
+            Zone(geometry=territory, zone_type="territory"),
+            Zone(geometry=self._bowtie(), zone_type="building"),
+        ]
+        exclusion = build_exclusion_zone([], zones, "tree", norms)
+
+        buildable = buildable_area(territory, exclusion, zones)
+
+        assert not buildable.is_empty
+        assert buildable.area < territory.area, "препятствие должно что-то вычесть"

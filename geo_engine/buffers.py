@@ -4,6 +4,8 @@ given type is not allowed to intersect, per geo_engine/config/planting_norms.yam
 
 from __future__ import annotations
 
+import numpy as np
+import shapely
 from shapely import unary_union
 from shapely.geometry.base import BaseGeometry
 
@@ -20,6 +22,51 @@ from geo_engine.species import Species
 # resolution keeps the buffered boundary within ~0.1mm of the true circle at
 # any setback distance we use.
 _BUFFER_QUAD_SEGS = 32
+
+
+
+def valid_polygonal_union(geometries: list[BaseGeometry]) -> BaseGeometry:
+    """Объединить площадные геометрии, пережив невалидные среди них.
+
+    Живой отказ на реальной улице («13. Харьковский проезд»): весь прогон
+    падал с `TopologyException: side location conflict`, и падал целиком —
+    отчёта не было вообще. Замер по этой улице: твёрдых препятствий 921, из
+    них невалидных **7 (0,76 %)**, все с диагнозом `Self-intersection`. То
+    есть семь самопересекающихся контуров из девятисот уносили улицу.
+
+    Откуда они берутся: обмерные чертежи рисуют здания и покрытия
+    полилиниями, которые сходятся не идеально, а
+    `geometry_cleanup.reconstruct_closed_footprints()` собирает из них
+    полигоны — на честно кривом входе часть колец получается с
+    самопересечением. GEOS считать оверлей на таком входе не обязан.
+
+    Чинится точечно: `shapely.is_valid` по всему массиву дёшево (это C-цикл),
+    а `make_valid` вызывается ТОЛЬКО для невалидных. На той же улице union
+    после этого проходит мгновенно (0,0 с). Глобальный `make_valid` по всем
+    объектам был бы дороже на порядки — на реальных улицах их сотни тысяч.
+
+    После починки остаются только площадные части. Это не придирка:
+    `make_valid` разворачивает самопересекающийся полигон в
+    `GeometryCollection` с линиями внутри, а смешанная размерность второго
+    операнда `difference()` — ровно тот краш, который master уже чинил
+    отдельно (17. Грузинская М ул, «cannot determine overlay result geometry
+    dimension»). Вернуть его назад этой правкой было бы обидно.
+    """
+    if not geometries:
+        return unary_union([])
+    array = np.array(geometries, dtype=object)
+    healthy = shapely.is_valid(array)
+    if not healthy.all():
+        array = np.where(healthy, array, shapely.make_valid(array))
+    parts: list[BaseGeometry] = []
+    for geometry in array:
+        if geometry is None or geometry.is_empty:
+            continue
+        if geometry.geom_type in ("Polygon", "MultiPolygon"):
+            parts.append(geometry)
+        elif geometry.geom_type == "GeometryCollection":
+            parts.extend(g for g in geometry.geoms if g.geom_type in ("Polygon", "MultiPolygon"))
+    return unary_union(parts) if parts else unary_union([])
 
 
 def build_exclusion_zone(
@@ -133,5 +180,5 @@ def buildable_area(
     else:
         result = territory
     if hard_obstacles:
-        result = result.difference(unary_union(hard_obstacles))
+        result = result.difference(valid_polygonal_union(hard_obstacles))
     return result
