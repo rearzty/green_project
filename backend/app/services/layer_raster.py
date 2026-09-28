@@ -70,7 +70,18 @@ _ZONE_COLORS = {
     "building": "#78716c",
     "road": "#57534e",
     "territory": "#0ea5e9",
-    "existing_greenery": "#16a34a",
+    # Deliberately teal, not the same green family as PLANTING_COLORS.tree
+    # (#15803d) / .shrub (#65a30d) in mapStyle.ts. Was #16a34a -- close enough
+    # to tree's #15803d that on a real street where existing_greenery is
+    # mostly individual small tree-canopy polygons (live case, "4. Харьковская
+    # улица": 24 814 polygons averaging 0.23 m² each, not one big patch -- see
+    # CLAUDE.md), it rendered as small green marks indistinguishable from the
+    # plan's own newly-generated tree dots. Live complaint: "ты все равно
+    # только деревья добавляешь" -- the real trees were there, just
+    # camouflaged as more of the same color as the proposed ones. Keep in
+    # sync with mapStyle.ts's own ZONE_COLORS.existing_greenery (used by
+    # ThreeDView's 3D extrusion) if this changes again.
+    "existing_greenery": "#0d9488",
     # Заливки.dwg's asphalt/tile sidewalk fills (layer_rules.py's АБ ТР/ПЛ ТР
     # patterns) -- a lighter stone than road/building so it reads as related
     # hardscape without being mistaken for either.
@@ -217,6 +228,60 @@ class LayerRaster:
 def _bounds_of(geoms: list[BaseGeometry]) -> tuple[float, float, float, float]:
     arr = shapely.bounds(np.array(geoms, dtype=object))
     return float(arr[:, 0].min()), float(arr[:, 1].min()), float(arr[:, 2].max()), float(arr[:, 3].max())
+
+
+# Scales a median absolute deviation to be comparable to a normal
+# distribution's standard deviation -- the standard MAD->sigma constant.
+_MAD_TO_SIGMA = 1.4826
+# How many (scaled) MADs from the median centroid a geometry may sit before
+# _dominant_cluster_bounds treats it as "not really part of this site".
+# Calibrated live on "7. Нижние Поля ул" (no usable territory boundary at
+# all, see MissingTerritoryError -- this function's caller only runs this
+# path when there's no territory to anchor on instead): the real site's
+# utilities/road/building/etc. cluster tightly (median-centred spread ~400-
+# 500m), but "unknown" alone carries a genuine second population of 26 605
+# objects (not a single stray point) 2-3km further out -- almost certainly
+# paperspace/inset content from the same main drawing, not the work site --
+# plus a handful of scattered singletons (existing_greenery/building/
+# lighting_pole) thousands of metres off in unrelated directions, none of
+# them near the origin (drop_origin only catches artifacts AT the origin,
+# not just anywhere far from the real site). Swept k=3..20 against this
+# exact dataset: k<=5 cleanly excludes both (kept 99.9% of all objects, x/y
+# range barely wider than the utility-only extent); k>=8 pulls the far
+# cluster back in and the canvas balloons to the full, useless ~9x13km span
+# again. 5 sits with a clear margin on the safe side of that cliff, not
+# tuned to the exact boundary.
+_ROBUST_OUTLIER_MADS = 5.0
+# Floor under the MAD itself so a real, tightly-clustered site (or a small
+# synthetic test fixture) doesn't get its own genuine, tiny spread treated
+# as "zero tolerance for anything else" -- comparable order of magnitude to
+# _CONTEXT_MARGIN_M below, not a load-bearing precise value.
+_MIN_ROBUST_MAD_M = 50.0
+
+
+def _dominant_cluster_bounds(geoms: list[BaseGeometry]) -> tuple[float, float, float, float]:
+    """Same 'the real site is wherever most of the data actually is, not
+    wherever the outer edges of any one layer happen to reach' idea as
+    geo_engine.territory._dominant_cluster, generalized from "territory
+    polygons only" to an arbitrary mix of layer types -- see this module's
+    only caller, render_layer_raster's no-territory fallback, and
+    _ROBUST_OUTLIER_MADS's own comment for the live case this was measured
+    against. Median (not mean) and median-absolute-deviation (not standard
+    deviation) throughout specifically because both are robust to the exact
+    failure mode here -- a mean/stddev computed over a real cluster plus a
+    26 605-object second population would itself be dragged toward the
+    wrong answer, defeating the whole point.
+    """
+    if len(geoms) == 1:
+        return geoms[0].bounds
+    centroids = shapely.centroid(np.array(geoms, dtype=object))
+    xs, ys = shapely.get_x(centroids), shapely.get_y(centroids)
+    median_x, median_y = float(np.median(xs)), float(np.median(ys))
+    mad_x = max(float(np.median(np.abs(xs - median_x))) * _MAD_TO_SIGMA, _MIN_ROBUST_MAD_M)
+    mad_y = max(float(np.median(np.abs(ys - median_y))) * _MAD_TO_SIGMA, _MIN_ROBUST_MAD_M)
+    keep = (np.abs(xs - median_x) <= mad_x * _ROBUST_OUTLIER_MADS) & (np.abs(ys - median_y) <= mad_y * _ROBUST_OUTLIER_MADS)
+    kept = [g for g, k in zip(geoms, keep) if k]
+    return _bounds_of(kept if kept else geoms)
 
 
 def _wgs84_bounds(
@@ -381,10 +446,23 @@ def render_layer_raster(layers: list[_LayerLike], source_crs: str | None) -> Lay
         # actual site down to a speck). Zoning is still drawn either way --
         # just clipped to whatever falls inside the canvas everything else
         # defines.
+        #
+        # A plain union of everything here is itself not safe -- live case,
+        # "7. Нижние Поля ул" (this whole branch only runs because there's no
+        # territory to anchor on): "unknown" alone carried a genuine second
+        # 26 605-object population several km from the real site, plus a
+        # handful of far-flung singletons in other categories, and unioning
+        # all of it stretched the canvas to a useless ~9x13km span with the
+        # real site reduced to a speck. _dominant_cluster_bounds keeps only
+        # what's actually near the main mass of the data first, same
+        # "biggest coherent cluster wins" principle territory_polygon() uses
+        # for its own input -- see its docstring for the calibration.
         bound_geoms = [geom for key, geom in entries if not key.startswith(_ZONING_PREFIX)]
         if not bound_geoms:
             bound_geoms = [geom for _, geom in entries]
-        minx, miny, maxx, maxy = _bounds_of(bound_geoms)
+        rminx, rminy, rmaxx, rmaxy = _dominant_cluster_bounds(bound_geoms)
+        minx, miny = rminx - _CONTEXT_MARGIN_M, rminy - _CONTEXT_MARGIN_M
+        maxx, maxy = rmaxx + _CONTEXT_MARGIN_M, rmaxy + _CONTEXT_MARGIN_M
 
     _, px_w, px_h, scale = _make_pixel_transform(minx, miny, maxx, maxy, _MAX_CANVAS_PX)
     bounds = _wgs84_bounds(minx, miny, maxx, maxy, source_crs)
@@ -392,6 +470,22 @@ def render_layer_raster(layers: list[_LayerLike], source_crs: str | None) -> Lay
     by_group: dict[str, list[BaseGeometry]] = {}
     for key, geom in entries:
         by_group.setdefault(key, []).append(geom)
+    # existing_greenery/existing_lawn always get a legend row, even at 0
+    # objects -- every other category here stays "only what's actually
+    # present" (see this function's own comment on _CONTEXT_MARGIN_M/
+    # extentBounds for that general philosophy), but these two specifically
+    # were the subject of a live, repeated complaint ("не рисуется газон
+    # который уже есть") that turned out to mean two different things on two
+    # different streets: on one, existing_lawn genuinely has zero objects
+    # (see layer_rules.py's docstring on why a project's own proposed "Газон"
+    # layers are correctly left unclassified rather than guessed as real
+    # existing turf); on another, existing_greenery has thousands of real
+    # objects that were simply camouflaged by color (see _ZONE_COLORS' own
+    # comment above). A silently-absent toggle reads as "the feature is
+    # broken", not "this street's data genuinely has none" -- showing "0"
+    # here makes that a visible fact instead of an ambiguous gap.
+    by_group.setdefault("existing_greenery", [])
+    by_group.setdefault("existing_lawn", [])
     colors = {key: _hex_to_rgb(_group_color(key)) for key in by_group}
 
     if len(entries) >= _PARALLEL_RENDER_THRESHOLD and len(by_group) > 1:

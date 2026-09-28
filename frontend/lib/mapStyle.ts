@@ -11,7 +11,10 @@ export const ZONE_COLORS: Record<string, string> = {
   building: "#78716c",
   road: "#57534e",
   territory: "#0ea5e9",
-  existing_greenery: "#16a34a",
+  // Teal, not tree-green -- kept in sync with layer_raster.py's own
+  // _ZONE_COLORS.existing_greenery, see its comment for why (real existing
+  // trees were camouflaged as more of the plan's own proposed-tree color).
+  existing_greenery: "#0d9488",
 };
 
 /** Planting-item colors by planting_type -- used by both MapView.tsx's 2D
