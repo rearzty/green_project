@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import random
 import zlib
 from collections.abc import Callable, Collection
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
@@ -804,28 +806,49 @@ def plan_items(
     worker_count = min(len(planting_types), os.cpu_count() or 1)
     if worker_count > 1 and len(utilities) + len(zones) >= _PARALLEL_PLAN_THRESHOLD:
         items: list[PlantingItem] = []
-        with ProcessPoolExecutor(max_workers=worker_count) as pool:
-            futures = [
-                pool.submit(
-                    _plan_type_items,
-                    plan_key,
-                    planting_type,
-                    utilities,
-                    zones,
-                    territory,
-                    score_fn,
-                    norms,
-                    keep_spacing_for,
-                    species_overrides.get(planting_type),
-                    pattern,
-                    density_per_ha.get(planting_type),
-                    catalogue,
-                )
-                for planting_type in planting_types
-            ]
-            for future in futures:
-                items.extend(future.result())
-        return items
+        try:
+            with ProcessPoolExecutor(max_workers=worker_count) as pool:
+                futures = [
+                    pool.submit(
+                        _plan_type_items,
+                        plan_key,
+                        planting_type,
+                        utilities,
+                        zones,
+                        territory,
+                        score_fn,
+                        norms,
+                        keep_spacing_for,
+                        species_overrides.get(planting_type),
+                        pattern,
+                        density_per_ha.get(planting_type),
+                        catalogue,
+                    )
+                    for planting_type in planting_types
+                ]
+                for future in futures:
+                    items.extend(future.result())
+            return items
+        except BrokenProcessPool:
+            # Рабочий процесс убит извне — на реальных данных это нехватка
+            # памяти: типы посадки считаются параллельно, и на самой крупной
+            # улице пилота («1. Олимпийская деревня», 421 126 м², 48 857
+            # сетей) два воркера разом не помещаются. Наружу это выходило как
+            # `BrokenProcessPool: A process in the process pool was terminated
+            # abruptly` — сообщение, по которому пользователю нечего делать, и
+            # улица терялась целиком.
+            #
+            # Падать тут незачем: последовательный путь ниже уже существует
+            # (он же обслуживает небольшие площадки), считает то же самое и
+            # держит в памяти один тип посадки вместо всех сразу. Медленнее,
+            # но с результатом. Если памяти не хватит и так — наружу выйдет
+            # уже настоящая ошибка этого типа посадки, а не обрыв пула.
+            print(
+                "  ! параллельный расчёт не удался (рабочий процесс убит, обычно "
+                "это нехватка памяти) — пересчитываю последовательно",
+                file=sys.stderr,
+            )
+            items = []
 
     items = []
     for planting_type in planting_types:
