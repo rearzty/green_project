@@ -38,6 +38,11 @@ class GenerateJobStatus(BaseModel):
     status: GenerateJobState
     plan_id: str | None = None
     error: str | None = None
+    # Best-effort, same shape as ProjectUploadJobStatus -- see
+    # generation_jobs.py's own docstring. `stage` names the planting_type
+    # that most recently finished; `progress` is types-done/types-total.
+    stage: str | None = None
+    progress: float | None = None
 
 
 class ExportJobOut(BaseModel):

@@ -233,3 +233,45 @@ class TestResolveAndReadBundleOverlap:
 
         assert warnings == []
         assert sorted(u.geometry.coords[0][0] for u in utilities) == [0, 50]
+
+    def test_on_progress_fires_at_zero_before_conversion_and_reaches_the_total_at_the_end(self, tmp_path):
+        """Live complaint this covers: a real upload's progress bar sat on
+        the caller's PRE-bundle stage label ("Распаковка архива") for the
+        entire main-file conversion + first-file-read stretch, which on a
+        slow-converting real file reads as hung, not busy (see CLAUDE.md).
+        `on_progress` must fire at (0, total) before the main file's own
+        (potentially slow) conversion even starts, not only once files start
+        finishing, so the caller has the *correct* stage name and total on
+        screen immediately instead of a stale, unrelated one."""
+        bundle_dir = tmp_path / "bundle"
+        bundle_dir.mkdir()
+        main_dwg = bundle_dir / "main.dwg"
+        main_dwg.write_bytes(b"fake")
+        xrefs = bundle_dir / "Xrefs"
+        xrefs.mkdir()
+        sibling = xrefs / "sibling.dwg"
+        sibling.write_bytes(b"fake")
+
+        converted_dir = tmp_path / "converted"
+        converted_dir.mkdir()
+        converted_main = converted_dir / "converted_main.dxf"
+        converted_sibling = converted_dir / "converted_sibling.dxf"
+        self._make_dxf(converted_main, x_offset=0)
+        self._make_dxf(converted_sibling, x_offset=100)
+        conversion_map = {main_dwg: converted_main, sibling: converted_sibling}
+
+        calls: list[tuple[int, int]] = []
+
+        resolve_and_read_bundle(
+            bundle_dir,
+            tmp_path / "work",
+            layer_map=MOSGEOTREST_LAYER_MAP,
+            convert=lambda path, workdir: conversion_map[path],
+            on_progress=lambda done, total: calls.append((done, total)),
+        )
+
+        assert calls[0] == (0, 2), "must report 0/total before conversion starts, not only after files finish"
+        assert calls[-1] == (2, 2)
+        assert all(total == 2 for _done, total in calls), "total must not change mid-run"
+        dones = [done for done, _total in calls]
+        assert dones == sorted(dones), "done count must never go backwards"

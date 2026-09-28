@@ -49,6 +49,7 @@ async def _run_generate_job(
             scoring_mode=scoring_mode,
             tree_spacing_m=tree_spacing_m,
             shrub_spacing_m=shrub_spacing_m,
+            on_progress=lambda ptype, done, total: generation_jobs.update_progress(job_id, ptype, done, total),
         )
         generation_jobs.mark_done(job_id, plan.id)
     except (MissingTerritoryError, TooManyCandidatesError) as exc:
@@ -86,7 +87,7 @@ async def generate_status(project_id: str, job_id: str) -> GenerateJobStatus:
     job = generation_jobs.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Задача генерации не найдена — возможно, сервер перезапускался.")
-    return GenerateJobStatus(status=job.status, plan_id=job.plan_id, error=job.error)
+    return GenerateJobStatus(status=job.status, plan_id=job.plan_id, error=job.error, stage=job.stage, progress=job.progress)
 
 
 @router.get("/plans", response_model=list[PlanSummary])

@@ -38,6 +38,7 @@ import shutil
 import tempfile
 import zipfile
 from pathlib import Path
+from typing import Callable
 
 from fastapi.concurrency import run_in_threadpool
 
@@ -55,12 +56,23 @@ from geo_engine.model import Utility, Zone
 
 SUPPORTED_SUFFIXES = {".dxf", ".dwg", ".zip", ".geojson", ".json", ".shp"}
 
+# (stage label, files done, files total) -- called from whatever thread
+# run_in_threadpool's parse_territory_file actually runs on (plain function
+# call, not cross-process: resolve_and_read_bundle's own on_progress fires
+# from that same thread), so a plain closure into project_jobs.update_progress
+# is enough, no queue/lock needed. See project_jobs.py's own docstring for why
+# this exists at all -- a real bundle upload silently taking 100+ seconds with
+# no feedback reads as "hung", not "working".
+ProgressCallback = Callable[[str, int, int], None]
+
 
 class UnsupportedFileTypeError(ValueError):
     pass
 
 
-def _parse_dxf_bundle(path: Path, workdir: Path) -> tuple[list[Utility], list[Zone], str | None]:
+def _parse_dxf_bundle(
+    path: Path, workdir: Path, on_progress: ProgressCallback | None = None
+) -> tuple[list[Utility], list[Zone], str | None]:
     """One drawing or a whole project folder -- resolve_and_read_bundle
     handles both, so a lone .dwg and a .zip full of them share this path.
 
@@ -72,8 +84,17 @@ def _parse_dxf_bundle(path: Path, workdir: Path) -> tuple[list[Utility], list[Zo
     fully-sequential resolve-then-read was measured live to cost tens of
     seconds on a real multi-file bundle.
     """
+    on_bundle_progress = (
+        (lambda done, total: on_progress("Чтение файлов бандла", done, total)) if on_progress else None
+    )
     utilities, zones, warnings = resolve_and_read_bundle(
-        path, workdir, layer_map=COMBINED_LAYER_MAP, stitch_dashes=True, drop_origin=True, reconstruct_footprints=True
+        path,
+        workdir,
+        layer_map=COMBINED_LAYER_MAP,
+        stitch_dashes=True,
+        drop_origin=True,
+        reconstruct_footprints=True,
+        on_progress=on_bundle_progress,
     )
     for warning in warnings:
         # Not fatal -- one unreadable xref shouldn't sink the whole upload --
@@ -144,7 +165,11 @@ def _extract_archive(archive: zipfile.ZipFile, extract_dir: Path) -> None:
             shutil.copyfileobj(source, sink)
 
 
-def _parse_zip_bundle(path: Path, workdir: Path) -> tuple[list[Utility], list[Zone], str | None]:
+def _parse_zip_bundle(
+    path: Path, workdir: Path, on_progress: ProgressCallback | None = None
+) -> tuple[list[Utility], list[Zone], str | None]:
+    if on_progress:
+        on_progress("Распаковка архива", 0, 1)
     extract_dir = workdir / "extracted"
     extract_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -159,6 +184,8 @@ def _parse_zip_bundle(path: Path, workdir: Path) -> tuple[list[Utility], list[Zo
         raise UnsupportedFileTypeError(
             f"Не удалось распаковать архив: {error.strerror or error}."
         ) from error
+    if on_progress:
+        on_progress("Распаковка архива", 1, 1)
 
     # A folder zipped on macOS/Windows often lands one level down (the zip
     # root holds a single directory named after the folder) or wrapped in a
@@ -166,10 +193,12 @@ def _parse_zip_bundle(path: Path, workdir: Path) -> tuple[list[Utility], list[Zo
     # built just so.
     entries = [p for p in extract_dir.iterdir() if p.name != "__MACOSX"]
     root = entries[0] if len(entries) == 1 and entries[0].is_dir() else extract_dir
-    return _parse_dxf_bundle(root, workdir)
+    return _parse_dxf_bundle(root, workdir, on_progress)
 
 
-def parse_territory_file(path: Path, workdir: Path | None = None) -> tuple[list[Utility], list[Zone], str | None]:
+def parse_territory_file(
+    path: Path, workdir: Path | None = None, on_progress: ProgressCallback | None = None
+) -> tuple[list[Utility], list[Zone], str | None]:
     """The third return value is a CRS `read_vector_file` auto-detected from
     the file itself (geographic coordinates only -- see its docstring) --
     None for DXF/DWG/ZIP, which never carry CRS metadata at all, and for a
@@ -179,18 +208,28 @@ def parse_territory_file(path: Path, workdir: Path | None = None) -> tuple[list[
     owns its lifetime (create_project_from_file wraps the whole call in a
     TemporaryDirectory) because the geometry this function returns doesn't
     outlive it -- nothing here keeps its own copy of the drawing.
+
+    `on_progress`, when given, is called `(stage_label, files_done,
+    files_total)` at whatever granularity each format's path can offer --
+    a single .dxf/.geojson only ever reports (0,1) then (1,1) since there's
+    nothing finer to report, while a .zip/bundle .dwg reports real per-file
+    counts via _parse_dxf_bundle -> resolve_and_read_bundle.
     """
     suffix = path.suffix.lower()
     if suffix == ".dxf":
+        if on_progress:
+            on_progress("Чтение чертежа", 0, 1)
         utilities, zones = read_dxf(
             path, layer_map=COMBINED_LAYER_MAP, stitch_dashes=True, drop_origin=True, reconstruct_footprints=True
         )
+        if on_progress:
+            on_progress("Чтение чертежа", 1, 1)
         return utilities, zones, None
     if suffix == ".dwg":
         if workdir is None:
             raise ValueError("parse_territory_file(.dwg) requires workdir")
         try:
-            return _parse_dxf_bundle(path, workdir)
+            return _parse_dxf_bundle(path, workdir, on_progress)
         except (BundleResolutionError, RuntimeError) as error:
             # RuntimeError too, not just BundleResolutionError: that's only
             # "no converter on PATH" -- a converter that IS present but chokes
@@ -202,11 +241,16 @@ def parse_territory_file(path: Path, workdir: Path | None = None) -> tuple[list[
         if workdir is None:
             raise ValueError("parse_territory_file(.zip) requires workdir")
         try:
-            return _parse_zip_bundle(path, workdir)
+            return _parse_zip_bundle(path, workdir, on_progress)
         except (BundleResolutionError, RuntimeError) as error:
             raise UnsupportedFileTypeError(str(error)) from error
     if suffix in (".geojson", ".json", ".shp"):
-        return read_vector_file(path, type_field="object_type")
+        if on_progress:
+            on_progress("Чтение файла", 0, 1)
+        result = read_vector_file(path, type_field="object_type")
+        if on_progress:
+            on_progress("Чтение файла", 1, 1)
+        return result
     raise UnsupportedFileTypeError(
         f"Неподдерживаемый формат файла «{suffix or 'без расширения'}». Поддерживаются: {', '.join(sorted(SUPPORTED_SUFFIXES))}."
     )
@@ -216,6 +260,7 @@ async def create_project_from_file(
     name: str,
     upload_path: Path,
     source_crs: str | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> Project:
     # Parsing (ezdxf/geopandas) is blocking file I/O + CPU work with no
     # async path of its own -- run it off the event loop rather than
@@ -225,7 +270,7 @@ async def create_project_from_file(
     # (plain shapely geometry) before it's cleaned up.
     with tempfile.TemporaryDirectory(prefix="greenproject-upload-") as workdir:
         utilities, zones, detected_crs = await run_in_threadpool(
-            parse_territory_file, upload_path, Path(workdir)
+            parse_territory_file, upload_path, Path(workdir), on_progress
         )
 
     # An explicit source_crs from the caller always wins; otherwise fall

@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
 import type { ItemCompliance, PlanSummary, PlantingNorms, PlantingType, ScoringMode, ValidationViolation } from "@/lib/api";
 import { countLabel, OBJECT_FORMS, PLANTING_TYPE_FORMS, PLANTING_TYPE_LABELS } from "@/lib/format";
+import type { JobProgress } from "@/lib/hooks/useProjectSession";
 import type { SelectionSummary } from "@/lib/hooks/useSelection";
 import { SEASON_LABELS, type LayerLegendEntry, type Season } from "@/lib/mapStyle";
 import { errorMessage, toast } from "@/lib/toast";
@@ -34,6 +35,32 @@ function formatPlanLabel(plan: PlanSummary): string {
   return `${mode} · ${time} · ${plan.item_count} шт.${plan.is_current ? " · текущий" : ""}`;
 }
 
+/** Stage text + a fill bar for a long-running background job (upload/
+ * generate) -- without this, a job that can genuinely take 100+ seconds
+ * (see CLAUDE.md's own timing notes) reads as a hung UI, not a busy one.
+ * `progress` null (no countable total yet, e.g. before the first bundle file
+ * finishes) renders as an animated indeterminate stripe instead of a stuck
+ * 0%-wide bar -- same reasoning a native <progress> element without a `value`
+ * uses for its own indeterminate state. */
+function ProgressBar({ label, progress }: { label: string; progress: number | null }) {
+  const pct = progress !== null ? Math.round(Math.min(1, Math.max(0, progress)) * 100) : null;
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-stone-700">
+        {pct !== null ? (
+          <div className="h-full rounded-full bg-greenery-500 transition-[width] duration-300" style={{ width: `${pct}%` }} />
+        ) : (
+          <div className="h-full w-1/3 animate-[progress-indeterminate_1.2s_ease-in-out_infinite] rounded-full bg-greenery-500" />
+        )}
+      </div>
+      <p className="text-xs text-stone-400">
+        {label}
+        {pct !== null ? ` — ${pct}%` : ""}
+      </p>
+    </div>
+  );
+}
+
 export interface ControlPanelProps {
   hasProject: boolean;
   hasPlan: boolean;
@@ -45,6 +72,13 @@ export interface ControlPanelProps {
    * generation now runs as a background job the frontend polls, see
    * lib/api.ts::generatePlan. */
   generating?: boolean;
+  /** Best-effort stage/percent for the upload job -- see
+   * useProjectSession.ts::JobProgress. null whenever no upload is running or
+   * the backend hasn't reported a stage yet (still shows *something* is
+   * happening via the `busy` spinner either way, this just adds detail). */
+  uploadProgress?: JobProgress | null;
+  /** Same idea as uploadProgress, for the generate job. */
+  generateProgress?: JobProgress | null;
   /** True while a DXF export job is running server-side -- writing a
    * real-scale plan can take minutes, so this also runs as a background job
    * the frontend polls, see lib/api.ts::exportDxf. */
@@ -155,6 +189,8 @@ export function ControlPanel({
   hasPlan,
   restoring = false,
   generating = false,
+  uploadProgress = null,
+  generateProgress = null,
   exporting = false,
   onUpload,
   onGenerate,
@@ -309,6 +345,7 @@ export function ControlPanel({
         <Button disabled={!file || busy} onClick={() => file && guarded(() => onUpload(file, name, sourceCrs))}>
           Загрузить
         </Button>
+        {uploadProgress && <ProgressBar label={uploadProgress.stage} progress={uploadProgress.progress} />}
         {/* .dwg -- один чертёж, конвертируется в DXF на бэкенде (LibreDWG/ODA).
             .zip -- целая папка объекта (главный чертёж + Xrefs/), как её и
             отдают реальные поставки -- граница участка на пилотных данных
@@ -387,6 +424,7 @@ export function ControlPanel({
         >
           Сгенерировать план
         </Button>
+        {generateProgress && <ProgressBar label={generateProgress.stage} progress={generateProgress.progress} />}
       </section>
 
       {plans.length > 0 && (
