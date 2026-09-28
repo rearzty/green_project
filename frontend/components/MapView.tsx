@@ -37,7 +37,23 @@ function areaStyle(type: string, selected: boolean, violation: boolean): PathOpt
   return {
     color: selected ? SELECTION_COLOR : violation ? VIOLATION_COLOR : base,
     fillColor: violation ? VIOLATION_COLOR : base,
-    fillOpacity: violation ? 0.45 : 0.7,
+    // Lawn is the only non-Point planting_type (see areaFeatures' filter
+    // above), and it's mounted *after* the source-layer <ImageOverlay>s
+    // below -- correctly, per the brief's "result on a separate layer over
+    // the original drawing". But at the old 0.7 it painted near-opaque over
+    // its own footprint, and generate_area_candidates() walks the whole
+    // buildable_area -- which includes real existing turf (existing_lawn
+    // isn't a hard obstacle, see buffers.HARD_OBSTACLE_ZONE_TYPES) -- so the
+    // new lawn polygon routinely coincides with where existing_lawn's raster
+    // paints underneath it, at a near-identical pale-lime hue
+    // (PLANTING_COLORS.lawn #a3e635 vs. layer_raster.py's existing_lawn
+    // #bef264). The two together read as "the existing lawn never rendered
+    // at all" -- a repeat live complaint -- when it was rendering, just
+    // completely covered. Turned down so the backdrop (existing_lawn, and
+    // any other source context under the new lawn's outline) stays legible
+    // through it; violation keeps a stronger fill since it's the one state
+    // that should visually dominate, not blend in.
+    fillOpacity: violation ? 0.55 : 0.35,
     weight: selected ? 3 : violation ? 2 : 1,
     dashArray: selected ? "6 4" : undefined,
   };

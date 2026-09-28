@@ -125,3 +125,15 @@ body {
 .gp-menu {
   animation: gp-pop-in 0.16s ease-out;
 }
+
+/* ControlPanel.tsx's ProgressBar -- indeterminate state (no countable total
+   yet) for a long-running upload/generate job, same idea as a native
+   <progress> element with no `value`. */
+@keyframes progress-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}

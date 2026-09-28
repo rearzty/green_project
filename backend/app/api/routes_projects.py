@@ -37,7 +37,12 @@ async def _run_upload_job(job_id: str, name: str, tmp_path: Path, source_crs: st
     Owns tmp_path's lifetime -- the route only creates it, this cleans it up
     on every exit path."""
     try:
-        project = await create_project_from_file(name=name, upload_path=tmp_path, source_crs=source_crs)
+        project = await create_project_from_file(
+            name=name,
+            upload_path=tmp_path,
+            source_crs=source_crs,
+            on_progress=lambda stage, done, total: project_jobs.update_progress(job_id, stage, done, total),
+        )
         project_jobs.mark_done(job_id, project.id)
     except UnsupportedFileTypeError as exc:
         project_jobs.mark_error(job_id, str(exc))
@@ -86,7 +91,9 @@ async def upload_status(job_id: str) -> ProjectUploadJobStatus:
     job = project_jobs.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Задача загрузки не найдена — возможно, сервер перезапускался.")
-    return ProjectUploadJobStatus(status=job.status, project_id=job.project_id, error=job.error)
+    return ProjectUploadJobStatus(
+        status=job.status, project_id=job.project_id, error=job.error, stage=job.stage, progress=job.progress
+    )
 
 
 @router.get("/{project_id}", response_model=ProjectOut)

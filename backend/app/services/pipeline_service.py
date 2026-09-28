@@ -6,6 +6,8 @@ imports the other.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from fastapi.concurrency import run_in_threadpool
 
 from backend.app.core.config import settings
@@ -76,6 +78,7 @@ def _compute_planting_rows(
     scorer: ScoringStrategy,
     norms,
     keep_spacing_for: tuple[str, ...] = (),
+    on_progress: Callable[[str, int, int], None] | None = None,
 ) -> list[PlantingItemRow]:
     """Pure CPU work (geometry buffers/candidates/greedy selection) — kept as
     one synchronous function so it can run in a worker thread via
@@ -104,6 +107,7 @@ def _compute_planting_rows(
         scorer.as_score_fn(),
         norms,
         keep_spacing_for=keep_spacing_for,
+        on_progress=on_progress,
     )
     return [domain_item_to_row(plan_id, item) for item in items]
 
@@ -204,6 +208,7 @@ async def generate_plan(
     scoring_mode: str,
     tree_spacing_m: float | None = None,
     shrub_spacing_m: float | None = None,
+    on_progress: Callable[[str, int, int], None] | None = None,
 ) -> Plan:
     reusable = _find_reusable_plan(project, scoring_mode, planting_types, tree_spacing_m, shrub_spacing_m)
     if reusable is not None:
@@ -238,6 +243,7 @@ async def generate_plan(
         scorer,
         norms,
         _spacing_overridden(tree_spacing_m, shrub_spacing_m),
+        on_progress,
     )
     _attach(plan, items)
     plan.item_count = len(items)

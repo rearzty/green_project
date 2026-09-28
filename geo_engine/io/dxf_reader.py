@@ -1334,9 +1334,19 @@ def resolve_and_read_bundle(
     use_layer_rules: bool = True,
     reconstruct_footprints: bool = False,
     on_error: Callable[[Path, Exception], None] | None = _warn_unreadable,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> tuple[list[Utility], list[Zone], list[str]]:
     """`resolve_bundle_inputs()` followed by `read_dxf_bundle()`, overlapped
     instead of sequential.
+
+    `on_progress`, when given, is called as `(files_done, files_total)` once
+    per bundle member as its result is consumed, in the same canonical order
+    everything else here uses -- not completion order, so it can briefly sit
+    at the same count while the pending file is still the slow one, same as
+    the wall-clock experience actually is. Exists for the web upload job
+    (`project_service.py`/`project_jobs.py`) to report real "N of M files"
+    progress instead of an indefinite spinner -- see project_jobs.py's own
+    docstring for why that mattered enough to add.
 
     Measured live on a real 33-file/52MB bundle ("1. Олимпийская деревня"):
     conversion (25.3s -- an external GUI subprocess, ODA under xvfb, mostly
@@ -1382,6 +1392,18 @@ def resolve_and_read_bundle(
         return convert(path, workdir) if path.suffix.lower() == ".dwg" else path
 
     main, all_members = _discover_bundle_members(source)
+    total = len(all_members)
+    if on_progress is not None:
+        # Fired before the main file's own conversion (below) even starts --
+        # without this, a slow-to-convert main file (real case: tens of
+        # seconds, see CLAUDE.md's ezdxf-tokenizer profiling) left the caller
+        # stuck reporting whatever stage came before this function was even
+        # called (project_service.py's "Распаковка архива") for that entire
+        # stretch, which live-tested as indistinguishable from a hung upload.
+        # This puts the correct stage name and total on screen immediately,
+        # at 0/total, so the user sees real numbers advancing from the start
+        # rather than a stale, unrelated message.
+        on_progress(0, total)
     converted_main = convert_if_needed(main)  # hard failure, same as resolve_bundle_inputs
     others = [p for p in all_members if p != main]
 
@@ -1433,9 +1455,12 @@ def resolve_and_read_bundle(
                         continue
                     pending[original] = submit_read(read_pool, dxf_path)
 
-        for path in all_members:  # canonical order, not completion order
+        total = len(all_members)
+        for index, path in enumerate(all_members, start=1):  # canonical order, not completion order
             future = pending.get(path)
             if future is None:
+                if on_progress is not None:
+                    on_progress(index, total)
                 continue  # conversion failed and was already warned about above
             try:
                 file_utilities, file_zones, _entity_count = future.result()
@@ -1443,9 +1468,13 @@ def resolve_and_read_bundle(
                 if on_error is None:
                     raise
                 on_error(path, error)
+                if on_progress is not None:
+                    on_progress(index, total)
                 continue
             utilities.extend(file_utilities)
             zones.extend(file_zones)
+            if on_progress is not None:
+                on_progress(index, total)
 
     if stitch_dashes:
         utilities = stitch_utility_lines(utilities)
