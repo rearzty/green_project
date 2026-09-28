@@ -744,8 +744,18 @@ def plan_items(
     pattern: str = "auto",
     density_per_ha: dict[str, float] | None = None,
     catalogue: SpeciesCatalogue | None = None,
+    on_progress: Callable[[str, int, int], None] | None = None,
 ) -> list[PlantingItem]:
     """Сгенерировать посадки для одного плана.
+
+    `on_progress`, when given, is called `(planting_type, types_done,
+    types_total)` once per finished type -- in `planting_types` submission
+    order in the parallel branch, not completion order (same tradeoff
+    `resolve_and_read_bundle`'s own `on_progress` makes and documents), so a
+    slow type earlier in the list still gates when a faster one later in the
+    list gets reported done. Coarse (whole types, not within-type candidate
+    counts) on purpose: the within-type work runs inside a worker process in
+    the parallel branch, and a callback can't cross that process boundary.
 
     Каждый тип посадки генерируется независимо от одной и той же buildable-area,
     без взаимного вычитания — дерево или куст, попавший на площадь газона, это
@@ -823,12 +833,16 @@ def plan_items(
                 )
                 for planting_type in planting_types
             ]
-            for future in futures:
+            total = len(futures)
+            for index, (planting_type, future) in enumerate(zip(planting_types, futures), start=1):
                 items.extend(future.result())
+                if on_progress is not None:
+                    on_progress(planting_type, index, total)
         return items
 
     items = []
-    for planting_type in planting_types:
+    total = len(planting_types)
+    for index, planting_type in enumerate(planting_types, start=1):
         items.extend(
             _plan_type_items(
                 plan_key,
@@ -845,4 +859,6 @@ def plan_items(
                 catalogue,
             )
         )
+        if on_progress is not None:
+            on_progress(planting_type, index, total)
     return items
