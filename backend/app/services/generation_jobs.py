@@ -36,6 +36,12 @@ class GenerationJob:
     status: JobStatus = "pending"
     plan_id: str | None = None
     error: str | None = None
+    # Same idea and shape as project_jobs.ProjectUploadJob's stage/progress --
+    # see that module's docstring. Here `stage` is which planting_type just
+    # finished (geo_engine.planner.plan_items reports whole types, not
+    # candidate-level counts -- see its own on_progress docstring for why).
+    stage: str | None = None
+    progress: float | None = None
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -45,6 +51,18 @@ def create_job() -> str:
     while len(_jobs) > _MAX_JOBS:
         _jobs.popitem(last=False)
     return job_id
+
+
+_TYPE_LABELS = {"tree": "Деревья", "shrub": "Кустарники", "lawn": "Газон"}
+
+
+def update_progress(job_id: str, planting_type: str, done: int, total: int) -> None:
+    job = _jobs.get(job_id)
+    if job is None:
+        return
+    label = _TYPE_LABELS.get(planting_type, planting_type)
+    job.stage = f"Готово: {label} ({done} из {total})" if total > 1 else f"Готово: {label}"
+    job.progress = (done / total) if total > 0 else None
 
 
 def mark_done(job_id: str, plan_id: str) -> None:

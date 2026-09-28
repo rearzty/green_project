@@ -33,6 +33,13 @@ class ProjectUploadJob:
     status: JobStatus = "pending"
     project_id: str | None = None
     error: str | None = None
+    # Human-readable stage ("Распаковка архива", "Чтение файлов бандла: 4 из
+    # 33") plus a 0..1 fraction where one is known -- both optional because
+    # some paths (a single small .dxf/.geojson) finish before a second stage
+    # is even worth reporting. See create_project_from_file's on_progress
+    # plumbing for who sets this and how often.
+    stage: str | None = None
+    progress: float | None = None
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -42,6 +49,14 @@ def create_job() -> str:
     while len(_jobs) > _MAX_JOBS:
         _jobs.popitem(last=False)
     return job_id
+
+
+def update_progress(job_id: str, stage: str, done: int, total: int) -> None:
+    job = _jobs.get(job_id)
+    if job is None:
+        return
+    job.stage = f"{stage}: {done} из {total}" if total > 1 else stage
+    job.progress = (done / total) if total > 0 else None
 
 
 def mark_done(job_id: str, project_id: str) -> None:

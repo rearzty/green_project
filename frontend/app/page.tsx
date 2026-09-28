@@ -329,6 +329,8 @@ export default function Home() {
           hasPlan={plan !== null}
           restoring={session.restoring}
           generating={session.generating}
+          uploadProgress={session.uploadProgress}
+          generateProgress={session.generateProgress}
           exporting={session.exporting}
           onUpload={session.handleUpload}
           onGenerate={session.handleGenerate}

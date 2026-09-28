@@ -12,11 +12,13 @@ import {
   listPlans,
   uploadProject,
   type GeoJSONFeature,
+  type GenerateJobStatus,
   type LayersRaster,
   type PlanOut,
   type PlanSummary,
   type PlantingType,
   type ProjectOut,
+  type ProjectUploadJobStatus,
   type ScoringMode,
 } from "@/lib/api";
 import { buildPlanIndex, patchPlanIndex, type PlanIndex } from "@/lib/planIndex";
@@ -85,6 +87,16 @@ function applyEffectToFeatures(features: GeoJSONFeature[], effect: LocalEditEffe
   }
 }
 
+/** Best-effort progress for a long-running background job -- shared shape for
+ * both the upload and generate polling loops (see api.ts's
+ * ProjectUploadJobStatus/GenerateJobStatus, which this is derived from).
+ * `progress` null means "no countable total yet", not "0%" -- callers should
+ * render an indeterminate bar in that case rather than a stuck empty one. */
+export interface JobProgress {
+  stage: string;
+  progress: number | null;
+}
+
 /** Owns the currently-open project/plan and the actions that change *which*
  * plan is open (upload, generate, switch, clear) -- session persistence,
  * the plan-history sidebar list, and the two primitives everything else
@@ -104,6 +116,8 @@ export function useProjectSession() {
   const [plans, setPlans] = useState<PlanSummary[]>([]);
   const [planRevision, setPlanRevision] = useState(0);
   const [generating, setGenerating] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<JobProgress | null>(null);
+  const [generateProgress, setGenerateProgress] = useState<JobProgress | null>(null);
   const [exporting, setExporting] = useState(false);
   const [restoring, setRestoring] = useState(true);
 
@@ -182,14 +196,25 @@ export function useProjectSession() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  function progressFromStatus(status: ProjectUploadJobStatus | GenerateJobStatus): JobProgress | null {
+    return status.stage ? { stage: status.stage, progress: status.progress } : null;
+  }
+
   async function handleUpload(file: File, name: string, sourceCrs: string) {
-    const { project_id } = await uploadProject(name, file, sourceCrs || undefined);
-    const fetched = await getProject(project_id);
-    setProject(fetched);
-    await refreshLayersRaster(project_id);
-    applyPlan(null);
-    setPlans([]);
-    saveStoredSession({ projectId: project_id, planId: null });
+    setUploadProgress(null);
+    try {
+      const { project_id } = await uploadProject(name, file, sourceCrs || undefined, {
+        onPoll: (status) => setUploadProgress(progressFromStatus(status)),
+      });
+      const fetched = await getProject(project_id);
+      setProject(fetched);
+      await refreshLayersRaster(project_id);
+      applyPlan(null);
+      setPlans([]);
+      saveStoredSession({ projectId: project_id, planId: null });
+    } finally {
+      setUploadProgress(null);
+    }
   }
 
   async function handleGenerate(
@@ -199,13 +224,18 @@ export function useProjectSession() {
   ) {
     if (!project) return;
     setGenerating(true);
+    setGenerateProgress(null);
     try {
-      const generated = await generatePlan(project.id, plantingTypes, scoringMode, spacing);
+      const generated = await generatePlan(project.id, plantingTypes, scoringMode, {
+        ...spacing,
+        onPoll: (status) => setGenerateProgress(progressFromStatus(status)),
+      });
       applyPlan(generated);
       await refreshPlans(project.id);
       saveStoredSession({ projectId: project.id, planId: generated.plan_id });
     } finally {
       setGenerating(false);
+      setGenerateProgress(null);
     }
   }
 
@@ -273,6 +303,8 @@ export function useProjectSession() {
     // calls that cause this render, so there's nothing to recompute here.
     planIndex: planIndexRef.current,
     generating,
+    uploadProgress,
+    generateProgress,
     exporting,
     restoring,
     applyPlan,

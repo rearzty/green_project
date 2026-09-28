@@ -25,6 +25,12 @@ class ProjectUploadJobStatus(BaseModel):
     status: ProjectUploadJobState
     project_id: str | None = None
     error: str | None = None
+    # Both optional and best-effort -- see project_jobs.py's own docstring.
+    # `stage` is human-readable Russian text ready to show as-is; `progress`
+    # is a 0..1 fraction when the current stage has a countable total, else
+    # None (frontend falls back to an indeterminate bar).
+    stage: str | None = None
+    progress: float | None = None
 
 
 class ProjectOut(BaseModel):

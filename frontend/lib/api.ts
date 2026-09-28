@@ -110,10 +110,16 @@ function postJson<T>(path: string, body: unknown): Promise<T> {
   return request(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 }
 
-interface ProjectUploadJobStatus {
+export interface ProjectUploadJobStatus {
   status: "pending" | "done" | "error";
   project_id: string | null;
   error: string | null;
+  /** Best-effort human-readable stage ("Распаковка архива", "Чтение файлов
+   * бандла: 4 из 33"), null before the backend has anything to report yet. */
+  stage: string | null;
+  /** 0..1 when the current stage has a countable total, else null -- render
+   * an indeterminate bar rather than a stuck 0%/100% in that case. */
+  progress: number | null;
 }
 
 function startUpload(name: string, file: File, sourceCrs?: string): Promise<{ job_id: string }> {
@@ -139,10 +145,16 @@ const UPLOAD_POLL_INTERVAL_MS = 700;
  * returned -- same signature/return shape as before, so call sites don't
  * need to change, mirroring generatePlan()'s own polling-behind-one-Promise
  * pattern. */
-export async function uploadProject(name: string, file: File, sourceCrs?: string): Promise<{ project_id: string }> {
+export async function uploadProject(
+  name: string,
+  file: File,
+  sourceCrs?: string,
+  options?: { onPoll?: (status: ProjectUploadJobStatus) => void }
+): Promise<{ project_id: string }> {
   const { job_id } = await startUpload(name, file, sourceCrs);
   for (;;) {
     const status = await getUploadStatus(job_id);
+    options?.onPoll?.(status);
     if (status.status === "error") throw new ApiError(status.error ?? "Не удалось загрузить проект.", 0);
     if (status.status === "done" && status.project_id) return { project_id: status.project_id };
     await new Promise((resolve) => setTimeout(resolve, UPLOAD_POLL_INTERVAL_MS));
@@ -202,6 +214,11 @@ export interface GenerateJobStatus {
   status: "pending" | "done" | "error";
   plan_id: string | null;
   error: string | null;
+  /** Best-effort: which planting_type most recently finished ("Готово:
+   * Кустарники (2 из 3)"), null before the backend has anything to report. */
+  stage: string | null;
+  /** types-done/types-total, 0..1, or null before the first type finishes. */
+  progress: number | null;
 }
 
 function startGenerate(
@@ -242,13 +259,18 @@ export async function generatePlan(
   projectId: string,
   plantingTypes: PlantingType[],
   scoringMode: ScoringMode,
-  options?: { signal?: AbortSignal; onPoll?: () => void; treeSpacingM?: number; shrubSpacingM?: number }
+  options?: {
+    signal?: AbortSignal;
+    onPoll?: (status: GenerateJobStatus) => void;
+    treeSpacingM?: number;
+    shrubSpacingM?: number;
+  }
 ): Promise<PlanOut> {
   const { job_id } = await startGenerate(projectId, plantingTypes, scoringMode, options?.treeSpacingM, options?.shrubSpacingM);
   for (;;) {
     if (options?.signal?.aborted) throw new ApiError("Генерация отменена.", 0);
     const status = await getGenerateStatus(projectId, job_id);
-    options?.onPoll?.();
+    options?.onPoll?.(status);
     if (status.status === "error") throw new ApiError(status.error ?? "Не удалось сгенерировать план.", 0);
     if (status.status === "done" && status.plan_id) return getPlan(projectId, status.plan_id);
     await new Promise((resolve) => setTimeout(resolve, GENERATE_POLL_INTERVAL_MS));
