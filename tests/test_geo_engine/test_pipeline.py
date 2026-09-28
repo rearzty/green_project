@@ -326,3 +326,60 @@ class TestInvalidHardObstacles:
 
         assert not buildable.is_empty
         assert buildable.area < territory.area, "препятствие должно что-то вычесть"
+
+
+class TestDuplicateTerritoryContours:
+    """Повторы одного контура не должны съедать участок.
+
+    Живой отказ на «4. Харьковская улица», и он тихий — худший вид. Бандл
+    ссылается на один чертёж четырежды, поэтому приходят четыре копии
+    каждого контура. Дубликат по определению содержится в уже собранном
+    результате на 100 %, логика дырок принимает его за внутреннее кольцо и
+    вычитает только что добавленное; следующая копия добавляет обратно, и на
+    чётном числе копий остаётся ноль. Итог: территория 0 м², план пустой, а
+    CLI рапортует «Готово» с кодом возврата 0.
+    """
+
+    @staticmethod
+    def _zones(*geoms):
+        return [Zone(geometry=g, zone_type="territory") for g in geoms]
+
+    def test_four_copies_of_one_contour_are_one_contour(self):
+        from geo_engine.territory import territory_polygon
+
+        outline = box(0, 0, 100, 100)
+
+        result = territory_polygon(self._zones(*([outline] * 4)))
+
+        assert result.area == pytest.approx(outline.area), "копии не должны вычитаться"
+
+    def test_a_real_hole_still_works_alongside_duplicates(self):
+        """Дедупликация не должна отменить сам механизм дырок — он нужен
+        («1. Олимпийская деревня»: внешний контур минус восемь вырезов).
+        """
+        from geo_engine.territory import territory_polygon
+
+        outer, hole = box(0, 0, 100, 100), box(40, 40, 60, 60)
+
+        result = territory_polygon(self._zones(outer, outer, hole, hole))
+
+        assert result.area == pytest.approx(outer.area - hole.area)
+
+    def test_an_empty_result_is_an_error_not_a_silent_success(self, monkeypatch):
+        """Отдельная защита, независимая от причины схлопывания.
+
+        Конкретный случай Харьковской чинит дедупликация выше, но сам по себе
+        «успех на пустой территории» — отдельный дефект: пустая территория
+        даёт пустой план, а CLI рапортует «Готово» с кодом возврата 0.
+        Следующая такая геометрия придёт с другой улицы, поэтому проверяется
+        именно защита, а не подогнанные под ноль фигуры.
+        """
+        from shapely.geometry import Polygon
+
+        from geo_engine import territory as territory_module
+        from geo_engine.territory import MissingTerritoryError, territory_polygon
+
+        monkeypatch.setattr(territory_module, "_combine_with_holes", lambda pieces: Polygon())
+
+        with pytest.raises(MissingTerritoryError, match="не осталось площади"):
+            territory_polygon(self._zones(box(0, 0, 100, 100), box(200, 200, 300, 300)))
