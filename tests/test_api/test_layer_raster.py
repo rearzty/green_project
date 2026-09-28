@@ -94,9 +94,14 @@ class TestRenderLayerRaster:
         result = render_layer_raster(layers, source_crs=None)
 
         keys = {g.key for g in result.groups}
-        assert keys == {"territory", "utility", "building"}
+        # existing_greenery/existing_lawn always get a row (see
+        # render_layer_raster's own comment) even though this fixture has
+        # neither -- that's the point of the always-shown pair, checked
+        # explicitly below.
+        assert keys == {"territory", "utility", "building", "existing_greenery", "existing_lawn"}
+        real_groups = {"territory", "utility", "building"}
         for group in result.groups:
-            assert group.count == 1
+            assert group.count == (1 if group.key in real_groups else 0)
             image = Image.open(__import__("io").BytesIO(group.png))
             assert image.format == "PNG"
             assert image.mode == "RGBA"
@@ -173,6 +178,53 @@ class TestRenderLayerRaster:
         (south, west), (north, east) = result.bounds
         assert east < 50_000
 
+    def test_existing_greenery_and_existing_lawn_always_get_a_legend_row(self):
+        """Live complaint: on one real street existing_lawn genuinely has
+        zero objects (its "Газон" layers are the project's OWN proposed
+        design, correctly left unclassified rather than guessed as real
+        existing turf -- see layer_rules.py), and a silently-absent legend
+        toggle for that read as "the feature is broken" rather than "this
+        street's data has none". Both categories must appear even when a
+        project (like this fixture) has neither, with an honest count of 0."""
+        layers = [_layer(id="territory", kind="zone", object_type="territory", geometry=shape_to_db(TERRITORY))]
+
+        result = render_layer_raster(layers, source_crs=None)
+
+        by_key = {g.key: g for g in result.groups}
+        assert by_key["existing_greenery"].count == 0
+        assert by_key["existing_lawn"].count == 0
+        # Still a real, validly-decodable (fully transparent) PNG, not a
+        # placeholder/None -- the frontend's <ImageOverlay> renders whatever
+        # this returns unconditionally once the group is in the list.
+        image = Image.open(__import__("io").BytesIO(by_key["existing_lawn"].png))
+        assert image.mode == "RGBA"
+        assert image.getextrema()[3] == (0, 0), "an empty group's canvas must be fully transparent, not garbage pixels"
+
+    def test_a_stray_fragment_does_not_balloon_the_canvas_when_there_is_no_territory_at_all(self):
+        """Live case, "7. Нижние Поля ул": no closeable boundary anywhere in
+        the bundle (MissingTerritoryError), so render_layer_raster has no
+        territory to anchor bounds on at all and falls back to the union of
+        every other layer -- and on that street, several categories
+        ("unknown", "existing_greenery", "building", "lighting_pole") each
+        carried content thousands of metres from the real site (not near the
+        origin, so drop_origin doesn't catch it), stretching the canvas to a
+        useless ~9x13km span. No `territory` layer in this fixture at all --
+        _dominant_cluster_bounds must still keep the real, densely-clustered
+        mass and drop the one far-off straggler.
+        """
+        real_site = [Point(x, y) for x in range(0, 100, 10) for y in range(0, 100, 10)]
+        stray = Point(50_000, 50_000)
+        layers = [
+            _layer(id=f"real-{i}", kind="zone", object_type="existing_greenery", geometry=shape_to_db(p))
+            for i, p in enumerate(real_site)
+        ] + [_layer(id="stray", kind="zone", object_type="unknown", geometry=shape_to_db(stray))]
+
+        result = render_layer_raster(layers, source_crs=None)
+
+        (south, west), (north, east) = result.bounds
+        assert east < 1_000, "the far-off straggler must not have set the canvas frame"
+        assert west > -1_000
+
     def test_reprojects_bounds_when_source_crs_is_set(self):
         layers = [_layer(id="territory", kind="zone", object_type="territory", geometry=shape_to_db(TERRITORY))]
         result = render_layer_raster(layers, source_crs="EPSG:32637")
@@ -220,10 +272,17 @@ class TestParallelRendering:
         the pool -- a project with only one legend group would otherwise pay
         process-spawn overhead for a "parallel" render of exactly one thing.
         Forcing the threshold down here should still take the inline path,
-        not crash trying to divide work across a pool of one."""
+        not crash trying to divide work across a pool of one.
+
+        The always-shown existing_greenery/existing_lawn pair (see
+        render_layer_raster's own comment) means a real call always has at
+        least 3 groups now, so this can't reach `len(by_group) == 1` through
+        the public function any more -- kept anyway as a smoke test that a
+        handful of mostly-empty groups still renders without touching the
+        pool-of-one edge case in _render_groups_parallel."""
         layers = [_layer(id="territory", kind="zone", object_type="territory", geometry=shape_to_db(TERRITORY))]
         monkeypatch.setattr(layer_raster_module, "_PARALLEL_RENDER_THRESHOLD", 1)
 
         result = render_layer_raster(layers, source_crs=None)
 
-        assert {g.key for g in result.groups} == {"territory"}
+        assert {g.key for g in result.groups} == {"territory", "existing_greenery", "existing_lawn"}
