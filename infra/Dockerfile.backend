@@ -62,19 +62,41 @@ FROM python:3.11-slim
 # (not a third-party mirror) -- confirmed empirically to be a stable,
 # unauthenticated download (plain 200, no login/EULA redirect), not a
 # short-lived presigned link.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        wget xvfb xauth libgl1 libxkbcommon0 libxkbcommon-x11-0 libxcb-icccm4 \
-        libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 \
-        libxcb-xkb1 libfontconfig1 libxrender1 libsm6 libice6 libxrandr2 \
-        libxi6 libxcursor1 libxcomposite1 libxdamage1 libxtst6 libnss3 \
-        libasound2t64 libdbus-1-3 \
-    && rm -rf /var/lib/apt/lists/* \
-    && wget -q "https://www.opendesign.com/guestfiles/get?filename=ODAFileConverter_QT6_lnxX64_8.3dll_27.1.deb" \
-        -O /tmp/oda_converter.deb \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends /tmp/oda_converter.deb \
-    && rm -rf /tmp/oda_converter.deb /var/lib/apt/lists/*
+#
+# УСТАНАВЛИВАЕТСЯ ТОЛЬКО НА amd64, и это не перестраховка. ODA публикует под
+# Linux единственную сборку — x86-64 (`lnxX64`); имён под arm64 у неё нет,
+# проверено запросами к тому же guestfiles-маршруту: `lnxARM64`, `lnxAArch64`
+# и `lnxArm64` отдают 404, `lnxX64` — 206 с реальным содержимым. Без этого
+# условия на машине с Apple Silicon образ backend не собирался ВООБЩЕ:
+# `dpkg: package architecture (amd64) does not match system (arm64)`, вся
+# сборка падала с кодом 100, то есть `docker compose up --build` из README не
+# работал на такой машине совсем. Собрать образ под amd64 через эмуляцию
+# можно (`--platform linux/amd64`), но это осознанный выбор того, кто
+# собирает, а не то, что должно случаться молча.
+#
+# На arm64 остаётся LibreDWG — ровно тот путь, который `available_backend()`
+# уже предусматривает как запасной. Цена известна и описана выше: пустые
+# ACIS-payload'ы у REGION/3DSOLID, то есть теряются поверхностные заливки.
+# Это деградация, а не поломка, и она видна в логе сборки.
+RUN set -eu; \
+    if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends \
+            wget xvfb xauth libgl1 libxkbcommon0 libxkbcommon-x11-0 libxcb-icccm4 \
+            libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 \
+            libxcb-xkb1 libfontconfig1 libxrender1 libsm6 libice6 libxrandr2 \
+            libxi6 libxcursor1 libxcomposite1 libxdamage1 libxtst6 libnss3 \
+            libasound2t64 libdbus-1-3 \
+        && rm -rf /var/lib/apt/lists/* \
+        && wget -q "https://www.opendesign.com/guestfiles/get?filename=ODAFileConverter_QT6_lnxX64_8.3dll_27.1.deb" \
+            -O /tmp/oda_converter.deb \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends /tmp/oda_converter.deb \
+        && rm -rf /tmp/oda_converter.deb /var/lib/apt/lists/* \
+        && ODAFileConverter --version >/dev/null 2>&1 || true; \
+    else \
+        echo "ODA File Converter: сборки под $(dpkg --print-architecture) не существует (только lnxX64) — остаётся LibreDWG, см. комментарий выше"; \
+    fi
 
 WORKDIR /app
 
