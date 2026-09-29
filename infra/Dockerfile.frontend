@@ -5,7 +5,23 @@ COPY frontend/package.json frontend/package-lock.json ./
 # npm ci, not npm install -- installs exactly what's pinned in
 # package-lock.json (reproducible across machines/CI) and is faster (skips
 # npm's own dependency-resolution step, which install always redoes).
-RUN npm ci
+#
+# Кэш npm смонтирован как BuildKit-кэш, и это не украшение. Живой отказ:
+# на медленном канале сборка фронта падала `DeadlineExceeded: context
+# deadline exceeded` прямо на этом шаге, и КАЖДАЯ повторная попытка качала
+# все пакеты заново — то есть повтор не приближал к успеху. Замерено с этой
+# же машины: одни метаданные `next` весят 31 МБ и едут 10 секунд, а их в
+# дереве сотни. С кэшем повтор продолжает с того, что уже скачано.
+#
+# `--no-audit --no-fund` убирают два лишних сетевых обращения, которые к
+# установке отношения не имеют. Повторы и увеличенный таймаут — для того же
+# канала: значения по умолчанию (3 попытки, 5 минут) на нём срабатывали не
+# всегда.
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --no-audit --no-fund \
+        --fetch-retries 5 \
+        --fetch-retry-maxtimeout 120000 \
+        --fetch-timeout 600000
 
 FROM node:20-slim AS build
 WORKDIR /app
