@@ -47,7 +47,7 @@ from __future__ import annotations
 import math
 
 import shapely
-from shapely.geometry import LineString, MultiLineString, Point, Polygon
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import linemerge, polygonize_full, unary_union
 from shapely.strtree import STRtree
@@ -501,7 +501,19 @@ def reconstruct_closed_footprints(
     if snap_grid_m > 0:
         lines = [shapely.set_precision(line, snap_grid_m) for line in lines]
     closed, cuts, dangles, invalid = polygonize_full(unary_union(lines))
-    polygons.extend(g for g in closed.geoms if not g.is_empty)
+    # Same repair as `reconstruct_closed_road_polygons()` below, same reason:
+    # `polygonize_full`'s "closed" rings are not guaranteed valid -- grid
+    # snapping can close a ring that self-touches rather than a clean loop.
+    # Not yet observed to break this specific caller live, but the
+    # construction is identical, so the same defensive repair is cheap
+    # insurance rather than a guess.
+    for g in closed.geoms:
+        if g.is_empty:
+            continue
+        if not g.is_valid:
+            g = g.buffer(0)
+        if not g.is_empty:
+            polygons.append(g)
 
     for leftover in (*cuts.geoms, *dangles.geoms, *invalid.geoms):
         if leftover.is_empty:
@@ -519,7 +531,7 @@ DEFAULT_ROAD_POLYGON_SNAP_GRID_M = 0.1
 def reconstruct_closed_road_polygons(
     geometries: list[BaseGeometry],
     snap_grid_m: float = DEFAULT_ROAD_POLYGON_SNAP_GRID_M,
-) -> list[Polygon]:
+) -> list[Polygon | MultiPolygon]:
     """Curb-line loops that close into a real road/sidewalk surface polygon.
 
     Deliberately a *different*, additive function rather than another call
@@ -563,4 +575,29 @@ def reconstruct_closed_road_polygons(
     if snap_grid_m > 0:
         lines = [shapely.set_precision(line, snap_grid_m) for line in lines]
     closed, _cuts, _dangles, _invalid = polygonize_full(unary_union(lines))
-    return [g for g in closed.geoms if not g.is_empty]
+    # `polygonize_full`'s "closed" rings are not guaranteed valid -- live
+    # crash on "13. Харьковский проезд": grid-snapping a curb network into
+    # 0.1 m cells occasionally collapses two nearly-parallel vertices onto
+    # the same snapped point, closing a ring that self-touches instead of a
+    # clean loop. `is_valid` was false for 7 of ~2600 sidewalk polygons on
+    # that street, and `buffers.buildable_area()`'s later
+    # `unary_union(hard_obstacles)` -- which has to node every one of them
+    # against every other -- died with `GEOSException: side location
+    # conflict` on the self-intersection, not a graceful skip. Same repair
+    # `dxf_reader.py` already uses for the same GEOS symptom on a HATCH
+    # boundary loop (`polygon.buffer(0)`): it re-derives a valid boundary
+    # from the (possibly self-touching) ring, which for a snapping artifact
+    # is either the same shape with the touch resolved or splits into the
+    # ring's real disjoint lobes -- both fine, both far better than handing
+    # GEOS's noding an input it can't resolve four call frames later with no
+    # indication which polygon was the cause.
+    result = []
+    for g in closed.geoms:
+        if g.is_empty:
+            continue
+        if not g.is_valid:
+            g = g.buffer(0)
+        if g.is_empty or g.area <= 0:
+            continue
+        result.append(g)
+    return result

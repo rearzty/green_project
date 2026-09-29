@@ -374,3 +374,35 @@ def test_a_self_touching_near_closed_ring_is_left_as_a_line(tmp_path):
     _, zones = read_dxf(path, layer_map=MOSGEOTREST_LAYER_MAP)
 
     assert zones[0].geometry.geom_type == "LineString"
+
+
+def test_an_explicitly_closed_self_intersecting_polyline_is_repaired_not_left_invalid(tmp_path):
+    """Different from the test above on purpose: there the closure is
+    inferred (ends merely land close together), so falling back to a line
+    when the ring turns out invalid respects the source data -- nothing said
+    this should have been an area. Here the DXF entity is explicitly flagged
+    closed (`close=True`), so there is no such "maybe it wasn't meant to
+    close" escape hatch -- the source data itself says it is a closed ring,
+    and the only question is whether the *shape* is valid. Live crash, "13.
+    Харьковский проезд": 7 of ~2600 sidewalk polygons on that street are
+    exactly this -- an explicitly-closed LWPOLYLINE whose vertex sequence
+    self-intersects (a real drafting slip or DWG->DXF conversion artifact,
+    not inferred data) -- and the unrepaired invalid Polygon later crashed
+    `buffers.buildable_area()`'s `unary_union(hard_obstacles)` with a GEOS
+    `side location conflict` several call frames away from which polygon
+    actually caused it.
+    """
+    doc = ezdxf.new(setup=True)
+    doc.layers.add(name=BOUNDARY_LAYER)
+    # A bowtie: crosses itself once, same shape class as the real finding.
+    doc.modelspace().add_lwpolyline(
+        [(0, 0), (100, 100), (100, 0), (0, 100)], close=True, dxfattribs={"layer": BOUNDARY_LAYER}
+    )
+    path = tmp_path / "bowtie.dxf"
+    doc.saveas(str(path))
+
+    _, zones = read_dxf(path, layer_map=MOSGEOTREST_LAYER_MAP)
+
+    assert zones[0].geometry.geom_type in ("Polygon", "MultiPolygon")
+    assert zones[0].geometry.is_valid
+    assert zones[0].geometry.area > 0

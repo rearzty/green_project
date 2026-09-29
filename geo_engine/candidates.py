@@ -166,8 +166,8 @@ class TooManyCandidatesError(ValueError):
 # pathological input" spirit as MAX_3D_ITEMS/MAX_VISIBLE_MARKERS on the
 # frontend (plan3d.ts/MapView.tsx), not a claim about what's realistic.
 # Comfortably above default-settings usage on a real ~1.5x1.5km territory
-# (measured ~362K tree / ~1.0M shrub raw samples -- see CLAUDE.md's
-# real-scale benchmarks), comfortably below the failing case above.
+# (measured ~362K tree / ~1.0M shrub raw samples on a real pilot street),
+# comfortably below the failing case above.
 _MAX_RAW_SAMPLES_PER_POLYGON = 2_000_000
 
 # Dart-throwing oversample: how many random raw points to draw per polygon,
@@ -175,9 +175,9 @@ _MAX_RAW_SAMPLES_PER_POLYGON = 2_000_000
 # same bounding box (see generate_point_candidates). Pure rejection sampling
 # needs more raw darts than a grid to reach comparable final density, because
 # some fraction always lands too close to an already-accepted neighbor and
-# gets rejected later by greedy_select -- 4x was enough in practice (see
-# CLAUDE.md) to keep counts in the same ballpark as the old grid at the same
-# spacing; raise it if a real run comes back noticeably sparser than expected.
+# gets rejected later by greedy_select -- 4x was enough in practice to keep
+# counts in the same ballpark as the old grid at the same spacing; raise it
+# if a real run comes back noticeably sparser than expected.
 _OVERSAMPLE_FACTOR = 4
 
 
@@ -199,11 +199,11 @@ def generate_point_candidates(
     without writing a real Bridson's-algorithm implementation: greedy_select
     was already fast and already tested at real scale, this only changes
     what candidates it sees. A plain grid looked mathematically regular on
-    real data -- see CLAUDE.md.
+    real data.
 
     `seed` must be derived deterministically from something stable per plan
     (pipeline_service._compute_planting_rows uses plan_id) -- generate_plan is
-    otherwise a pure function of its recipe (CLAUDE.md), and
+    otherwise a pure function of its recipe, and
     ensure_materialized() has to reproduce a collapsed plan's exact layout,
     not a fresh random one, when it recomputes it later.
 

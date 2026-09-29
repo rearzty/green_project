@@ -4,14 +4,17 @@
 
 | Метод | Путь | Описание |
 |---|---|---|
-| `POST` | `/api/projects` | Загрузка территории (`multipart/form-data`: `name`, `file` — DXF/DWG/ZIP/GeoJSON/SHP, опц. `source_crs`) — запускает DWG-конвертацию + разбор бандла как **фоновую задачу** (на реальном многофайловом ZIP — от десятков секунд до нескольких минут, см. CLAUDE.md) → `202 {job_id}`. `source_crs` можно не указывать для GeoJSON/SHP в градусах (WGS84) — определяется автоматически и перепроецируется в UTM (см. CLAUDE.md); для DXF/DWG/ZIP и любой другой метрической CRS `source_crs` по-прежнему обязателен |
+| `POST` | `/api/projects` | Загрузка территории (`multipart/form-data`: `name`, `file` — DXF/DWG/ZIP/GeoJSON/SHP, опц. `source_crs`) — запускает DWG-конвертацию + разбор бандла как **фоновую задачу** (на реальном многофайловом ZIP — от десятков секунд до нескольких минут) → `202 {job_id}`. `source_crs` можно не указывать для GeoJSON/SHP в градусах (WGS84) — определяется автоматически и перепроецируется в UTM; для DXF/DWG/ZIP и любой другой метрической CRS `source_crs` по-прежнему обязателен |
 | `GET` | `/api/projects/upload/{job_id}` | Статус фоновой задачи загрузки → `{status: "pending"\|"done"\|"error", project_id, error}`. Фронт опрашивает это, затем забирает проект обычным `GET .../{project_id}` |
 | `GET` | `/api/projects/{project_id}` | Метаданные проекта (без слоёв — см. `/layers` ниже) |
 | `GET` | `/api/projects/{project_id}/layers` | Все слои (коммуникации, здания, зонирование, территория) в виде `FeatureCollection` — отдельный, лениво запрашиваемый эндпоинт (только 3D-вид), на реальном масштабе может быть десятки МБ |
+| `GET` | `/api/projects/{project_id}/layers-raster` | Границы + список групп легенды для растровой подложки 2D-карты (не векторные фичи) |
+| `GET` | `/api/projects/{project_id}/layers-raster/image?group=...` | PNG одной группы легенды на общей пиксельной сетке |
 | `POST` | `/api/projects/{project_id}/generate` | Запускает генерацию как **фоновую задачу** (не ждёт её здесь — на реальном масштабе может занять десятки секунд) → `202 {job_id}` |
 | `GET` | `/api/projects/{project_id}/generate/{job_id}` | Статус фоновой задачи генерации → `{status: "pending"\|"done"\|"error", plan_id, error}`. Фронт опрашивает это, затем забирает план обычным `GET .../plans/{plan_id}` — создаёт **новый** `Plan` (не перезаписывает предыдущий), помечает его `is_current` |
 | `GET` | `/api/projects/{project_id}/plans` | История всех планов проекта (не только текущий) — `[{plan_id, scoring_mode, created_at, is_current, item_count}]`, без геометрии (для списка/переключателя в UI) |
 | `GET` | `/api/projects/{project_id}/plans/{plan_id}` | Один конкретный план (полная геометрия) |
+| `DELETE` | `/api/projects/{project_id}/plans/{plan_id}` | Удалить план из истории насовсем, без undo. Отклоняет удаление текущего плана (`409`) |
 | `PATCH` | `/api/projects/{project_id}/plans/{plan_id}/items/{item_id}` | Точечная графическая правка (перенос/смена типа/вида) → обновлённый `Feature`. `geometry` — в WGS84 (родная CRS Leaflet), сервер сам перепроецирует в `source_crs` проекта |
 | `POST` | `/api/projects/{project_id}/plans/{plan_id}/items/delete` | Удалить объекты по id. Тело `{ids}` → `{deleted_items: [Feature], item_count}` — снэпшоты «до удаления» (для отмены через `items/restore`) и свежий счётчик плана. Неизвестный id → 409, ничего не удаляется |
 | `POST` | `/api/projects/{project_id}/plans/{plan_id}/items/retype` | Сменить тип. Тело `{changes: [{id, planting_type}]}` (у каждого свой тип — так работает и отмена) → `{previous_items: [Feature], skipped_ids}`: снэпшоты реально изменённых (геометрия не меняется, фронт правит `planting_type` локально); в `skipped_ids` — объекты, чья геометрия не может иметь такой тип (газон-полигон ↔ дерево/куст-точка) |
@@ -19,15 +22,19 @@
 | `POST` | `/api/projects/{project_id}/plans/{plan_id}/items/restore` | Восстановить удалённые объекты из снэпшотов (`{items: [Feature]}`, тот же id/геометрия/тип/оценка/`is_manual_edit`) → `{item_count}`. Если объект с таким id уже есть — 409 |
 | `POST` | `/api/projects/{project_id}/plans/{plan_id}/validate` | Полная перепроверка плана на нормативы → `{violations: [{item_id, message}]}` — только при открытии плана |
 | `POST` | `/api/projects/{project_id}/plans/{plan_id}/validate/items` | То же самое, но только для указанных id (`{ids}`) — сеттбек проверяется независимо для каждого объекта, так что правка не может изменить статус нарушения ни у чего, кроме того, что она сама задела; фронт зовёт это после каждой правки вместо полной проверки, объединяя результат по id |
-| `POST` | `/api/projects/{project_id}/plans/{plan_id}/export-dxf` | Запускает экспорт в DXF как **фоновую задачу** (на реальном масштабе — до ~3 минут, см. CLAUDE.md) → `202 {job_id}` |
+| `POST` | `/api/projects/{project_id}/plans/{plan_id}/export-dxf` | Запускает экспорт в DXF как **фоновую задачу** (на реальном масштабе — до ~3 минут) → `202 {job_id}` |
 | `GET` | `/api/projects/{project_id}/plans/{plan_id}/export-dxf/{job_id}` | Статус фоновой задачи экспорта → `{status: "pending"\|"done"\|"error", error}` |
 | `GET` | `/api/projects/{project_id}/plans/{plan_id}/export-dxf/{job_id}/download` | Скачать готовый файл (`Content-Disposition: attachment`) — доступен один раз, после отдачи задача и временный файл удаляются |
+| `POST` | `/api/projects/{project_id}/plans/{plan_id}/compliance/items` | Обоснование по нормативам для конкретных посадок (`{ids}`) — тот же `geo_engine.compliance.explain_items`, что и CLI, но по подмножеству и синхронно (дёшево — один `STRtree`-проход) |
+| `GET` | `/api/projects/{project_id}/plans/{plan_id}/compliance-report.json` | Полный отчёт по плану — тот же формат, что пишет `scripts/plan_dxf.py` рядом с `--output` |
+| `GET` | `/api/projects/{project_id}/plans/{plan_id}/compliance-report.csv` | То же плоской таблицей посадка×ограничение |
+| `POST` | `/api/assistant/message` | Чат с ассистентом «Юна» (Groq, function-calling) — меняет параметры генерации (интервалы посадок, типы), сам вызывает `POST .../generate`; без `GREENPROJECT_GROQ_API_KEY` отвечает `503` |
 | `GET` | `/api/config/planting-norms` | Текущий справочник нормативов (для легенды и клиентской валидации) |
 | `GET` | `/health` | Liveness-проверка |
 
 ## Правка карты — по id объектов, не по зоне
 
-Выделение на карте (клик, рамка, Shift-добавление) и все действия над ним (перенос, смена типа, удаление, отмена/повтор) обращаются к конкретным `item_id`, не к геометрической зоне — повторный вызов позже (например, отмена) действует ровно на те же объекты, независимо от того, что успело переместиться в эту область или из неё за это время. Более раннюю зонную реализацию («убрать в радиусе», «переместить в зоне» и т.п., плюс журнал правок `edit_history`) удалили как неиспользуемый код, когда интерфейс полностью перешёл на правку по id — история (`docs/worklog.md`, запись «Undo/redo по id»).
+Выделение на карте (клик, рамка, Shift-добавление) и все действия над ним (перенос, смена типа, удаление, отмена/повтор) обращаются к конкретным `item_id`, не к геометрической зоне — повторный вызов позже (например, отмена) действует ровно на те же объекты, независимо от того, что успело переместиться в эту область или из неё за это время. Более раннюю зонную реализацию («убрать в радиусе», «переместить в зоне» и т.п., плюс журнал правок `edit_history`) удалили как неиспользуемый код, когда интерфейс полностью перешёл на правку по id.
 
 ## Не блокирующая валидация
 

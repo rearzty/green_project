@@ -283,8 +283,8 @@ async def create_project_from_file(
     # real evidence in the file's own coordinates -- a caller-supplied
     # source_crs (even one that happens to be correct) is still a guess we
     # have no way to check, and showing a real basemap under it would be
-    # exactly the kind of overconfidence that produced the Kenya-map bug
-    # (see CLAUDE.md). See Project.crs_verified's own docstring.
+    # exactly the kind of overconfidence that once put a real project's
+    # territory at the equator in Kenya. See Project.crs_verified's own docstring.
     project = Project(name=name, source_crs=source_crs or detected_crs, crs_verified=source_crs is None and detected_crs is not None)
     project.layers = [
         Layer(

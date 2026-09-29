@@ -3,8 +3,8 @@ derived from the machine's real core count instead of a hardcoded 8, greedy
 LPT bin-packing for batched DWG conversion, and `resolve_and_read_bundle`'s
 overlap of DWG->DXF conversion with DXF reading.
 
-Real-world context for the numbers below is in CLAUDE.md and
-docs/decision_log.md -- summarized here: the project brief's own guaranteed
+Real-world context for the numbers below is in docs/decision_log.md --
+summarized here: the project brief's own guaranteed
 minimum target hardware is 8 logical cores (ТЗ, "не менее 8 логических
 ядер"), and a hardcoded worker cap of 8 happened to sit exactly on that
 floor, silently leaving every core above it idle on a beefier machine
@@ -238,7 +238,7 @@ class TestResolveAndReadBundleOverlap:
         """Live complaint this covers: a real upload's progress bar sat on
         the caller's PRE-bundle stage label ("Распаковка архива") for the
         entire main-file conversion + first-file-read stretch, which on a
-        slow-converting real file reads as hung, not busy (see CLAUDE.md).
+        slow-converting real file reads as hung, not busy.
         `on_progress` must fire at (0, total) before the main file's own
         (potentially slow) conversion even starts, not only once files start
         finishing, so the caller has the *correct* stage name and total on

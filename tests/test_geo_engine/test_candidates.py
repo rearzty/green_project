@@ -40,7 +40,7 @@ def test_minimum_tree_spacing_on_a_modest_territory_is_rejected():
 
 
 def test_default_spacing_on_a_real_scale_territory_is_not_rejected():
-    # ~1.5x1.5km, this project's own documented real-world scale (CLAUDE.md),
+    # ~1.5x1.5km, this project's own documented real-world scale,
     # at planting_norms.yaml's own defaults -- must stay well clear of the
     # cap, or the safety valve would be blocking the app's main use case.
     territory = box(0, 0, 1500, 1500)
@@ -181,8 +181,8 @@ class TestExclusionIndex:
         assert index.distance(probe) == pytest.approx(probe.distance(complex_poly), rel=1e-6)
 
     def test_indexed_batch_lookup_stays_fast_against_many_high_vertex_parts(self):
-        """Not real-data scale (that's a live, opt-in verification -- see
-        CLAUDE.md's plan_items paragraph) -- enough vertices and queries
+        """Not real-data scale (that's a live, opt-in verification) --
+        enough vertices and queries
         that the naive or part-level-indexed path would visibly show up
         here too."""
         n = 2000

@@ -246,7 +246,7 @@ MOSGEOTREST_LAYER_MAP: LayerMap = {
 #   already present and already classified elsewhere (water_pipe/sewer/
 #   cable_line already have real setbacks_m entries) — a manhole is an access
 #   point on an already-protected line, not an independent structure with its
-#   own clearance. Left as "unknown" on purpose, see CLAUDE.md.
+#   own clearance. Left as "unknown" on purpose.
 
 # Layers whose INSERTs are point symbols: the insertion point *is* the object,
 # and exploding them yields the little circles and ticks the symbol is drawn
@@ -358,7 +358,25 @@ def _entity_to_geometry(entity) -> BaseGeometry | None:
             return None
         is_closed = getattr(entity, "is_closed", False) or getattr(entity.dxf, "flags", 0) & 1
         if is_closed and len(points) >= 3:
-            return Polygon(points)
+            # Unlike the inferred-closure branch below, this ring's closure
+            # is not a guess -- the DXF entity itself is flagged closed, so
+            # there is no "leave it as a line instead" fallback that respects
+            # the source data. Self-intersection is still possible though (a
+            # real drafting slip, or a DWG->DXF conversion artifact) and,
+            # unrepaired, was found live on "13. Харьковский проезд": 7 of
+            # ~2600 sidewalk polygons on that street self-intersect this way,
+            # and the invalid one later made `buffers.buildable_area()`'s
+            # `unary_union(hard_obstacles)` die with a GEOS `side location
+            # conflict` several call frames away from which polygon actually
+            # caused it. Same repair already used a few lines down in this
+            # same function (`_hatch_to_geometry`'s boundary loops) for the
+            # identical symptom on a different entity type.
+            polygon = Polygon(points)
+            if not polygon.is_valid:
+                polygon = polygon.buffer(0)
+            if not polygon.is_empty and polygon.area > 0:
+                return polygon
+            return LineString(points)
         if len(points) >= _POLYLINE_CLOSE_MIN_POINTS:
             gap = math.dist(points[0], points[-1])
             if gap <= _POLYLINE_CLOSE_TOLERANCE_M:
@@ -1396,7 +1414,7 @@ def resolve_and_read_bundle(
     if on_progress is not None:
         # Fired before the main file's own conversion (below) even starts --
         # without this, a slow-to-convert main file (real case: tens of
-        # seconds, see CLAUDE.md's ezdxf-tokenizer profiling) left the caller
+        # seconds, per ezdxf-tokenizer profiling on real data) left the caller
         # stuck reporting whatever stage came before this function was even
         # called (project_service.py's "Распаковка архива") for that entire
         # stretch, which live-tested as indistinguishable from a hung upload.

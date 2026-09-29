@@ -204,7 +204,7 @@ class PlantingNorms(BaseModel):
         candidate grid step in geo_engine.candidates, so it must move
         together with canopy_radius_m: setting only the crown radius while
         leaving a smaller/unrelated grid step is exactly the bug that once
-        made shrub density basically uncontrolled (see CLAUDE.md) -- keeping
+        made shrub density basically uncontrolled once already -- keeping
         the ratio fixed here is what prevents a repeat of that for
         user-supplied values too. Doesn't touch load_norms()'s cache (this
         builds an independent in-memory copy, never re-reads the YAML)."""

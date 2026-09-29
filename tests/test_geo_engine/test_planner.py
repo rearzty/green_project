@@ -9,9 +9,8 @@ futures-in-submission-order guarantee) -- re-verified on the same street with
 patterns in place: 1512.15s -> 379.72s combined-run wall time, byte-identical
 output (13124 items, same species/counts, all compliant) once
 geo_engine/candidates.py::ExclusionIndex fixed a *second*, larger bottleneck
-that patterns.py's group/curtain pattern introduced (see CLAUDE.md's
-`planner.plan_items()`/куртины paragraphs) -- that second fix is unrelated to
-parallelism itself, just found while re-measuring it.
+that patterns.py's group/curtain pattern introduced -- that second fix is
+unrelated to parallelism itself, just found while re-measuring it.
 
 What *is* cheap to check here, and worth checking regardless of what's inside
 _plan_type_items (a multiprocessing path can silently diverge from its
@@ -112,8 +111,8 @@ class TestDefaultDensity:
     legally available spot ("сколько влезает", not "сколько нужно"),
     confirmed live as both unrealistic (235 curtains, 12577 shrubs on one
     real street, every 14m regardless of whether a designer would put an
-    accent group there) and the dominant cost on real scale (see CLAUDE.md's
-    "Куртины кустарника" paragraph). plan_items() now applies a practice-based
+    accent group there) and the dominant cost on real scale. plan_items() now
+    applies a practice-based
     per-type default instead of requiring every caller to opt in, reusing the
     exact tree=25/shrub=250 figures already validated by eye on the reference
     street (docs/decision_log.md) rather than inventing new numbers.

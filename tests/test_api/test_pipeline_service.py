@@ -200,6 +200,57 @@ class TestTerritoryPolygon:
         assert territory.area == pytest.approx(outer.area - hole.area + island.area)
         assert territory.intersection(island).area == pytest.approx(island.area)
 
+    def test_a_near_duplicate_boundary_is_unioned_not_subtracted_from_itself(self):
+        """Живая находка, «17. Грузинская М ул»: слой границы участка читается
+        ДВАЖДЫ — из главного чертежа и из отдельного xref-файла границы,
+        которые несут почти идентичную (с шумом дигитализации в пару м²)
+        копию одного и того же контура. Старая версия `_combine_with_holes()`
+        не отличала «маленький кусок внутри большого — это дырка» от «почти
+        такой же по размеру кусок внутри такого же по размеру — это дубль»:
+        обе ситуации дают `contained_fraction > 0.99`, и дубль вычитался сам
+        из себя, схлопывая ~30 000 м² реальной площади до ~19 м² остатка.
+        Дубль здесь не идентичен побитово (реальный случай — тоже нет),
+        чтобы не полагаться на identity/exact-equality шейпли."""
+        from shapely.geometry import Polygon
+
+        from backend.app.services.pipeline_service import territory_polygon
+        from geo_engine.model import Zone
+
+        original = Polygon([(0, 0), (100, 0), (100, 100), (0, 100)])
+        # Same footprint, nudged by fractions of a unit on two corners --
+        # digitisation noise, not an exact copy.
+        near_duplicate = Polygon([(0, 0), (100.3, -0.2), (99.8, 100.1), (0, 100)])
+        zones = [
+            Zone(geometry=original, zone_type="territory"),
+            Zone(geometry=near_duplicate, zone_type="territory"),
+        ]
+
+        territory = territory_polygon(zones)
+
+        # The bug collapsed this to a sliver a couple orders of magnitude
+        # smaller than either input; the correct result is close to either
+        # single copy's own area (a union of two near-identical shapes),
+        # not their difference.
+        assert territory.area == pytest.approx(original.area, rel=0.05)
+
+    def test_a_genuine_hole_much_smaller_than_the_outer_boundary_still_cuts_out(self):
+        """Guards the size-ratio check itself: a hole under the 50% cutoff
+        must still behave exactly like `test_a_zone_fully_inside_another_is_
+        cut_out_as_a_hole_not_unioned` above -- the near-duplicate fix must
+        not accidentally weaken the original, still-valid hole case."""
+        from shapely.geometry import Polygon
+
+        from backend.app.services.pipeline_service import territory_polygon
+        from geo_engine.model import Zone
+
+        outer = Polygon([(0, 0), (100, 0), (100, 100), (0, 100)])
+        hole = Polygon([(20, 20), (49, 20), (49, 49), (20, 49)])  # 29x29 = 841, 8.4% of outer
+        zones = [Zone(geometry=outer, zone_type="territory"), Zone(geometry=hole, zone_type="territory")]
+
+        territory = territory_polygon(zones)
+
+        assert territory.area == pytest.approx(outer.area - hole.area)
+
 
 class TestAsPolygonal:
     """`_as_polygonal()` -- the fix for a live crash on «18. Кустанайская

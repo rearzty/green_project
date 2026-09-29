@@ -2,7 +2,7 @@
 
 POST .../generate used to block the whole request for however long
 candidate generation + greedy placement takes -- fine on the 100x80m demo
-synthetic territory, but CLAUDE.md's own measurements on a real ~1.5x1.5km
+synthetic territory, but measurements on a real ~1.5x1.5km
 territory put this at tens of seconds even after the O(n log n) rewrite of
 placement.py/candidates.py, which risks tripping a browser/proxy timeout on
 real data. Now the route hands back a job id immediately and the frontend

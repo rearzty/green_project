@@ -413,6 +413,33 @@ class TestReconstructClosedFootprints:
         assert with_fallback and with_fallback[0].area > 0
         assert without_fallback == []
 
+    def test_a_self_intersecting_closed_ring_is_repaired_not_returned_broken(self, monkeypatch):
+        """Same defensive repair as `reconstruct_closed_road_polygons`'s own
+        version of this test, applied here too: `polygonize_full`'s "closed"
+        set is not guaranteed valid (see that test's docstring for the live
+        trigger on real curb-network data), and this function shares the
+        identical `polygonize_full(unary_union(lines))` construction. Not yet
+        observed to break on a real building/territory/existing_greenery
+        layer, but the vulnerability is the same one either way."""
+        bowtie = Polygon([(0, 0), (10, 10), (10, 0), (0, 10), (0, 0)])
+        assert not bowtie.is_valid
+
+        import geo_engine.io.geometry_cleanup as geometry_cleanup
+
+        def fake_polygonize_full(_geometry):
+            from shapely.geometry import GeometryCollection
+
+            empty = unary_union([])
+            return GeometryCollection([bowtie]), empty, empty, empty
+
+        monkeypatch.setattr(geometry_cleanup, "polygonize_full", fake_polygonize_full)
+
+        result = reconstruct_closed_footprints([LineString([(0, 0), (1, 1)])], snap_grid_m=0.3, dangle_buffer_m=0.3)
+
+        assert len(result) >= 1
+        assert all(g.is_valid for g in result)
+        assert sum(g.area for g in result) > 0
+
 
 class TestReconstructClosedRoadPolygons:
     """Live case, "2. Песчаный переулок": road/sidewalk are already in
@@ -474,3 +501,43 @@ class TestReconstructClosedRoadPolygons:
 
         assert len(result) == 1
         assert result[0].area == pytest.approx(100.0)
+
+    def test_a_self_intersecting_closed_ring_is_repaired_not_returned_broken(self, monkeypatch):
+        """Live crash, «13. Харьковский проезд»: snapping a real curb network
+        to the 0.1 m grid occasionally collapses two near-parallel vertices
+        onto the same point, so `polygonize_full`'s "closed" set contains a
+        ring that self-touches instead of a clean loop -- 7 of ~2600
+        sidewalk polygons on that street, confirmed via `shapely.is_valid`/
+        `explain_validity`. Handed straight through, that invalid polygon
+        later made `buffers.buildable_area()`'s `unary_union(hard_obstacles)`
+        die with `GEOSException: side location conflict`, four call frames
+        away from which polygon actually caused it.
+
+        Reproducing the exact snap-precision trigger synthetically wasn't
+        found practical (same conclusion as `TestAsPolygonal` reached for the
+        analogous GeometryCollection case) -- `polygonize_full` itself nodes
+        its input, so a hand-built self-crossing ring gets split into valid
+        pieces rather than reproducing the bug. This tests the repair
+        directly: a bowtie-shaped invalid polygon standing in for what
+        `polygonize_full` handed back live, injected via monkeypatch so the
+        test exercises the actual repair branch deterministically.
+        """
+        bowtie = Polygon([(0, 0), (10, 10), (10, 0), (0, 10), (0, 0)])
+        assert not bowtie.is_valid  # sanity: this is the shape of the real failure
+
+        import geo_engine.io.geometry_cleanup as geometry_cleanup
+
+        def fake_polygonize_full(_geometry):
+            closed = unary_union([bowtie])
+            empty = unary_union([])
+            from shapely.geometry import GeometryCollection
+
+            return GeometryCollection([bowtie]), empty, empty, empty
+
+        monkeypatch.setattr(geometry_cleanup, "polygonize_full", fake_polygonize_full)
+
+        result = reconstruct_closed_road_polygons([LineString([(0, 0), (1, 1)])])
+
+        assert len(result) >= 1
+        assert all(g.is_valid for g in result)
+        assert sum(g.area for g in result) > 0

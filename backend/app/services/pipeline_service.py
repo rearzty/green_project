@@ -83,8 +83,8 @@ def _compute_planting_rows(
     """Pure CPU work (geometry buffers/candidates/greedy selection) — kept as
     one synchronous function so it can run in a worker thread via
     run_in_threadpool, off the event loop, instead of blocking every other
-    request for however long a big territory takes (see CLAUDE.md's
-    placement.py/candidates.py performance notes).
+    request for however long a big territory takes (see
+    placement.py/candidates.py for the performance work behind this).
 
     Each planting_type is generated independently from the same
     buildable_area, with no cross-type exclusion -- a tree/shrub candidate

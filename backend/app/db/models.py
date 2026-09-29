@@ -65,7 +65,7 @@ class Plan:
     """A `Plan` is the *recipe* that produced a plan (scoring_mode +
     planting_types), not necessarily its materialized `items`. `generate_plan`
     is a pure function of (project layers, norms, model artifact, this
-    recipe) -- see CLAUDE.md -- so a plan that nobody has hand-edited is fully
+    recipe) -- so a plan that nobody has hand-edited is fully
     reproducible and doesn't need its (potentially hundreds of thousands of)
     items kept around. `materialized` tracks whether they currently exist;
     `pipeline_service.ensure_materialized` recomputes them on demand when a

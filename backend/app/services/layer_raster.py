@@ -73,13 +73,10 @@ _ZONE_COLORS = {
     # Deliberately teal, not the same green family as PLANTING_COLORS.tree
     # (#15803d) / .shrub (#65a30d) in mapStyle.ts. Was #16a34a -- close enough
     # to tree's #15803d that on a real street where existing_greenery is
-    # mostly individual small tree-canopy polygons (live case, "4. Харьковская
-    # улица": 24 814 polygons averaging 0.23 m² each, not one big patch -- see
-    # CLAUDE.md), it rendered as small green marks indistinguishable from the
-    # plan's own newly-generated tree dots. Live complaint: "ты все равно
-    # только деревья добавляешь" -- the real trees were there, just
-    # camouflaged as more of the same color as the proposed ones. Keep in
-    # sync with mapStyle.ts's own ZONE_COLORS.existing_greenery (used by
+    # mostly individual small tree-canopy polygons (thousands of small
+    # polygons, not one big patch), it rendered as small green marks
+    # indistinguishable from the plan's own newly-generated tree dots. Keep
+    # in sync with mapStyle.ts's own ZONE_COLORS.existing_greenery (used by
     # ThreeDView's 3D extrusion) if this changes again.
     "existing_greenery": "#0d9488",
     # Заливки.dwg's asphalt/tile sidewalk fills (layer_rules.py's АБ ТР/ПЛ ТР
