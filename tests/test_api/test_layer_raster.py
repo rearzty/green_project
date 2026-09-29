@@ -227,3 +227,50 @@ class TestParallelRendering:
         result = render_layer_raster(layers, source_crs=None)
 
         assert {g.key for g in result.groups} == {"territory"}
+
+
+class TestLegendLabels:
+    """Каждый тип, который может произвести чтение чертежа, обязан иметь
+    русскую подпись.
+
+    Пользователь увидел в легенде «Территория 1, lighting_pole 1159,
+    slope_toe 1742, unknown 6888, Дороги 7612» — половина списка по-русски,
+    половина латиницей из кода. Причина накопительная: `layer_rules.py` со
+    временем научился распознавать новые классы (опоры, откосы, подпорные
+    стенки, трамвайные пути, школы — у каждого свой нормативный отступ), а
+    таблица подписей про них не узнала.
+
+    Тест существует именно потому, что забыть подпись легко, а заметить
+    трудно: сырой ключ всплывает только на той улице, где такой слой есть.
+    """
+
+    def test_every_object_type_a_reader_can_produce_is_labelled(self):
+        from backend.app.services.layer_raster import _LAYER_TYPE_LABELS
+        from geo_engine.io.dxf_reader import COMBINED_LAYER_MAP
+        from geo_engine.io.layer_rules import LAYER_RULES
+
+        produced = {object_type for _, object_type in COMBINED_LAYER_MAP.values()}
+        produced |= {rule.object_type for rule in LAYER_RULES if rule.object_type}
+        # Сети в легенде намеренно сведены в одну запись «Инженерные сети»
+        # (`layer_group_key()`), зонирование подписывается своей таблицей по
+        # подкатегории — их отдельные ключи здесь не ожидаются.
+        produced -= {"zoning"}
+        produced = {t for t in produced if t not in ("heat_network", "water_pipe", "sewer",
+                                                     "gas_pipe", "cable_line", "power_line_corridor")}
+
+        missing = sorted(produced - set(_LAYER_TYPE_LABELS))
+        assert not missing, f"в легенде появятся сырыми: {missing}"
+
+    def test_an_unlabelled_key_does_not_leak_latin_into_the_legend(self):
+        """Запасной вариант тоже не должен отдавать сырой ключ: латиница в
+        русской легенде читается как сбой, а не как «тип без подписи»."""
+        from backend.app.services.layer_raster import _group_label
+
+        assert _group_label("совершенно_новый_тип") == "Прочее (совершенно_новый_тип)"
+
+    def test_unrecognised_geometry_says_it_is_not_used(self):
+        """«unknown 6888» без пояснения выглядит как потерянные данные, хотя
+        это неопознанная графика чертежа, в отступах не участвующая."""
+        from backend.app.services.layer_raster import _group_label
+
+        assert "не участвует" in _group_label("unknown")

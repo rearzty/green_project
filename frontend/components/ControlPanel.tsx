@@ -345,76 +345,83 @@ export function ControlPanel({
         </Button>
       </section>
 
-      <section className="flex flex-col gap-2 border-t border-stone-700 pt-3">
-        <div className="flex items-center justify-between">
-          <h2 className="text-sm font-medium">2. Сгенерировать план</h2>
-          {generating && (
-            <span className="flex items-center gap-1 text-xs text-stone-400">
-              <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
-              Генерация…
-            </span>
-          )}
-        </div>
-        <div className="flex flex-col gap-1 text-sm">
-          {(Object.keys(GENERATE_TYPE_LABELS) as PlantingType[]).map((type) => (
-            <label key={type} className="flex items-center gap-2">
+      {hasProject && (
+        <section className="flex flex-col gap-2 border-t border-stone-700 pt-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-medium">2. Сгенерировать план</h2>
+            {generating && (
+              <span className="flex items-center gap-1 text-xs text-stone-400">
+                <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+                Генерация…
+              </span>
+            )}
+          </div>
+          <div className="flex flex-col gap-1 text-sm">
+            {(Object.keys(GENERATE_TYPE_LABELS) as PlantingType[]).map((type) => (
+              <label key={type} className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={plantingTypes.includes(type)}
+                  onChange={() => toggleType(type)}
+                  className="h-4 w-4 accent-greenery-600"
+                />
+                {GENERATE_TYPE_LABELS[type]}
+              </label>
+            ))}
+          </div>
+          <div className="flex flex-col gap-1 text-sm">
+            <label className="flex items-center gap-2">
+              <span className="w-32 flex-none text-stone-300">Деревья: интервал, м</span>
               <input
-                type="checkbox"
-                checked={plantingTypes.includes(type)}
-                onChange={() => toggleType(type)}
-                className="h-4 w-4 accent-greenery-600"
+                type="number"
+                step={0.5}
+                min={0.5}
+                max={15}
+                value={treeSpacingM ?? ""}
+                onChange={(e) => onTreeSpacingMChange(e.target.value === "" ? undefined : Number(e.target.value))}
+                disabled={!plantingTypes.includes("tree")}
+                placeholder={String(plantingNorms?.species_spacing.tree_default?.min_distance_m ?? 5)}
+                className="w-20 rounded border border-stone-600 bg-stone-900 px-2 py-0.5 disabled:opacity-50"
               />
-              {GENERATE_TYPE_LABELS[type]}
             </label>
-          ))}
-        </div>
-        <div className="flex flex-col gap-1 text-sm">
-          <label className="flex items-center gap-2">
-            <span className="w-32 flex-none text-stone-300">Деревья: интервал, м</span>
-            <input
-              type="number"
-              step={0.5}
-              min={0.5}
-              max={15}
-              value={treeSpacingM ?? ""}
-              onChange={(e) => onTreeSpacingMChange(e.target.value === "" ? undefined : Number(e.target.value))}
-              disabled={!plantingTypes.includes("tree")}
-              placeholder={String(plantingNorms?.species_spacing.tree_default?.min_distance_m ?? 5)}
-              className="w-20 rounded border border-stone-600 bg-stone-900 px-2 py-0.5 disabled:opacity-50"
-            />
-          </label>
-          <label className="flex items-center gap-2">
-            <span className="w-32 flex-none text-stone-300">Кусты: интервал, м</span>
-            <input
-              type="number"
-              step={0.5}
-              min={0.3}
-              max={10}
-              value={shrubSpacingM ?? ""}
-              onChange={(e) => onShrubSpacingMChange(e.target.value === "" ? undefined : Number(e.target.value))}
-              disabled={!plantingTypes.includes("shrub")}
-              placeholder={String(plantingNorms?.species_spacing.shrub_default?.min_distance_m ?? 3)}
-              className="w-20 rounded border border-stone-600 bg-stone-900 px-2 py-0.5 disabled:opacity-50"
-            />
-          </label>
-        </div>
-        <div className="flex gap-3 text-sm">
-          <label className="flex items-center gap-1">
-            <input type="radio" checked={scoringMode === "heuristic"} onChange={() => onScoringModeChange("heuristic")} className="h-4 w-4 accent-greenery-600" />
-            Эвристика
-          </label>
-          <label className="flex items-center gap-1">
-            <input type="radio" checked={scoringMode === "ml"} onChange={() => onScoringModeChange("ml")} className="h-4 w-4 accent-greenery-600" />
-            ML
-          </label>
-        </div>
-        <Button
-          disabled={!hasProject || plantingTypes.length === 0 || busy || editBusy || generating}
-          onClick={() => guarded(() => onGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM }))}
-        >
-          Сгенерировать план
-        </Button>
-      </section>
+            <label className="flex items-center gap-2">
+              <span className="w-32 flex-none text-stone-300">Кусты: интервал, м</span>
+              <input
+                type="number"
+                step={0.5}
+                min={0.3}
+                max={10}
+                value={shrubSpacingM ?? ""}
+                onChange={(e) => onShrubSpacingMChange(e.target.value === "" ? undefined : Number(e.target.value))}
+                disabled={!plantingTypes.includes("shrub")}
+                placeholder={String(plantingNorms?.species_spacing.shrub_default?.min_distance_m ?? 3)}
+                className="w-20 rounded border border-stone-600 bg-stone-900 px-2 py-0.5 disabled:opacity-50"
+              />
+            </label>
+          </div>
+          <div className="flex gap-3 text-sm">
+            <label className="flex items-center gap-1">
+              <input type="radio" checked={scoringMode === "heuristic"} onChange={() => onScoringModeChange("heuristic")} className="h-4 w-4 accent-greenery-600" />
+              Эвристика
+            </label>
+            <label className="flex items-center gap-1">
+              <input type="radio" checked={scoringMode === "ml"} onChange={() => onScoringModeChange("ml")} className="h-4 w-4 accent-greenery-600" />
+              ML
+            </label>
+          </div>
+          <Button
+            disabled={!hasProject || plantingTypes.length === 0 || busy || editBusy || generating}
+            onClick={() => guarded(() => onGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM }))}
+          >
+            Сгенерировать план
+          </Button>
+        </section>
+      )}
+      {!hasProject && (
+        <p className="border-t border-stone-700 pt-3 text-xs text-stone-500">
+          Загрузите чертёж, и здесь появится генерация плана.
+        </p>
+      )}
 
       {plans.length > 0 && (
         <section className="flex flex-col gap-2 border-t border-stone-700 pt-3">
@@ -455,257 +462,273 @@ export function ControlPanel({
         </section>
       )}
 
-      <section className="flex flex-col gap-2 border-t border-stone-700 pt-3">
-        <div className="flex items-center justify-between">
-          <h2 className="text-sm font-medium">Правка плана</h2>
-          {editBusy && (
-            <span className="flex items-center gap-1 text-xs text-stone-400">
-              <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
-              Сохранение…
-            </span>
-          )}
-        </div>
-
-        <div className="grid grid-cols-2 gap-2">
-          <Button variant="outline" size="sm" disabled={!canUndo || !canEdit} onClick={onUndo} title="Отменить последнюю правку">
-            <Undo2 className="mr-1.5 h-4 w-4" aria-hidden />
-            Отменить
-            <Kbd className="ml-auto">Ctrl+Z</Kbd>
-          </Button>
-          <Button variant="outline" size="sm" disabled={!canRedo || !canEdit} onClick={onRedo} title="Повторить отменённую правку">
-            <Redo2 className="mr-1.5 h-4 w-4" aria-hidden />
-            Повторить
-            <Kbd className="ml-auto">Ctrl+Y</Kbd>
-          </Button>
-        </div>
-
-        <Button
-          variant={selectMode ? "default" : "outline"}
-          size="sm"
-          disabled={!selectMode && (!hasPlan || !showPlan)}
-          onClick={onToggleSelectMode}
-          aria-pressed={selectMode}
-          title="Левой кнопкой по карте — рамка выделения вместо перемещения карты"
-        >
-          <SquareDashedMousePointer className="mr-1.5 h-4 w-4" aria-hidden />
-          {selectMode ? "Режим выделения: вкл" : "Режим выделения: выкл"}
-          <Kbd className={`ml-auto ${selectMode ? "border-greenery-500 bg-greenery-700 text-white" : ""}`}>S</Kbd>
-        </Button>
-
-        <p className="text-xs text-stone-400">
-          {selectMode
-            ? "Потяните по карте — выделить рамкой (с Shift — добавить к выделению). Потяните выделенное — переместить."
-            : "Клик по объекту — выделить (Shift — несколько), перетаскивание точки — переместить. Для рамки включите режим выделения."}{" "}
-          ПКМ — меню действий.
-        </p>
-
-        <div className={`flex flex-col gap-2 rounded-md border p-2 ${hasSelection ? "border-blue-900 bg-blue-950/40" : "border-stone-700"}`}>
-          <div className="flex items-start justify-between gap-2">
-            <div className="min-w-0 text-xs">
-              {hasSelection ? (
-                <>
-                  <p className="font-medium text-stone-100">Выделено: {countLabel(selection.total, OBJECT_FORMS)}</p>
-                  <p className="truncate text-stone-300">{describeSelection(selection)}</p>
-                  {selection.single?.violation && <p className="text-red-400">Нарушен норматив отступа</p>}
-                  {selection.single && (
-                    <div className="mt-1.5 border-t border-stone-700 pt-1.5">
-                      <p className="font-medium text-stone-200">Почему здесь?</p>
-                      {complianceLoading ? (
-                        <p className="flex items-center gap-1 text-stone-400">
-                          <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
-                          Считаю обоснование…
-                        </p>
-                      ) : complianceForSelection ? (
-                        <p className="whitespace-pre-wrap text-stone-300">{complianceForSelection.summary}</p>
-                      ) : (
-                        <p className="text-stone-500">Обоснование недоступно.</p>
-                      )}
-                    </div>
-                  )}
-                </>
-              ) : (
-                <p className="text-stone-400">Ничего не выделено</p>
-              )}
-            </div>
-            {hasSelection ? (
-              <button onClick={onClearSelection} className="flex items-center gap-1 rounded px-1 text-xs text-stone-400 hover:bg-stone-800" title="Снять выделение">
-                <X className="h-3.5 w-3.5" aria-hidden />
-                <Kbd>Esc</Kbd>
-              </button>
-            ) : (
-              <button
-                onClick={onSelectAll}
-                disabled={!hasPlan || !showPlan}
-                className="rounded px-1 text-xs text-greenery-300 hover:bg-stone-800 disabled:opacity-40"
-              >
-                Выделить всё <Kbd>Ctrl+A</Kbd>
-              </button>
+      {hasPlan && (
+        <section className="flex flex-col gap-2 border-t border-stone-700 pt-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-medium">Правка плана</h2>
+            {editBusy && (
+              <span className="flex items-center gap-1 text-xs text-stone-400">
+                <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+                Сохранение…
+              </span>
             )}
           </div>
+  
           <div className="grid grid-cols-2 gap-2">
-            <Button variant="outline" size="sm" disabled={!hasSelection || !canEdit} onClick={() => onRetypeSelection("tree")}>
-              <TreeDeciduous className="mr-1.5 h-4 w-4" aria-hidden />
-              Дерево
-              <Kbd className="ml-auto">1</Kbd>
+            <Button variant="outline" size="sm" disabled={!canUndo || !canEdit} onClick={onUndo} title="Отменить последнюю правку">
+              <Undo2 className="mr-1.5 h-4 w-4" aria-hidden />
+              Отменить
+              <Kbd className="ml-auto">Ctrl+Z</Kbd>
             </Button>
-            <Button variant="outline" size="sm" disabled={!hasSelection || !canEdit} onClick={() => onRetypeSelection("shrub")}>
-              <Shrub className="mr-1.5 h-4 w-4" aria-hidden />
-              Кустарник
-              <Kbd className="ml-auto">2</Kbd>
+            <Button variant="outline" size="sm" disabled={!canRedo || !canEdit} onClick={onRedo} title="Повторить отменённую правку">
+              <Redo2 className="mr-1.5 h-4 w-4" aria-hidden />
+              Повторить
+              <Kbd className="ml-auto">Ctrl+Y</Kbd>
             </Button>
           </div>
+  
           <Button
-            variant="outline"
+            variant={selectMode ? "default" : "outline"}
             size="sm"
-            disabled={!hasSelection || !canEdit}
-            onClick={onDeleteSelection}
-            className="border-red-900 text-red-300 hover:bg-red-950/60"
+            disabled={!selectMode && (!hasPlan || !showPlan)}
+            onClick={onToggleSelectMode}
+            aria-pressed={selectMode}
+            title="Левой кнопкой по карте — рамка выделения вместо перемещения карты"
           >
-            <Trash2 className="mr-1.5 h-4 w-4" aria-hidden />
-            Удалить
-            <Kbd className="ml-auto">Del</Kbd>
+            <SquareDashedMousePointer className="mr-1.5 h-4 w-4" aria-hidden />
+            {selectMode ? "Режим выделения: вкл" : "Режим выделения: выкл"}
+            <Kbd className={`ml-auto ${selectMode ? "border-greenery-500 bg-greenery-700 text-white" : ""}`}>S</Kbd>
           </Button>
-        </div>
-      </section>
-
-      <section className="flex flex-col gap-2 border-t border-stone-700 pt-3">
-        <h2 className="text-sm font-medium">Отображение на карте</h2>
-        {layerLegend.length > 0 && (
-          <ul className="flex flex-col gap-1.5">
-            {layerLegend.map((entry) => (
-              <li key={entry.key}>
-                <label className="flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={!hiddenLayerTypes.has(entry.key)}
-                    onChange={() => onToggleLayerType(entry.key)}
-                    className="h-4 w-4 accent-greenery-600"
-                  />
-                  <span
-                    className="h-3 w-3 flex-none rounded-sm border border-white/10"
-                    style={{ backgroundColor: entry.color }}
-                    aria-hidden
-                  />
-                  {entry.label}
-                  <span className="text-xs text-stone-400">{entry.count}</span>
-                </label>
-              </li>
-            ))}
-          </ul>
-        )}
-        <label className="flex items-center gap-2 text-sm">
-          <input type="checkbox" checked={showPlan} onChange={(e) => onToggleShowPlan(e.target.checked)} className="h-4 w-4 accent-greenery-600" />
-          Сгенерированный план
-        </label>
-        <Button
-          variant={view3d ? "default" : "outline"}
-          size="sm"
-          disabled={!view3d && !hasPlan}
-          onClick={onToggleView3d}
-          aria-pressed={view3d}
-          title="Только просмотр — без выделения и правки"
-        >
-          <Box className="mr-1.5 h-4 w-4" aria-hidden />
-          {view3d ? "Вернуться на 2D-карту" : "Показать в 3D"}
-        </Button>
-        <div className="grid grid-cols-4 gap-1">
-          {(Object.keys(SEASON_LABELS) as Season[]).map((s) => (
-            <button
-              key={s}
-              disabled={!view3d}
-              onClick={() => onSeasonChange(s)}
-              aria-pressed={season === s}
-              className={cn(
-                "rounded border px-1 py-1 text-xs disabled:opacity-40",
-                season === s ? "border-greenery-500 bg-stone-800 text-greenery-300" : "border-stone-700 text-stone-300 hover:bg-stone-800"
+  
+          <p className="text-xs text-stone-400">
+            {selectMode
+              ? "Потяните по карте — выделить рамкой (с Shift — добавить к выделению). Потяните выделенное — переместить."
+              : "Клик по объекту — выделить (Shift — несколько), перетаскивание точки — переместить. Для рамки включите режим выделения."}{" "}
+            ПКМ — меню действий.
+          </p>
+  
+          <div className={`flex flex-col gap-2 rounded-md border p-2 ${hasSelection ? "border-blue-900 bg-blue-950/40" : "border-stone-700"}`}>
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0 text-xs">
+                {hasSelection ? (
+                  <>
+                    <p className="font-medium text-stone-100">Выделено: {countLabel(selection.total, OBJECT_FORMS)}</p>
+                    <p className="truncate text-stone-300">{describeSelection(selection)}</p>
+                    {selection.single?.violation && <p className="text-red-400">Нарушен норматив отступа</p>}
+                    {selection.single && (
+                      <div className="mt-1.5 border-t border-stone-700 pt-1.5">
+                        <p className="font-medium text-stone-200">Почему здесь?</p>
+                        {complianceLoading ? (
+                          <p className="flex items-center gap-1 text-stone-400">
+                            <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+                            Считаю обоснование…
+                          </p>
+                        ) : complianceForSelection ? (
+                          <p className="whitespace-pre-wrap text-stone-300">{complianceForSelection.summary}</p>
+                        ) : (
+                          <p className="text-stone-500">Обоснование недоступно.</p>
+                        )}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <p className="text-stone-400">Ничего не выделено</p>
+                )}
+              </div>
+              {hasSelection ? (
+                <button onClick={onClearSelection} className="flex items-center gap-1 rounded px-1 text-xs text-stone-400 hover:bg-stone-800" title="Снять выделение">
+                  <X className="h-3.5 w-3.5" aria-hidden />
+                  <Kbd>Esc</Kbd>
+                </button>
+              ) : (
+                <button
+                  onClick={onSelectAll}
+                  disabled={!hasPlan || !showPlan}
+                  className="rounded px-1 text-xs text-greenery-300 hover:bg-stone-800 disabled:opacity-40"
+                >
+                  Выделить всё <Kbd>Ctrl+A</Kbd>
+                </button>
               )}
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <Button variant="outline" size="sm" disabled={!hasSelection || !canEdit} onClick={() => onRetypeSelection("tree")}>
+                <TreeDeciduous className="mr-1.5 h-4 w-4" aria-hidden />
+                Дерево
+                <Kbd className="ml-auto">1</Kbd>
+              </Button>
+              <Button variant="outline" size="sm" disabled={!hasSelection || !canEdit} onClick={() => onRetypeSelection("shrub")}>
+                <Shrub className="mr-1.5 h-4 w-4" aria-hidden />
+                Кустарник
+                <Kbd className="ml-auto">2</Kbd>
+              </Button>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!hasSelection || !canEdit}
+              onClick={onDeleteSelection}
+              className="border-red-900 text-red-300 hover:bg-red-950/60"
             >
-              {SEASON_LABELS[s]}
-            </button>
-          ))}
-        </div>
-      </section>
-
-      <section className="flex flex-col gap-2 border-t border-stone-700 pt-3">
-        <div className="flex items-center justify-between">
-          <h2 className="text-sm font-medium">3. Нормативы и экспорт</h2>
-          {validating && hasPlan && (
-            <span className="flex items-center gap-1 text-xs text-stone-400">
-              <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
-              Проверка…
-            </span>
-          )}
-        </div>
-        {hasPlan && violations !== null && violations.length === 0 && (
-          <p className="text-xs text-greenery-300">Нарушений отступов не найдено.</p>
-        )}
-        {hasPlan && violations !== null && violations.length > 0 && (
-          <div className="rounded-md border border-red-900 bg-red-950/60 p-2 text-xs text-red-300">
-            <p className="flex items-center gap-1.5 font-medium">
-              <span className="inline-block h-2.5 w-2.5 flex-none rounded-full bg-red-600" aria-hidden />
-              Нарушений: {violations.length} — отмечены на карте красным
-            </p>
-            <ul className="mt-1.5 flex flex-col gap-1">
-              {violationGroups.map(([message, ids]) => {
-                const clicks = violationCursor[message] ?? 0;
-                return (
-                  <li key={message} className="flex items-center justify-between gap-2">
-                    <span className="min-w-0">
-                      {message} <span className="text-red-400">× {ids.length}</span>
-                    </span>
-                    <button
-                      disabled={!showPlan}
-                      onClick={() => {
-                        onFocusItem(ids[clicks % ids.length]);
-                        setViolationCursor((c) => ({ ...c, [message]: clicks + 1 }));
-                      }}
-                      className="flex-none rounded border border-red-900 bg-stone-900 px-1.5 py-0.5 text-red-300 hover:bg-red-950 disabled:opacity-40"
-                    >
-                      {clicks === 0 || ids.length === 1 ? "Показать" : `Следующее ${(clicks % ids.length) + 1}/${ids.length}`}
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
+              <Trash2 className="mr-1.5 h-4 w-4" aria-hidden />
+              Удалить
+              <Kbd className="ml-auto">Del</Kbd>
+            </Button>
           </div>
-        )}
-        <Button
-          variant="outline"
-          disabled={!hasPlan || busy || exporting}
-          className="w-full"
-          onClick={() => guarded(() => onExportDxf())}
-        >
-          {exporting && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" aria-hidden />}
-          {exporting ? "Экспортируем…" : "Экспорт в DXF"}
-        </Button>
-        {/* Полное обоснование по НПА для всего плана -- то же, что CLI пишет
-            в report.json/--csv (geo_engine/compliance.py), но по HTTP.
-            Обязательное требование ТЗ (ссылка на акт и пункт для каждой
-            посадки), не бонус — поэтому кнопка всегда рядом с экспортом, а
-            не спрятана. */}
-        <div className="flex gap-2">
+        </section>
+      )}
+      {!hasPlan && (
+        <p className="border-t border-stone-700 pt-3 text-xs text-stone-500">
+          Правка станет доступна, когда план будет построен.
+        </p>
+      )}
+
+      {hasProject && (
+        <section className="flex flex-col gap-2 border-t border-stone-700 pt-3">
+          <h2 className="text-sm font-medium">Отображение на карте</h2>
+          {layerLegend.length > 0 && (
+            <ul className="flex flex-col gap-1.5">
+              {layerLegend.map((entry) => (
+                <li key={entry.key}>
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={!hiddenLayerTypes.has(entry.key)}
+                      onChange={() => onToggleLayerType(entry.key)}
+                      className="h-4 w-4 accent-greenery-600"
+                    />
+                    <span
+                      className="h-3 w-3 flex-none rounded-sm border border-white/10"
+                      style={{ backgroundColor: entry.color }}
+                      aria-hidden
+                    />
+                    {entry.label}
+                    <span className="text-xs text-stone-400">{entry.count}</span>
+                  </label>
+                </li>
+              ))}
+            </ul>
+          )}
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={showPlan} onChange={(e) => onToggleShowPlan(e.target.checked)} className="h-4 w-4 accent-greenery-600" />
+            Сгенерированный план
+          </label>
+          <Button
+            variant={view3d ? "default" : "outline"}
+            size="sm"
+            disabled={!view3d && !hasPlan}
+            onClick={onToggleView3d}
+            aria-pressed={view3d}
+            title="Только просмотр — без выделения и правки"
+          >
+            <Box className="mr-1.5 h-4 w-4" aria-hidden />
+            {view3d ? "Вернуться на 2D-карту" : "Показать в 3D"}
+          </Button>
+          <div className="grid grid-cols-4 gap-1">
+            {(Object.keys(SEASON_LABELS) as Season[]).map((s) => (
+              <button
+                key={s}
+                disabled={!view3d}
+                onClick={() => onSeasonChange(s)}
+                aria-pressed={season === s}
+                className={cn(
+                  "rounded border px-1 py-1 text-xs disabled:opacity-40",
+                  season === s ? "border-greenery-500 bg-stone-800 text-greenery-300" : "border-stone-700 text-stone-300 hover:bg-stone-800"
+                )}
+              >
+                {SEASON_LABELS[s]}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {hasPlan && (
+        <section className="flex flex-col gap-2 border-t border-stone-700 pt-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-medium">3. Нормативы и экспорт</h2>
+            {validating && hasPlan && (
+              <span className="flex items-center gap-1 text-xs text-stone-400">
+                <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+                Проверка…
+              </span>
+            )}
+          </div>
+          {hasPlan && violations !== null && violations.length === 0 && (
+            <p className="text-xs text-greenery-300">Нарушений отступов не найдено.</p>
+          )}
+          {hasPlan && violations !== null && violations.length > 0 && (
+            <div className="rounded-md border border-red-900 bg-red-950/60 p-2 text-xs text-red-300">
+              <p className="flex items-center gap-1.5 font-medium">
+                <span className="inline-block h-2.5 w-2.5 flex-none rounded-full bg-red-600" aria-hidden />
+                Нарушений: {violations.length} — отмечены на карте красным
+              </p>
+              <ul className="mt-1.5 flex flex-col gap-1">
+                {violationGroups.map(([message, ids]) => {
+                  const clicks = violationCursor[message] ?? 0;
+                  return (
+                    <li key={message} className="flex items-center justify-between gap-2">
+                      <span className="min-w-0">
+                        {message} <span className="text-red-400">× {ids.length}</span>
+                      </span>
+                      <button
+                        disabled={!showPlan}
+                        onClick={() => {
+                          onFocusItem(ids[clicks % ids.length]);
+                          setViolationCursor((c) => ({ ...c, [message]: clicks + 1 }));
+                        }}
+                        className="flex-none rounded border border-red-900 bg-stone-900 px-1.5 py-0.5 text-red-300 hover:bg-red-950 disabled:opacity-40"
+                      >
+                        {clicks === 0 || ids.length === 1 ? "Показать" : `Следующее ${(clicks % ids.length) + 1}/${ids.length}`}
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          )}
           <Button
             variant="outline"
-            size="sm"
-            disabled={!hasPlan || !onDownloadComplianceReport}
-            className="flex-1"
-            onClick={() => onDownloadComplianceReport?.("json")}
-            title="Обоснование каждой посадки со ссылкой на акт и пункт (JSON)"
+            disabled={!hasPlan || busy || exporting}
+            className="w-full"
+            onClick={() => guarded(() => onExportDxf())}
           >
-            Обоснование (JSON)
+            {exporting && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" aria-hidden />}
+            {exporting ? "Экспортируем…" : "Экспорт в DXF"}
           </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={!hasPlan || !onDownloadComplianceReport}
-            className="flex-1"
-            onClick={() => onDownloadComplianceReport?.("csv")}
-            title="То же самое построчно: посадка × норматив (CSV)"
-          >
-            Обоснование (CSV)
-          </Button>
-        </div>
-      </section>
+          {/* Полное обоснование по НПА для всего плана -- то же, что CLI пишет
+              в report.json/--csv (geo_engine/compliance.py), но по HTTP.
+              Обязательное требование ТЗ (ссылка на акт и пункт для каждой
+              посадки), не бонус — поэтому кнопка всегда рядом с экспортом, а
+              не спрятана. */}
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!hasPlan || !onDownloadComplianceReport}
+              className="flex-1"
+              onClick={() => onDownloadComplianceReport?.("json")}
+              title="Обоснование каждой посадки со ссылкой на акт и пункт (JSON)"
+            >
+              Обоснование (JSON)
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!hasPlan || !onDownloadComplianceReport}
+              className="flex-1"
+              onClick={() => onDownloadComplianceReport?.("csv")}
+              title="То же самое построчно: посадка × норматив (CSV)"
+            >
+              Обоснование (CSV)
+            </Button>
+          </div>
+        </section>
+      )}
+      {!hasPlan && (
+        <p className="border-t border-stone-700 pt-3 text-xs text-stone-500">
+          Отчёт по нормативам и экспорт появятся вместе с планом.
+        </p>
+      )}
     </aside>
   );
 }
