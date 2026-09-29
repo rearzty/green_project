@@ -383,3 +383,72 @@ class TestDuplicateTerritoryContours:
 
         with pytest.raises(MissingTerritoryError, match="не осталось площади"):
             territory_polygon(self._zones(box(0, 0, 100, 100), box(200, 200, 300, 300)))
+
+
+class TestInvalidUtilityGeometry:
+    """Невалидная сеть даёт неверную охранную зону — молча.
+
+    Живой отказ на «1. Олимпийская деревня»: сирень встала в 0,76 м от
+    водопровода при требуемом метре. Генератор считал место законным, а
+    проверка мерила расстояние до исходной геометрии и видела нарушение —
+    то есть план, который отвергает собственная проверка сервиса.
+
+    Причина: труба пришла из чертежа самопересекающимся полигоном, а
+    `buffer()` на невалидном входе не падает, он возвращает неверную фигуру.
+    Проверено на той самой трубе: её буфер в 1,0 м точку НЕ накрывал, после
+    `make_valid` — накрывает. Масштаб: невалидны 763 сети из 93 715 (0,81 %)
+    на одной улице.
+    """
+
+    @staticmethod
+    def _bowtie():
+        from shapely.geometry import Polygon
+
+        bad = Polygon([(0, 0), (10, 10), (10, 0), (0, 10)])
+        assert not bad.is_valid, "фикстура обязана быть невалидной"
+        return bad
+
+    def test_repair_touches_only_what_is_broken(self):
+        from geo_engine.buffers import repaired_for_buffering
+
+        healthy = box(0, 0, 1, 1)
+        out = repaired_for_buffering([healthy])
+
+        assert out[0] is healthy, "валидное трогать незачем — это лишняя работа на сотнях тысяч объектов"
+
+    def test_repair_makes_an_invalid_utility_valid(self):
+        from geo_engine.buffers import repaired_for_buffering
+
+        out = repaired_for_buffering([self._bowtie()])
+
+        assert out[0].is_valid
+
+    def test_a_line_utility_stays_a_line(self):
+        """В отличие от твёрдых препятствий, площадные части здесь выделять
+        нельзя: сеть — чаще всего линия, и буфер вокруг неё и есть охранная
+        зона. Отбросить линейное значило бы потерять почти все сети.
+        """
+        from shapely.geometry import LineString
+
+        from geo_engine.buffers import repaired_for_buffering
+
+        line = LineString([(0, 0), (10, 0)])
+        assert repaired_for_buffering([line])[0].geom_type == "LineString"
+
+    def test_the_exclusion_covers_the_setback_around_a_broken_utility(self):
+        from geo_engine.buffers import build_exclusion_zone, repaired_for_buffering
+        from geo_engine.model import Utility
+
+        norms = load_norms()
+        broken = self._bowtie()
+        setback = norms.setback_for("water_pipe", "shrub")
+        assert setback > 0, "тест бессмыслен при нулевом отступе"
+
+        exclusion = build_exclusion_zone(
+            [Utility(geometry=broken, object_type="water_pipe")], [], "shrub", norms
+        )
+
+        # Точка на половине нормативного отступа от НАСТОЯЩЕЙ (починенной)
+        # фигуры трубы обязана попасть в зону отступов.
+        probe = repaired_for_buffering([broken])[0].buffer(setback / 2).exterior.coords[0]
+        assert exclusion.contains(Point(probe)), "охранная зона не накрыла отступ от сломанной трубы"
