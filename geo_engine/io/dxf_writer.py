@@ -80,7 +80,9 @@ def _set_explanation(entity, doc, record) -> None:
 _PARALLEL_EXPORT_THRESHOLD = 20_000
 
 
-def _build_type_chunk_document(items: list[PlantingItem], records: list | None, prefix: str) -> str:
+def _build_type_chunk_document(
+    items: list[PlantingItem], records: list | None, prefix: str
+) -> tuple[str, list[tuple[int, int]]]:
     """Runs in a worker process: builds one throwaway DXF holding every
     entity for a single planting type, on the *real* result layer name
     write_dxf itself will use (not a placeholder) -- so that merging it into
@@ -105,6 +107,18 @@ def _build_type_chunk_document(items: list[PlantingItem], records: list | None, 
         doc.appids.add(prefix)
     msp = doc.modelspace()
 
+    # (modelspace position, index into `items`/`records`) for every entity
+    # that got XDATA here -- the parallel merge path has to redo
+    # `_set_explanation` itself after import (see
+    # `_write_items_by_type_parallel`'s docstring for why: ezdxf's Importer
+    # strips xdata from every entity it copies, unconditionally, with no
+    # opt-out), and it needs both numbers: the modelspace position to find
+    # the right *new* entity after import (which preserves this worker's
+    # entity order), and the original index to look back up the matching
+    # record in the caller's own already-in-memory `chunk_records` -- cheaper
+    # than pickling every ComplianceRecord a second time on the way back.
+    xdata_positions: list[tuple[int, int]] = []
+
     for index, item in enumerate(items):
         record = records[index] if records is not None and index < len(records) else None
         entity = None
@@ -120,11 +134,13 @@ def _build_type_chunk_document(items: list[PlantingItem], records: list | None, 
             entity = msp.add_lwpolyline(points, close=True, dxfattribs={"layer": layer})
         if entity is not None and record is not None:
             _set_explanation(entity, doc, record)
+            position = len(msp) - (2 if item.geometry.geom_type == "Point" else 1)
+            xdata_positions.append((position, index))
 
     fd, tmp_path = tempfile.mkstemp(suffix=".dxf")
     os.close(fd)
     doc.saveas(tmp_path)
-    return tmp_path
+    return tmp_path, xdata_positions
 
 
 def _write_items_by_type_parallel(doc, msp, by_type: dict[str, tuple[list[PlantingItem], list | None]], prefix: str) -> None:
@@ -132,20 +148,22 @@ def _write_items_by_type_parallel(doc, msp, by_type: dict[str, tuple[list[Planti
     imports each resulting throwaway document into `doc` one at a time in
     the main process via ezdxf's own cross-document Importer addon.
 
-    NOT independently verified end-to-end in this environment (no working
-    Python/ezdxf install was available while writing this) -- the specific
-    assumption this relies on is that ezdxf.addons.importer.Importer, when
-    importing entities whose source layer has the same name *and* the same
-    definition (color) as a layer that already exists in the target
-    document (write_dxf already creates every GREEN_AI$... layer in `doc`
-    before this runs), reuses that existing target layer rather than
-    erroring or silently renaming -- which is what the Importer addon is
-    documented to be for (merging one DXF's content into another's), but
-    this exact case hasn't been exercised against a real file yet. If
-    testing shows otherwise, the fallback is to have workers write entities
-    on DXF's always-present default layer "0" instead and reassign
-    `entity.dxf.layer` explicitly after each import, trading a slightly
-    larger diff for not depending on the merge behaviour at all.
+    Merge behaviour verified against a real multi-type export (>20 000 items,
+    both source layers preserved and every GREEN_AI$... layer reused rather
+    than renamed) -- the one thing that verification caught: ezdxf's
+    Importer strips XDATA from every entity it copies unconditionally
+    (`new_clean_entity(..., keep_xdata=False)` deep inside `import_entity`,
+    with no parameter on `import_entities` itself to opt out). Geometry and
+    layer assignment survive the import; the justification text a real
+    export previously carried on ~20 000+-item plans silently did not --
+    confirmed live by re-opening a real exported DXF and finding zero
+    entities with XDATA on a result layer that should have had it on every
+    one. `_build_type_chunk_document` now hands back, alongside the temp
+    file, exactly which (modelspace position, original item index) pairs
+    had XDATA before the strip, so it can be re-applied here, in this
+    process, on the entity that actually ends up in `doc` -- the *only*
+    entity XDATA on it will ever survive being read back from, since the
+    worker's own copy is discarded together with its temp file.
 
     Deliberately does not catch and silently fall back to the sequential
     path on failure: `doc.saveas(path)` only happens after this returns, so
@@ -156,14 +174,20 @@ def _write_items_by_type_parallel(doc, msp, by_type: dict[str, tuple[list[Planti
     tmp_paths: list[str] = []
     try:
         with ProcessPoolExecutor(max_workers=worker_count) as pool:
-            futures = [pool.submit(_build_type_chunk_document, chunk_items, chunk_records, prefix) for chunk_items, chunk_records in by_type.values()]
-            for future in futures:
-                tmp_path = future.result()
+            chunks = list(by_type.values())
+            futures = [pool.submit(_build_type_chunk_document, chunk_items, chunk_records, prefix) for chunk_items, chunk_records in chunks]
+            for future, (_chunk_items, chunk_records) in zip(futures, chunks):
+                tmp_path, xdata_positions = future.result()
                 tmp_paths.append(tmp_path)
                 sub_doc = ezdxf.readfile(tmp_path)
                 importer = Importer(sub_doc, doc)
+                before_count = len(msp)
                 importer.import_entities(list(sub_doc.modelspace()), target_layout=msp)
                 importer.finalize()
+                if xdata_positions and chunk_records is not None:
+                    new_entities = list(msp)[before_count:]
+                    for position, item_index in xdata_positions:
+                        _set_explanation(new_entities[position], doc, chunk_records[item_index])
     finally:
         for tmp_path in tmp_paths:
             Path(tmp_path).unlink(missing_ok=True)

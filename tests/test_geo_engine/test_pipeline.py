@@ -50,8 +50,8 @@ def test_buildable_area_does_not_exclude_existing_lawn():
     """existing_lawn (Заливки.dwg's "гзн" surface-fill code -- layer_rules.py)
     is real ground cover, not a hard obstacle: a tree/shrub/lawn candidate is
     allowed to land right on top of already-grassy ground, same as it's
-    allowed to land on newly-generated lawn (see CLAUDE.md's "Дерево/куст
-    поверх газона" section). Regression for the split from existing_greenery
+    allowed to land on newly-generated lawn (a tree/shrub on top of existing
+    lawn is normal, not a bug). Regression for the split from existing_greenery
     -- before it, "гзн" layers fed the same hard-obstacle bucket as real
     existing trees/shrubs.
     """
@@ -88,9 +88,8 @@ def test_buildable_area_excludes_a_real_sidewalk_polygon():
 
 def test_buildable_area_ignores_non_polygonal_hard_obstacles():
     """Real Мосгеотрест data reads plenty of buildings/roads as bare
-    LineString (an unclosed footprint outline) or even a stray Point -- see
-    CLAUDE.md's "Здания на реальном чертеже -- не полигон". Either already
-    contributes zero area to a difference against a polygon, but mixing them
+    LineString (an unclosed footprint outline) or even a stray Point. Either
+    already contributes zero area to a difference against a polygon, but mixing them
     into `unary_union(hard_obstacles)` used to make that a heterogeneous
     GeometryCollection -- and GEOS's overlay engine cannot always compute a
     result dimension for that as `difference()`'s second operand. Live crash
@@ -212,7 +211,7 @@ def test_territory_margin_keeps_plantings_off_the_property_line(synthetic_scene)
     """buffers.buildable_area()'s territory_margin_m erodes the territory
     boundary inward before generating candidates for that type -- without it,
     a candidate could land right at the edge of the plot (found live on real
-    data by the user, see CLAUDE.md/decision_log.md). Every selected item
+    data, see decision_log.md). Every selected item
     must clear its own planting type's configured margin from the
     territory's own boundary line, not just from obstacles inside it.
     """
@@ -233,7 +232,7 @@ def test_territory_margin_keeps_plantings_off_the_property_line(synthetic_scene)
 
 
 def test_generate_point_candidates_is_deterministic_for_a_given_seed(synthetic_scene):
-    """generate_plan must stay a pure function of its recipe (CLAUDE.md) --
+    """generate_plan must stay a pure function of its recipe --
     ensure_materialized() has to reproduce a collapsed plan's exact layout
     later, not a fresh random one. Candidate generation is now randomized
     (dart-throwing, see candidates.py) instead of gridded, so this

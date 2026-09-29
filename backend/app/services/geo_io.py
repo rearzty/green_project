@@ -84,7 +84,7 @@ def display_crs(project: Project) -> str | None:
     does not, because that's exactly what produced the Kenya-map bug (a real
     Mosgeotrest drawing's small local numbers reprojected through UTM 37N as
     if they were real eastings/northings, landing the whole site near the
-    equator in Kenya -- see CLAUDE.md). Unverified projects get their raw
+    equator in Kenya). Unverified projects get their raw
     local-unit coordinates passed straight through instead, the same
     passthrough _to_wgs84/from_wgs84 already do for source_crs=None -- the
     frontend then renders them with Leaflet's CRS.Simple (plain Cartesian

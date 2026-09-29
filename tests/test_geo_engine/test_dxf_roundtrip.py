@@ -2,6 +2,7 @@ import ezdxf
 import pytest
 from shapely.geometry import LineString, Point, Polygon
 
+from geo_engine.io import dxf_writer
 from geo_engine.io.dxf_reader import DEFAULT_LAYER_MAP, read_dxf
 from geo_engine.io.dxf_writer import (
     RESULT_LAYER_PREFIX,
@@ -140,3 +141,43 @@ def test_justification_travels_with_the_entity_as_xdata(tmp_path):
     text = "".join(value for code, value in xdata if code == 1000)
 
     assert "743-ПП" in text or "СП 42.13330.2016" in text
+
+
+def test_justification_survives_the_parallel_multi_type_export_path(tmp_path, monkeypatch):
+    """Live-audited on a real >20 000-item pilot-street export: every
+    entity came back from `ezdxf.addons.importer.Importer` with its
+    geometry and layer intact but zero XDATA, because `Importer` strips
+    XDATA from every entity it copies unconditionally, with no opt-out on
+    `import_entities()`. `_write_items_by_type_parallel` now re-applies
+    `_set_explanation` itself after each worker's chunk is merged in (see
+    its docstring). Building 20 000+ real items just to exercise that path
+    would make this test slow for no benefit, so the threshold is
+    monkeypatched down instead -- the two items below (different planting
+    types, so `by_type` has more than one entry) are enough to force the
+    same code path a real multi-type export takes.
+    """
+    from geo_engine.compliance import explain_items
+    from geo_engine.model import Utility
+    from geo_engine.norms import load_norms
+
+    monkeypatch.setattr(dxf_writer, "_PARALLEL_EXPORT_THRESHOLD", 1)
+
+    items = [
+        PlantingItem(geometry=Point(50, 50), planting_type="tree", species="Липа", score=0.8, rationale="r"),
+        PlantingItem(geometry=Point(60, 50), planting_type="shrub", species="Сирень", score=0.6, rationale="r"),
+    ]
+    utilities = [Utility(geometry=LineString([(0, 0), (100, 0)]), object_type="gas_pipe")]
+    records = explain_items(items, utilities, [], load_norms())
+
+    out_path = tmp_path / "parallel_annotated.dxf"
+    write_dxf(items, out_path, records=records)
+
+    doc = ezdxf.readfile(str(out_path))
+    circles = [e for e in doc.modelspace() if e.dxftype() == "CIRCLE"]
+    assert len(circles) == 2
+
+    for circle in circles:
+        xdata = circle.get_xdata(RESULT_LAYER_PREFIX)
+        text = "".join(value for code, value in xdata if code == 1000)
+        assert text, f"entity on layer {circle.dxf.layer} lost its XDATA through the parallel merge"
+        assert "743-ПП" in text or "СП 42.13330.2016" in text

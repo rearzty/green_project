@@ -107,13 +107,13 @@ def buildable_area(
     result, which can't express "keep back from the property line" (there's
     no obstacle geometry to grow, the boundary itself is the constraint).
     Without this, a candidate could land right at the edge of the plot --
-    found live on real data, see CLAUDE.md.
+    found live on real data.
     """
     if territory_margin_m > 0:
         territory = territory.buffer(-territory_margin_m)
     # Only polygonal geometry can subtract area in the first place -- a
-    # building/road read as an unclosed LineString (real Мосгеотрест data,
-    # see CLAUDE.md) or a stray Point already contributes nothing to a
+    # building/road read as an unclosed LineString (real Мосгеотрест data)
+    # or a stray Point already contributes nothing to a
     # difference against a polygon. Live crash on real data (17. Грузинская
     # М ул): thousands of such LineStrings/Points mixed into this same list
     # made `unary_union(hard_obstacles)` a heterogeneous GeometryCollection,

@@ -162,8 +162,33 @@ def _combine_with_holes(pieces: list[BaseGeometry]) -> BaseGeometry:
     проезд's two survey clusters) are untouched: neither sits (almost)
     fully inside the other, so both go through the plain union branch,
     exactly as before this function existed.
+
+    Near-duplicate pieces are merged *before* this fold runs at all, by
+    `_merge_near_duplicates()` below -- not by adding a size check to the
+    fold's own containment test. Live case, «17. Грузинская М ул»: the
+    boundary layer is duplicated wholesale across two source files in the
+    bundle (the main drawing and a dedicated `xref_граница` file both carry
+    it) — three real sub-areas, each present as two near-identical copies a
+    couple m² apart from digitisation noise. A first attempt added "only
+    treat ≥99% containment as a hole if the piece is also under half the
+    *accumulated result's* size" directly in the loop below -- it fixed the
+    single-pair case but broke on three pairs together: after folding in one
+    *disjoint* pair (a real second sub-area, unioned in normally), the
+    accumulated `result` was big enough that the *next* pair's duplicate
+    looked "meaningfully smaller than the total" again, even though it was
+    really ~the same size as the one specific piece it duplicates -- and got
+    wrongly subtracted anyway. Traced live: 13744+13742 unions to ~13748,
+    +10381 unions to ~24129, then the 10368 duplicate reads as "contained,
+    and only 43% of 24129" and gets subtracted back out to ~13761 -- the
+    correct ~30 000 m² collapsing right back down to the original bug's
+    number by a different path. The size check was comparing the wrong two
+    things: a piece should be judged against *what it duplicates*, not
+    against *the running total of everything folded in so far*. Deduplicating
+    pairwise up front removes that mismatch instead of trying to patch it
+    with another threshold.
     """
-    by_area_desc = sorted(pieces, key=lambda g: -g.area)
+    deduped = _merge_near_duplicates(pieces)
+    by_area_desc = sorted(deduped, key=lambda g: -g.area)
     result = by_area_desc[0]
     for piece in by_area_desc[1:]:
         if piece.area <= 0:
@@ -174,6 +199,39 @@ def _combine_with_holes(pieces: list[BaseGeometry]) -> BaseGeometry:
         else:
             result = _as_polygonal(unary_union([result, piece]))
     return result
+
+
+def _merge_near_duplicates(pieces: list[BaseGeometry]) -> list[BaseGeometry]:
+    """Collapse pairs that are ~the same shape into one before `_combine_
+    with_holes()`'s biggest-first fold ever sees them.
+
+    A duplicate is a *symmetric* near-equality -- each piece is ≥99%
+    contained in the other -- which is a different, narrower test than
+    "contained in whatever the fold has accumulated so far" (see
+    `_combine_with_holes`'s docstring for why conflating the two broke on
+    more than one duplicate pair). Quadratic in the number of pieces, which
+    is fine here: real inputs carry a handful of territory fragments, not
+    thousands -- nothing like the utility/zone counts elsewhere in this
+    pipeline that actually need an index.
+    """
+    remaining = list(pieces)
+    merged: list[BaseGeometry] = []
+    while remaining:
+        current = remaining.pop(0)
+        i = 0
+        while i < len(remaining):
+            other = remaining[i]
+            if current.area <= 0 or other.area <= 0:
+                i += 1
+                continue
+            overlap = current.intersection(other).area
+            if overlap / current.area > 0.99 and overlap / other.area > 0.99:
+                current = _as_polygonal(unary_union([current, other]))
+                remaining.pop(i)
+                continue
+            i += 1
+        merged.append(current)
+    return merged
 
 
 def _has_nearby_context(geometry: BaseGeometry, context: list[BaseGeometry], tree: STRtree | None) -> bool:

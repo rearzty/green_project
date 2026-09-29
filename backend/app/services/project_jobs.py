@@ -2,8 +2,8 @@
 
 POST /api/projects used to block the whole request for however long DWG
 conversion + DXF/bundle parsing takes -- on a real multi-file ZIP bundle this
-was measured (see CLAUDE.md's ACIS-lookup/redundant-read profiling on
-"4. Харьковская улица") at over a hundred seconds even after those fixes,
+was measured (ACIS-lookup/redundant-read profiling on a real pilot street)
+at over a hundred seconds even after those fixes,
 well past what a browser tab or a proxy will hold a connection open for. Now
 the route saves the uploaded bytes (unavoidably tied to the request's own
 body) and hands back a job id immediately; the frontend polls

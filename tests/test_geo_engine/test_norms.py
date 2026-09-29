@@ -8,7 +8,7 @@ def test_with_spacing_override_derives_canopy_radius_as_half_the_interval():
     (5.0/2.5, 3.0/1.5) -- a user-supplied interval should keep the same
     relationship, not just move min_distance_m and leave canopy_radius_m
     wherever it was (that mismatch is exactly what once made shrub density
-    basically uncontrolled, see CLAUDE.md)."""
+    basically uncontrolled once already)."""
     overridden = NORMS.with_spacing_override("tree", 8.0)
     spacing = overridden.spacing_for("tree")
     assert spacing.min_distance_m == 8.0

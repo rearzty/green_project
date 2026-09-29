@@ -34,10 +34,10 @@ _projects: OrderedDict[str, Project] = OrderedDict()
 # Object count across every held project's layers + materialized plan items
 # -- not bytes. Profiling actual Python object sizes recursively would cost
 # more than this check saves, and object count is the metric the rest of
-# this codebase already uses to talk about scale (worklog.md/CLAUDE.md:
-# "1. Олимпийская деревня" is described as "371,685 объектов", never as a
-# byte figure). 2,000,000 comfortably fits several real pilot streets (the
-# largest measured so far, ~372K layers) or many small synthetic projects at
+# this codebase already uses to talk about scale (a real pilot street is
+# described as "371,685 объектов", never as a byte figure). 2,000,000
+# comfortably fits several real pilot streets (the largest measured so
+# far, ~372K layers) or many small synthetic projects at
 # once, while still bounding a long demo day of repeated real uploads to a
 # few hundred MB of process memory instead of letting it grow forever.
 _MAX_TOTAL_WEIGHT = 2_000_000
