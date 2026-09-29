@@ -268,54 +268,81 @@ export function ControlPanel({
       {restoring && <p className="text-xs text-stone-400">Восстановление сессии…</p>}
 
       <section className="flex flex-col gap-2">
-        <h2 className="text-sm font-medium">1. Загрузить территорию</h2>
+        <h2 className="text-sm font-medium">1. Загрузить чертёж</h2>
+        {/* Подсказка стоит ПЕРЕД выбором файла, а не после кнопки, как было:
+            пользователь читал её уже после того, как ему пришлось решить, что
+            класть. И формулировка теперь говорит, что СДЕЛАТЬ, а не из чего
+            состоит поставка: «заархивируйте папку улицы» вместо «вся папка
+            объекта (чертёж + Xrefs/)» — второе понятно только тому, кто и так
+            знает устройство данных.
+
+            Почему именно zip, а не один файл: граница участка на реальных
+            поставках лежит не в главном чертеже, а во внешних ссылках рядом
+            (см. CLAUDE.md), и без них план построить нельзя. */}
+        <p className="text-xs text-stone-400">
+          Заархивируйте папку улицы целиком в <span className="text-stone-300">.zip</span> и выберите его
+          ниже — в ней должен быть главный чертёж и папка внешних ссылок рядом
+          (<span className="text-stone-300">Xrefs</span>, <span className="text-stone-300">Ссылки</span> и т. п.).
+          Граница участка обычно лежит именно в них, поэтому одного файла не хватит.
+        </p>
+        <input
+          type="file"
+          accept=".dxf,.dwg,.zip,.geojson,.json"
+          onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+          className="text-sm text-stone-300 file:mr-3 file:cursor-pointer file:rounded-md file:border-0 file:bg-greenery-600 file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-white hover:file:bg-greenery-700"
+        />
+        <p className="text-xs text-stone-500">
+          Можно и один <span className="text-stone-400">.dwg</span> или <span className="text-stone-400">.dxf</span>,
+          если граница участка есть прямо в нём.
+        </p>
         <input
           type="text"
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="Название проекта"
+          placeholder="Название — как отличить этот проект от других"
           className="rounded border border-stone-600 bg-stone-900 px-2 py-1 text-sm"
         />
-        <select
-          value={crsPreset}
-          onChange={(e) => {
-            setCrsPreset(e.target.value);
-            if (e.target.value !== CUSTOM_CRS) setSourceCrs(e.target.value);
-          }}
-          className="rounded border border-stone-600 bg-stone-900 px-2 py-1 text-sm"
-        >
-          {CRS_PRESETS.map((p) => (
-            <option key={p.value} value={p.value}>
-              {p.label}
-            </option>
-          ))}
-          <option value={CUSTOM_CRS}>Свой…</option>
-        </select>
-        {crsPreset === CUSTOM_CRS && (
-          <input
-            type="text"
-            value={sourceCrs}
-            onChange={(e) => setSourceCrs(e.target.value)}
-            placeholder="напр. EPSG:32637"
-            className="rounded border border-stone-600 bg-stone-900 px-2 py-1 text-sm"
-          />
-        )}
-        <input
-          type="file"
-          accept=".dxf,.dwg,.zip,.geojson,.json,.shp"
-          onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-          className="text-sm text-stone-300 file:mr-3 file:cursor-pointer file:rounded-md file:border-0 file:bg-greenery-600 file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-white hover:file:bg-greenery-700"
-        />
+        {/* Система координат ушла ПОСЛЕ файла и подписана как необязательная.
+            Раньше она стояла вторым шагом, перед выбором файла, и читалась как
+            обязательная — хотя трогать её почти никогда не нужно: подтверждение
+            CRS выводится из самих координат файла, а не из этого поля. */}
+        <details className="text-xs text-stone-400">
+          <summary className="cursor-pointer select-none hover:text-stone-300">
+            Система координат — обычно менять не нужно
+          </summary>
+          <div className="mt-2 flex flex-col gap-2">
+            <p className="text-stone-500">
+              По умолчанию определяется по самому файлу. Указывайте вручную, только если точно её знаете.
+            </p>
+            <select
+              value={crsPreset}
+              onChange={(e) => {
+                setCrsPreset(e.target.value);
+                if (e.target.value !== CUSTOM_CRS) setSourceCrs(e.target.value);
+              }}
+              className="rounded border border-stone-600 bg-stone-900 px-2 py-1 text-sm"
+            >
+              {CRS_PRESETS.map((p) => (
+                <option key={p.value} value={p.value}>
+                  {p.label}
+                </option>
+              ))}
+              <option value={CUSTOM_CRS}>Свой…</option>
+            </select>
+            {crsPreset === CUSTOM_CRS && (
+              <input
+                type="text"
+                value={sourceCrs}
+                onChange={(e) => setSourceCrs(e.target.value)}
+                placeholder="напр. EPSG:32637"
+                className="rounded border border-stone-600 bg-stone-900 px-2 py-1 text-sm"
+              />
+            )}
+          </div>
+        </details>
         <Button disabled={!file || busy} onClick={() => file && guarded(() => onUpload(file, name, sourceCrs))}>
-          Загрузить
+          {busy ? "Загружаю…" : "Загрузить чертёж"}
         </Button>
-        {/* .dwg -- один чертёж, конвертируется в DXF на бэкенде (LibreDWG/ODA).
-            .zip -- целая папка объекта (главный чертёж + Xrefs/), как её и
-            отдают реальные поставки -- граница участка на пилотных данных
-            лежит именно во внешних ссылках, не в главном файле. */}
-        <p className="text-xs text-stone-400">
-          .zip — вся папка объекта (чертёж + Xrefs/), .dwg — один чертёж. Оба конвертируются на сервере.
-        </p>
       </section>
 
       <section className="flex flex-col gap-2 border-t border-stone-700 pt-3">
