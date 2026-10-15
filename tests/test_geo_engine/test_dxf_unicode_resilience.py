@@ -18,6 +18,8 @@ handed to the decoder, not of DXF structure a synthetic fixture could
 reproduce.
 """
 
+import pytest
+
 import ezdxf.lldxf.encoding as dxf_encoding
 
 import geo_engine.io.dxf_reader  # noqa: F401 -- import applies the patch
@@ -39,3 +41,58 @@ def test_garbage_after_backslash_u_plus_does_not_raise():
     # Not just an empty tail -- non-hex text can follow just as easily.
     result = dxf_encoding.decode_dxf_unicode("\\U+garbage")
     assert isinstance(result, str)
+
+
+class TestMissingLayoutDoesNotAbortTheDocument:
+    """`Layouts.get_layout_by_key()` нарушала собственный контракт.
+
+    Живой отказ на «12. Наташинский пр-д» (`04.Графическая часть.dxf`):
+    загрузка падала `KeyError: 'ГЕНПЛАН2.1'`, файл целиком пропускался, а
+    вместе с ним терялась граница участка — улица переставала считаться
+    из-за одной записи в таблице лейаутов.
+
+    Функция на каждом пути отказа поднимает `DXFKeyError`, и вызывающий
+    `DXFGraphic.get_layout()` ловит ровно его. Но последняя строка
+    обращается к словарю `_layouts` напрямую и бросает ГОЛЫЙ `KeyError`,
+    мимо контракта — он проходит сквозь обработчик и убивает загрузку,
+    причём в пост-обработке MTEXT-колонок, которую `ezdxf.recover` уже не
+    страхует.
+
+    Проверяется ровно это превращение, а не документ целиком: рассинхрон
+    таблицы лейаутов через `ezdxf.new().saveas()` не воспроизвести — тот
+    всегда пишет согласованный файл, как и с `\\U+`-escape выше.
+    """
+
+    def test_a_bare_keyerror_becomes_the_documented_dxf_error(self, monkeypatch):
+        import ezdxf
+        from ezdxf.layouts.layouts import Layouts
+        from ezdxf.lldxf.const import DXFKeyError
+
+        import geo_engine.io.dxf_reader  # noqa: F401 — импорт и применяет патч
+
+        doc = ezdxf.new()
+        # Ключ берётся ДО подмены: `doc.modelspace()` сам зовёт `get("Model")`,
+        # и вычисление аргумента иначе падало бы раньше проверяемого вызова.
+        key = doc.modelspace().block_record.dxf.handle
+        # Ровно тот промах, что на реальных данных: имя лейаута в записи
+        # блока есть, в словаре его нет.
+        monkeypatch.setattr(Layouts, "get", lambda self, name: (_ for _ in ()).throw(KeyError(name)))
+
+        with pytest.raises(DXFKeyError):
+            doc.layouts.get_layout_by_key(key)
+
+    def test_the_caller_no_longer_crashes(self, monkeypatch):
+        """Ради чего патч и делался: `get_layout()` обязан пережить промах,
+        а не уронить документ. Что именно он вернёт — лейаут блока или
+        `None` — его дело; важно, что исключение наружу не выходит.
+        """
+        import ezdxf
+        from ezdxf.layouts.layouts import Layouts
+
+        import geo_engine.io.dxf_reader  # noqa: F401
+
+        doc = ezdxf.new()
+        text = doc.modelspace().add_mtext("проверка")  # до подмены, см. соседний тест
+        monkeypatch.setattr(Layouts, "get", lambda self, name: (_ for _ in ()).throw(KeyError(name)))
+
+        text.get_layout()  # не должно бросать

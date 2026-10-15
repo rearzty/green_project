@@ -4,6 +4,8 @@ given type is not allowed to intersect, per geo_engine/config/planting_norms.yam
 
 from __future__ import annotations
 
+import numpy as np
+import shapely
 from shapely import unary_union
 from shapely.geometry.base import BaseGeometry
 
@@ -20,6 +22,90 @@ from geo_engine.species import Species
 # resolution keeps the buffered boundary within ~0.1mm of the true circle at
 # any setback distance we use.
 _BUFFER_QUAD_SEGS = 32
+
+
+
+def valid_polygonal_union(geometries: list[BaseGeometry]) -> BaseGeometry:
+    """Объединить площадные геометрии, пережив невалидные среди них.
+
+    Живой отказ на реальной улице («13. Харьковский проезд»): весь прогон
+    падал с `TopologyException: side location conflict`, и падал целиком —
+    отчёта не было вообще. Замер по этой улице: твёрдых препятствий 921, из
+    них невалидных **7 (0,76 %)**, все с диагнозом `Self-intersection`. То
+    есть семь самопересекающихся контуров из девятисот уносили улицу.
+
+    Откуда они берутся: обмерные чертежи рисуют здания и покрытия
+    полилиниями, которые сходятся не идеально, а
+    `geometry_cleanup.reconstruct_closed_footprints()` собирает из них
+    полигоны — на честно кривом входе часть колец получается с
+    самопересечением. GEOS считать оверлей на таком входе не обязан.
+
+    Чинится точечно: `shapely.is_valid` по всему массиву дёшево (это C-цикл),
+    а `make_valid` вызывается ТОЛЬКО для невалидных. На той же улице union
+    после этого проходит мгновенно (0,0 с). Глобальный `make_valid` по всем
+    объектам был бы дороже на порядки — на реальных улицах их сотни тысяч.
+
+    После починки остаются только площадные части. Это не придирка:
+    `make_valid` разворачивает самопересекающийся полигон в
+    `GeometryCollection` с линиями внутри, а смешанная размерность второго
+    операнда `difference()` — ровно тот краш, который master уже чинил
+    отдельно (17. Грузинская М ул, «cannot determine overlay result geometry
+    dimension»). Вернуть его назад этой правкой было бы обидно.
+    """
+    if not geometries:
+        return unary_union([])
+    array = np.array(geometries, dtype=object)
+    healthy = shapely.is_valid(array)
+    if not healthy.all():
+        array = np.where(healthy, array, shapely.make_valid(array))
+    parts: list[BaseGeometry] = []
+    for geometry in array:
+        if geometry is None or geometry.is_empty:
+            continue
+        if geometry.geom_type in ("Polygon", "MultiPolygon"):
+            parts.append(geometry)
+        elif geometry.geom_type == "GeometryCollection":
+            parts.extend(g for g in geometry.geoms if g.geom_type in ("Polygon", "MultiPolygon"))
+    return unary_union(parts) if parts else unary_union([])
+
+
+def repaired_for_buffering(geometries: list[BaseGeometry]) -> list[BaseGeometry]:
+    """Починить невалидные геометрии перед буферизацией.
+
+    Живой отказ на «1. Олимпийская деревня», и он молчаливый — хуже
+    падения. Сирень встала в **0,76 м от водопровода** при требуемом метре:
+    генератор считал место законным, а проверка мерила расстояние до
+    исходной геометрии и видела нарушение. То есть план, который отвергает
+    собственная проверка сервиса.
+
+    Причина: ближайшая труба пришла из чертежа САМОПЕРЕСЕКАЮЩИМСЯ полигоном
+    (`Self-intersection`), а `buffer()` на невалидном входе не падает — он
+    возвращает неверную фигуру. Проверено прямо на этой трубе: её
+    собственный буфер в 1,0 м точку НЕ накрывал, после `make_valid` —
+    накрывает. В зоне отступов получалась дыра, которой в данных нет.
+
+    Масштаб больше одной посадки: на этой улице невалидны **763 сети из
+    93 715 (0,81 %)** — 512 канализаций, 181 кабель, 53 водопровода, 17
+    теплосетей. У каждой охранная зона считалась по сломанной фигуре;
+    заметной нарушением стала одна, потому что остальные дыры пришлись на
+    места, куда посадки и так не встали.
+
+    Тот же класс, что и `valid_polygonal_union()` ниже, но там невалидный
+    вход ронял оверлей с `TopologyException`, а здесь — тихо искажает
+    результат. Разница в поведении, не в причине.
+
+    Площадные части здесь НЕ выделяются, в отличие от
+    `valid_polygonal_union()`: сеть — это чаще всего линия, и буфер вокруг
+    линии и есть её охранная зона. Отбросить линейное значило бы потерять
+    почти все сети разом.
+    """
+    if not geometries:
+        return []
+    array = np.array(geometries, dtype=object)
+    healthy = shapely.is_valid(array)
+    if healthy.all():
+        return geometries
+    return list(np.where(healthy, array, shapely.make_valid(array)))
 
 
 def build_exclusion_zone(
@@ -51,22 +137,28 @@ def build_exclusion_zone(
             object_type, planting_type, species, crown_reference_diameter_m
         ).required_m
 
-    for utility in utilities:
+    # Геометрия чинится ДО буферизации, а не после: `buffer()` на невалидном
+    # входе не падает, он молча отдаёт неверную фигуру — см.
+    # `repaired_for_buffering`.
+    for utility, geometry in zip(
+        utilities, repaired_for_buffering([u.geometry for u in utilities])
+    ):
         # Round join/cap: a utility is a line (possibly bent), and a rounded
         # clearance radius around a pipe/cable is physically the right shape.
         setback = required(utility.object_type)
-        buffered.append(utility.geometry.buffer(setback, quad_segs=_BUFFER_QUAD_SEGS))
+        buffered.append(geometry.buffer(setback, quad_segs=_BUFFER_QUAD_SEGS))
 
-    for zone in zones:
-        if zone.zone_type not in norms.setbacks_m:
-            continue
+    setback_zones = [z for z in zones if z.zone_type in norms.setbacks_m]
+    for zone, zone_geometry in zip(
+        setback_zones, repaired_for_buffering([z.geometry for z in setback_zones])
+    ):
         # Mitre join: a zone (building, road) is rectilinear, and offsetting
         # it should stay rectilinear too -- shapely's default round join
         # rounds every corner, which for e.g. a building turns a rectangular
         # setback strip into a blob-cornered shape (visibly wrong on the map)
         # and bloats the corner into ~30 extra vertices for no reason.
         setback = required(zone.zone_type)
-        buffered.append(zone.geometry.buffer(setback, quad_segs=_BUFFER_QUAD_SEGS, join_style="mitre"))
+        buffered.append(zone_geometry.buffer(setback, quad_segs=_BUFFER_QUAD_SEGS, join_style="mitre"))
 
     if not buffered:
         # No constraints at all -> empty exclusion zone (everything is candidate territory).
@@ -133,5 +225,5 @@ def buildable_area(
     else:
         result = territory
     if hard_obstacles:
-        result = result.difference(unary_union(hard_obstacles))
+        result = result.difference(valid_polygonal_union(hard_obstacles))
     return result

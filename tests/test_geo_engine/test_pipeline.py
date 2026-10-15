@@ -262,3 +262,192 @@ def test_generate_point_candidates_differs_across_seeds(synthetic_scene):
     b = generate_candidates(buildable, exclusion, "tree", NORMS, zoning_zones=zones, seed=2)
 
     assert [c.geometry.coords[:] for c in a] != [c.geometry.coords[:] for c in b]
+
+
+class TestInvalidHardObstacles:
+    """Невалидный полигон среди твёрдых препятствий не должен уносить улицу.
+
+    Живой отказ на «13. Харьковский проезд»: весь прогон падал с
+    `TopologyException: side location conflict`, отчёта не было вообще.
+    Замер по этой улице: твёрдых препятствий 921, из них невалидных **7
+    (0,76 %)**, все `Self-intersection`. Обмерные чертежи рисуют здания
+    полилиниями, которые сходятся не идеально, а
+    `reconstruct_closed_footprints()` собирает из них полигоны — часть колец
+    выходит с самопересечением, и считать оверлей на таком входе GEOS не
+    обязан.
+    """
+
+    @staticmethod
+    def _bowtie():
+        """Самопересекающийся контур — та же болезнь, что на реальных данных."""
+        from shapely.geometry import Polygon
+
+        bad = Polygon([(0, 0), (10, 10), (10, 0), (0, 10)])
+        assert not bad.is_valid, "фикстура обязана быть невалидной"
+        return bad
+
+    def test_union_survives_a_self_intersecting_polygon(self):
+        from geo_engine.buffers import valid_polygonal_union
+
+        result = valid_polygonal_union([box(20, 20, 30, 30), self._bowtie()])
+
+        assert not result.is_empty
+        assert result.is_valid
+        assert result.area > 100, "квадрат 10x10 плюс починенный контур"
+
+    def test_repair_does_not_leak_non_areal_parts(self):
+        """`make_valid` разворачивает самопересечение в GeometryCollection с
+        линиями внутри, а смешанная размерность второго операнда
+        `difference()` — отдельный краш, который уже чинили (17. Грузинская
+        М ул). Вернуть его этой правкой было бы обидно.
+        """
+        from geo_engine.buffers import valid_polygonal_union
+
+        result = valid_polygonal_union([self._bowtie()])
+
+        assert result.geom_type in ("Polygon", "MultiPolygon"), result.geom_type
+
+    def test_empty_input_is_not_an_error(self):
+        from geo_engine.buffers import valid_polygonal_union
+
+        assert valid_polygonal_union([]).is_empty
+
+    def test_buildable_area_survives_an_invalid_building(self):
+        norms = load_norms()
+        territory = box(0, 0, 100, 100)
+        zones = [
+            Zone(geometry=territory, zone_type="territory"),
+            Zone(geometry=self._bowtie(), zone_type="building"),
+        ]
+        exclusion = build_exclusion_zone([], zones, "tree", norms)
+
+        buildable = buildable_area(territory, exclusion, zones)
+
+        assert not buildable.is_empty
+        assert buildable.area < territory.area, "препятствие должно что-то вычесть"
+
+
+class TestDuplicateTerritoryContours:
+    """Повторы одного контура не должны съедать участок.
+
+    Живой отказ на «4. Харьковская улица», и он тихий — худший вид. Бандл
+    ссылается на один чертёж четырежды, поэтому приходят четыре копии
+    каждого контура. Дубликат по определению содержится в уже собранном
+    результате на 100 %, логика дырок принимает его за внутреннее кольцо и
+    вычитает только что добавленное; следующая копия добавляет обратно, и на
+    чётном числе копий остаётся ноль. Итог: территория 0 м², план пустой, а
+    CLI рапортует «Готово» с кодом возврата 0.
+    """
+
+    @staticmethod
+    def _zones(*geoms):
+        return [Zone(geometry=g, zone_type="territory") for g in geoms]
+
+    def test_four_copies_of_one_contour_are_one_contour(self):
+        from geo_engine.territory import territory_polygon
+
+        outline = box(0, 0, 100, 100)
+
+        result = territory_polygon(self._zones(*([outline] * 4)))
+
+        assert result.area == pytest.approx(outline.area), "копии не должны вычитаться"
+
+    def test_a_real_hole_still_works_alongside_duplicates(self):
+        """Дедупликация не должна отменить сам механизм дырок — он нужен
+        («1. Олимпийская деревня»: внешний контур минус восемь вырезов).
+        """
+        from geo_engine.territory import territory_polygon
+
+        outer, hole = box(0, 0, 100, 100), box(40, 40, 60, 60)
+
+        result = territory_polygon(self._zones(outer, outer, hole, hole))
+
+        assert result.area == pytest.approx(outer.area - hole.area)
+
+    def test_an_empty_result_is_an_error_not_a_silent_success(self, monkeypatch):
+        """Отдельная защита, независимая от причины схлопывания.
+
+        Конкретный случай Харьковской чинит дедупликация выше, но сам по себе
+        «успех на пустой территории» — отдельный дефект: пустая территория
+        даёт пустой план, а CLI рапортует «Готово» с кодом возврата 0.
+        Следующая такая геометрия придёт с другой улицы, поэтому проверяется
+        именно защита, а не подогнанные под ноль фигуры.
+        """
+        from shapely.geometry import Polygon
+
+        from geo_engine import territory as territory_module
+        from geo_engine.territory import MissingTerritoryError, territory_polygon
+
+        monkeypatch.setattr(territory_module, "_combine_with_holes", lambda pieces: Polygon())
+
+        with pytest.raises(MissingTerritoryError, match="не осталось площади"):
+            territory_polygon(self._zones(box(0, 0, 100, 100), box(200, 200, 300, 300)))
+
+
+class TestInvalidUtilityGeometry:
+    """Невалидная сеть даёт неверную охранную зону — молча.
+
+    Живой отказ на «1. Олимпийская деревня»: сирень встала в 0,76 м от
+    водопровода при требуемом метре. Генератор считал место законным, а
+    проверка мерила расстояние до исходной геометрии и видела нарушение —
+    то есть план, который отвергает собственная проверка сервиса.
+
+    Причина: труба пришла из чертежа самопересекающимся полигоном, а
+    `buffer()` на невалидном входе не падает, он возвращает неверную фигуру.
+    Проверено на той самой трубе: её буфер в 1,0 м точку НЕ накрывал, после
+    `make_valid` — накрывает. Масштаб: невалидны 763 сети из 93 715 (0,81 %)
+    на одной улице.
+    """
+
+    @staticmethod
+    def _bowtie():
+        from shapely.geometry import Polygon
+
+        bad = Polygon([(0, 0), (10, 10), (10, 0), (0, 10)])
+        assert not bad.is_valid, "фикстура обязана быть невалидной"
+        return bad
+
+    def test_repair_touches_only_what_is_broken(self):
+        from geo_engine.buffers import repaired_for_buffering
+
+        healthy = box(0, 0, 1, 1)
+        out = repaired_for_buffering([healthy])
+
+        assert out[0] is healthy, "валидное трогать незачем — это лишняя работа на сотнях тысяч объектов"
+
+    def test_repair_makes_an_invalid_utility_valid(self):
+        from geo_engine.buffers import repaired_for_buffering
+
+        out = repaired_for_buffering([self._bowtie()])
+
+        assert out[0].is_valid
+
+    def test_a_line_utility_stays_a_line(self):
+        """В отличие от твёрдых препятствий, площадные части здесь выделять
+        нельзя: сеть — чаще всего линия, и буфер вокруг неё и есть охранная
+        зона. Отбросить линейное значило бы потерять почти все сети.
+        """
+        from shapely.geometry import LineString
+
+        from geo_engine.buffers import repaired_for_buffering
+
+        line = LineString([(0, 0), (10, 0)])
+        assert repaired_for_buffering([line])[0].geom_type == "LineString"
+
+    def test_the_exclusion_covers_the_setback_around_a_broken_utility(self):
+        from geo_engine.buffers import build_exclusion_zone, repaired_for_buffering
+        from geo_engine.model import Utility
+
+        norms = load_norms()
+        broken = self._bowtie()
+        setback = norms.setback_for("water_pipe", "shrub")
+        assert setback > 0, "тест бессмыслен при нулевом отступе"
+
+        exclusion = build_exclusion_zone(
+            [Utility(geometry=broken, object_type="water_pipe")], [], "shrub", norms
+        )
+
+        # Точка на половине нормативного отступа от НАСТОЯЩЕЙ (починенной)
+        # фигуры трубы обязана попасть в зону отступов.
+        probe = repaired_for_buffering([broken])[0].buffer(setback / 2).exterior.coords[0]
+        assert exclusion.contains(Point(probe)), "охранная зона не накрыла отступ от сломанной трубы"
