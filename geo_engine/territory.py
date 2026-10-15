@@ -95,7 +95,24 @@ def territory_polygon(zones: list[Zone], utilities: list[Utility] | None = None)
             f"(суммарно {sum(g.area for g in dropped):,.0f} м²)".replace(",", " "),
             file=sys.stderr,
         )
-    return kept[0] if len(kept) == 1 else _combine_with_holes(kept)
+    result = kept[0] if len(kept) == 1 else _combine_with_holes(kept)
+    if result.is_empty or result.area <= 0:
+        # Вторая, независимая защита от того же класса отказа. Слой границы в
+        # чертеже ЕСТЬ, но после кластеризации и вычитания дырок от него не
+        # осталось площади — а дальше по пайплайну пустая территория даёт
+        # пустой план, и CLI рапортует «Готово» с кодом возврата 0. Живьём на
+        # «4. Харьковская улица» так и было: отчёт с нулём посадок, нулём
+        # нарушений и успешным завершением, то есть пользователь получал молча
+        # неверный результат вместо ошибки. Конкретную причину там починила
+        # дедупликация контуров (см. `_merge_near_duplicates`), но сам по себе
+        # успех на пустой территории — отдельный дефект, и закрывать его надо
+        # отдельно: следующая такая геометрия придёт с другой улицы.
+        raise MissingTerritoryError(
+            "Граница участка в чертеже есть, но после объединения контуров от неё "
+            "не осталось площади — план построить нельзя. Так бывает, когда контуры "
+            "накладываются друг на друга и взаимно вычитаются как внутренние кольца."
+        )
+    return result
 
 
 def _as_polygonal(geometry: BaseGeometry) -> BaseGeometry:
@@ -128,6 +145,13 @@ def _as_polygonal(geometry: BaseGeometry) -> BaseGeometry:
     if not polygonal:
         return geometry
     return polygonal[0] if len(polygonal) == 1 else unary_union(polygonal)
+
+
+# Насколько близкими должны быть площади двух контуров, чтобы считать их одним
+# и тем же. Не ноль: один и тот же контур, пришедший из разных файлов бандла,
+# может отличаться в последних знаках после конвертации DWG->DXF.
+_DUPLICATE_AREA_TOLERANCE = 1e-6
+
 
 
 def _combine_with_holes(pieces: list[BaseGeometry]) -> BaseGeometry:
