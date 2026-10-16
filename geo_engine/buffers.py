@@ -268,6 +268,16 @@ def buildable_area(
         result = territory.difference(exclusion_zone)
     else:
         result = territory
+    if hard_obstacles and not result.is_empty:
+        # В объединение — только препятствия, чей габарит касается участка:
+        # вычитание из участка остальных всё равно не видит, а объединять
+        # здания и дороги всей съёмки было второй по цене операцией
+        # генерации (55 с из 241 у деревьев на «1. Олимпийская деревня»).
+        # Сравнение по габариту, а не по самой геометрии: габарит всегда
+        # валиден, а починка невалидных — забота valid_polygonal_union ниже.
+        boxes = shapely.envelope(np.array(hard_obstacles, dtype=object))
+        near = shapely.intersects(boxes, shapely.envelope(result))
+        hard_obstacles = [g for g, keep in zip(hard_obstacles, near) if keep]
     if hard_obstacles:
         result = result.difference(valid_polygonal_union(hard_obstacles))
     return result

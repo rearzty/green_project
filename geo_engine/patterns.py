@@ -301,12 +301,25 @@ def _row_path(
         offsets.append(distance)
         distance += step
 
+    # Эквидистанта целиком лежит в габарите ориентира, раздутом на `limit`, —
+    # пересекать её достаточно с этим куском допустимой площади, а не со всей.
+    # Это и было узким местом генерации: на «1. Олимпийская деревня» 544 с из
+    # 649 у кустарника — десятки тысяч пересечений кольца с площадью всего
+    # участка. Результат тот же: вне прямоугольника кольца нет.
+    minx, miny, maxx, maxy = guide.geometry.bounds
+    pad = limit + 1.0
+    local = shapely.clip_by_rect(buildable_area, minx - pad, miny - pad, maxx + pad, maxy + pad)
+    if not local.is_valid:
+        local = shapely.make_valid(local)
+    if local.is_empty:
+        return None, guide.setback_m + inset_m
+
     best: BaseGeometry | None = None
     best_offset = guide.setback_m + inset_m
     best_length = 0.0
     for offset in offsets:
         ring = guide.geometry.buffer(offset).boundary
-        usable = ring.intersection(buildable_area)
+        usable = ring.intersection(local)
         length = usable.length
         if length >= pitch_m * 2:
             # Первая же эквидистанта, на которой помещается настоящий ряд, —
@@ -363,6 +376,9 @@ def row_candidates(
     exclusion_index = ExclusionIndex(exclusion_zone)
     if buildable_area is None or buildable_area.is_empty:
         return []
+    # Сотни тысяч проверок «точка внутри» на реальной улице — по подготовленной
+    # геометрии они на порядок дешевле.
+    shapely.prepare(buildable_area)
 
     band_m = ROW_SEARCH_BAND_M if band_m is None else band_m
 
