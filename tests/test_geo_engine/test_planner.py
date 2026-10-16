@@ -417,3 +417,31 @@ class TestPlanWorkersMemoryCap:
 
         monkeypatch.setattr(dxf_reader, "_available_memory_bytes", lambda: None)
         assert planner._memory_capped_plan_workers() >= 1
+
+
+class TestSpeciesDiversity:
+    """Финальный аудит: почти весь кустарник — одна «Сирень обыкновенная».
+    Смешение меняет породу только на нормативно равнозначную."""
+
+    def _plan(self, synthetic_scene, plan_key="div", overrides=None):
+        territory, utilities, zones = synthetic_scene["territory"], synthetic_scene["utilities"], synthetic_scene["zones"]
+        return plan_items(plan_key, utilities, zones, territory, ["tree", "shrub"], _constant_score_fn, NORMS,
+                          species_overrides=overrides)
+
+    def test_shrubs_are_no_longer_a_single_species(self, synthetic_scene):
+        items = self._plan(synthetic_scene)
+        shrubs = {i.species for i in items if i.planting_type == "shrub"}
+        assert len(shrubs) >= 2
+
+    def test_the_plan_stays_compliant_and_deterministic(self, synthetic_scene):
+        from geo_engine.compliance import explain_items
+
+        utilities, zones = synthetic_scene["utilities"], synthetic_scene["zones"]
+        first = self._plan(synthetic_scene)
+        second = self._plan(synthetic_scene)
+        assert [i.species for i in first] == [i.species for i in second]
+        assert all(r.compliant for r in explain_items(first, utilities, zones, NORMS))
+
+    def test_an_explicit_species_choice_is_respected(self, synthetic_scene):
+        items = self._plan(synthetic_scene, overrides={"shrub": "Спирея японская"})
+        assert {i.species for i in items if i.planting_type == "shrub"} == {"Спирея японская"}

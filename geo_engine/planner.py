@@ -790,6 +790,75 @@ def _memory_capped_plan_workers() -> int:
     return max(1, int(available // (rss * _PLAN_WORKER_MEMORY_FACTOR)))
 
 
+# Размер квартала, внутри которого посадки одного типа — одной породы. Участок
+# аллеи или группа куртин одной породы, а не пёстрая россыпь: так выглядят
+# реальные проекты пилота, а смена породы каждые несколько метров читалась
+# бы как шум.
+SPECIES_BLOCK_M = 60.0
+
+
+def _equivalence_key(species: Species, planting_type: str, norms: PlantingNorms, catalogue: SpeciesCatalogue) -> tuple:
+    """Всё, что порода меняет в нормах для этого типа посадки: отступы от
+    каждого типа объекта и — для деревьев — интервал по классу кроны. Породы с
+    одинаковым ключом нормативно взаимозаменяемы."""
+    setbacks = tuple(
+        round(norms.resolve_setback(object_type, planting_type, species, catalogue.crown_reference_diameter_m).required_m, 3)
+        for object_type in sorted(norms.setbacks_m)
+    )
+    interval = catalogue.spacing_for_crown(species.crown) if planting_type in CROWN_SPACING_TYPES else None
+    return setbacks + (interval,)
+
+
+def _diversify_species(
+    items: list[PlantingItem],
+    plan_key: str,
+    norms: PlantingNorms,
+    catalogue: SpeciesCatalogue,
+    species_overrides: dict[str, str] | None,
+) -> list[PlantingItem]:
+    """Разнообразить породы, не трогая нормы.
+
+    Финальный аудит пилота: «Сирень обыкновенная» — 23 тыс. из 26 тыс. кустов
+    на «13. Харьковском проезде», и так почти везде, а в реальных проектах
+    пород восемь и больше. Порода меняется только на НОРМАТИВНО РАВНОЗНАЧНУЮ
+    (`_equivalence_key`: те же отступы и тот же интервал), поэтому ни одна
+    посадка не может стать нарушением — проверка обоснований даёт ровно тот же
+    вердикт. Порода выбирается на квартал `SPECIES_BLOCK_M` детерминированно
+    от `plan_key`: тот же план — те же породы. Тип, для которого пользователь
+    сам задал породу, не трогается.
+    """
+    overridden = set((species_overrides or {}).keys())
+    classes: dict[tuple, dict[tuple, list[str]]] = {}
+    cache: dict[tuple[str, str], tuple | None] = {}
+
+    def key_of(planting_type: str, name: str) -> tuple | None:
+        if (planting_type, name) not in cache:
+            species = catalogue.get(name)
+            cache[(planting_type, name)] = (
+                _equivalence_key(species, planting_type, norms, catalogue) if species is not None else None
+            )
+        return cache[(planting_type, name)]
+
+    for item in items:
+        if item.planting_type in overridden or item.planting_type not in CROWN_SPACING_TYPES + ("shrub",):
+            continue
+        key = key_of(item.planting_type, item.species)
+        if key is None:
+            continue
+        if (item.planting_type, key) not in classes:
+            classes[(item.planting_type, key)] = sorted(
+                s.name for s in catalogue.for_type(item.planting_type)
+                if key_of(item.planting_type, s.name) == key
+            )
+        members = classes[(item.planting_type, key)]
+        if len(members) < 2:
+            continue
+        block = (int(item.geometry.centroid.x // SPECIES_BLOCK_M), int(item.geometry.centroid.y // SPECIES_BLOCK_M))
+        index = zlib.crc32(f"{plan_key}:{item.planting_type}:{key}:{block}".encode()) % len(members)
+        item.species = members[index]
+    return items
+
+
 def plan_items(
     plan_key: str,
     utilities: list[Utility],
@@ -910,7 +979,7 @@ def plan_items(
                     items.extend(future.result())
                     if on_progress is not None:
                         on_progress(planting_type, index, total)
-            return items
+            return _diversify_species(items, plan_key, norms, catalogue, species_overrides)
         except BrokenProcessPool:
             # Рабочий процесс убит извне — на реальных данных это нехватка
             # памяти: типы посадки считаются параллельно, и на самой крупной
@@ -953,4 +1022,4 @@ def plan_items(
         )
         if on_progress is not None:
             on_progress(planting_type, index, total)
-    return items
+    return _diversify_species(items, plan_key, norms, catalogue, species_overrides)
