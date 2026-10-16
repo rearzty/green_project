@@ -28,7 +28,7 @@ import {
   complianceReportUrl,
   getItemsCompliance,
   getPlantingNorms,
-  getProjectLayers,
+  getProjectLayers3d,
   type GeoJSONFeatureCollection,
   type ItemCompliance,
   type PlantingNorms,
@@ -66,7 +66,7 @@ export default function Home() {
     if (!view3d || !project) return;
     if (layers3d?.projectId === project.id) return;
     let cancelled = false;
-    getProjectLayers(project.id)
+    getProjectLayers3d(project.id)
       .then((layers) => {
         if (!cancelled) setLayers3d({ projectId: project.id, layers });
       })

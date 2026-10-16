@@ -33,10 +33,9 @@ from geo_engine.model import PlantingItem, Utility, Zone
 from geo_engine.norms import PlantingNorms
 from geo_engine.species import SpeciesCatalogue, load_catalogue
 
-# Zone types that impose a setback the same way a utility does. Hard obstacles
-# (buildings, roads) are already subtracted by buffers.buildable_area, but the
-# *explanation* still has to name them: "5 m from the building wall per table 9.1"
-# is the reason a tree sits where it does just as much as a gas main is.
+# Zone types that impose a setback the same way a utility does — the ones the
+# report used to check before every zone type with a setback was checked (see
+# `_constraint_groups`). Kept as a name only for callers that import it.
 SETBACK_ZONE_TYPES = ("building", "road")
 
 # Distances are compared with a tolerance, for the same reason validate_plan uses
@@ -100,6 +99,7 @@ OBJECT_LABELS_RU = {
     "building": "стена здания",
     "road": "край проезжей части",
     "sidewalk": "край тротуара",
+    "sidewalk_kerb": "край тротуара (бордюр)",
     "lighting_pole": "опора освещения/контактной сети",
     "retaining_wall": "подпорная стенка",
     "tram_track": "трамвайное полотно",
@@ -134,13 +134,26 @@ PLANTING_LABELS_RU = {"tree": "дерево", "shrub": "кустарник", "la
 UNMAPPED_SOURCE_ID = "__unmapped__"
 
 
-def _constraint_groups(utilities: list[Utility], zones: list[Zone]) -> dict[str, list[BaseGeometry]]:
+def _constraint_groups(
+    utilities: list[Utility], zones: list[Zone], norms: PlantingNorms | None = None
+) -> dict[str, list[BaseGeometry]]:
+    """Every object the report measures against: all utilities, and every
+    zone whose type has a setback in planting_norms.yaml.
+
+    Раньше из зон мерились только здания и дороги, а отступы от тротуаров,
+    опор освещения, школ, подпорных стенок, трамвайных путей и подошв откосов
+    генератор соблюдал (buffers.build_exclusion_zone берёт все типы из норм),
+    но отчёт их не перепроверял и не цитировал — «соблюдено N из N» было
+    утверждением про часть ограничений. Теперь проверяется то же множество,
+    по которому строится зона отступов.
+    """
+    zone_types = set(norms.setbacks_m) if norms is not None else set(SETBACK_ZONE_TYPES)
     groups: dict[str, list[BaseGeometry]] = {}
     for utility in utilities:
         if utility.geometry is not None and not utility.geometry.is_empty:
             groups.setdefault(utility.object_type, []).append(utility.geometry)
     for zone in zones:
-        if zone.zone_type in SETBACK_ZONE_TYPES and zone.geometry is not None and not zone.geometry.is_empty:
+        if zone.zone_type in zone_types and zone.geometry is not None and not zone.geometry.is_empty:
             groups.setdefault(zone.zone_type, []).append(zone.geometry)
     return {k: v for k, v in groups.items() if v}
 
@@ -238,7 +251,7 @@ def explain_items(
         return []
 
     catalogue = catalogue or load_catalogue()
-    groups = _constraint_groups(utilities, zones)
+    groups = _constraint_groups(utilities, zones, norms)
     neighbour_checks = _neighbour_checks(items, norms, catalogue)
     geometries = [item.geometry for item in items]
 

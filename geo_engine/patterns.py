@@ -49,7 +49,7 @@ from geo_engine.species import Species
 
 # Вдоль чего сажают ряд. Здания и инженерные сети сюда намеренно не входят —
 # см. docstring модуля.
-ROW_GUIDE_ZONE_TYPES = ("road", "sidewalk", "tram_track")
+ROW_GUIDE_ZONE_TYPES = ("road", "sidewalk", "sidewalk_kerb", "tram_track")
 
 # Типы посадки, для которых рядовая схема осмысленна. Газон — площадной
 # объект, ряда из него не бывает. Кустарник добавлен после сравнения с
