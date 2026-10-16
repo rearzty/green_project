@@ -303,14 +303,19 @@ def violation_mask(geometries: list[BaseGeometry], exclusion: BaseGeometry | Non
 
 
 def _check_violations(project: Project, items: list[PlantingItemRow]) -> list[dict]:
-    by_type: dict[str, list[PlantingItemRow]] = {}
+    # По (тип, порода), а не только по типу: у деревьев отступ зависит от
+    # породы (см. exclusion_cache._species_key) — и в одном плане их бывает
+    # несколько (ряд одной породой, россыпь другой).
+    by_type: dict[tuple[str, str | None], list[PlantingItemRow]] = {}
     for item in items:
-        by_type.setdefault(item.planting_type, []).append(item)
+        by_type.setdefault((item.planting_type, item.species), []).append(item)
 
     violations: list[dict] = []
-    for planting_type, type_items in by_type.items():
+    for (planting_type, species), type_items in by_type.items():
         geometries = [db_to_shape(item.geometry) for item in type_items]
-        mask = exclusion_cache.with_exclusion_zone(project, planting_type, lambda zone: violation_mask(geometries, zone))
+        mask = exclusion_cache.with_exclusion_zone(
+            project, planting_type, lambda zone: violation_mask(geometries, zone), species=species
+        )
         label = _PLANTING_TYPE_LABELS.get(planting_type, planting_type)
         violations.extend(
             {"item_id": item.id, "message": f"{label}: нарушен норматив отступа от сетей или зданий."}

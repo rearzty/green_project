@@ -326,6 +326,7 @@ export default function Home() {
       >
         <ControlPanel
           hasProject={project !== null}
+          projectWarnings={project?.warnings}
           hasPlan={plan !== null}
           restoring={session.restoring}
           generating={session.generating}

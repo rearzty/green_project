@@ -46,13 +46,19 @@ from backend.app.db.models import Project
 from backend.app.services.geo_io import layers_to_domain
 from geo_engine.buffers import build_exclusion_zone
 from geo_engine.norms import load_norms
+from geo_engine.planner import CROWN_SPACING_TYPES
+from geo_engine.species import load_catalogue
+from geo_engine.territory import MissingTerritoryError
 
 T = TypeVar("T")
 
 _MAX_ENTRIES = 24  # ~8 recently validated projects x 3 planting types
 _MAX_TERRITORY_ENTRIES = 64  # one entry per project, not per planting type -- cheaper to keep more around
 
-ZoneKey = tuple[str, str, int]
+# (project_id, planting_type, species, mtime planting_norms.yaml). Порода в
+# ключе только у деревьев — у остальных типов отступ от неё не зависит (см.
+# _species_key), иначе кэш дробился бы на копии одной и той же зоны.
+ZoneKey = tuple[str, str, str | None, int]
 
 _struct_lock = threading.Lock()
 _cache: OrderedDict[ZoneKey, BaseGeometry | None] = OrderedDict()
@@ -75,8 +81,20 @@ def _lock_for(registry: dict, key) -> threading.Lock:
         return lock
 
 
-def _zone_key(project: Project, planting_type: str) -> ZoneKey:
-    return (str(project.id), planting_type, settings.planting_norms_path.stat().st_mtime_ns)
+def _species_key(planting_type: str, species: str | None) -> str | None:
+    """Порода влияет на отступ только у деревьев: МГСН 1.02-02 п. 4.2.8 и
+    743-ПП прим. 1/3 — про деревья, и `norms.resolve_setback` для остальных
+    типов породу не смотрит (та же граница, что `planner.CROWN_SPACING_TYPES`)."""
+    return species if planting_type in CROWN_SPACING_TYPES else None
+
+
+def _zone_key(project: Project, planting_type: str, species: str | None) -> ZoneKey:
+    return (
+        str(project.id),
+        planting_type,
+        _species_key(planting_type, species),
+        settings.planting_norms_path.stat().st_mtime_ns,
+    )
 
 
 def _get_or_build_locked(key: ZoneKey, project: Project, planting_type: str) -> BaseGeometry | None:
@@ -86,7 +104,26 @@ def _get_or_build_locked(key: ZoneKey, project: Project, planting_type: str) -> 
             return _cache[key]
 
     utilities, zones = layers_to_domain(project.layers)
-    zone = build_exclusion_zone(utilities, zones, planting_type, load_norms(settings.planting_norms_path))
+    # Порода — та же, что ставил генератор, иначе проверка мерила бы по
+    # табличному отступу, а генератор — по увеличенному для широкой кроны, и
+    # ручная правка могла бы подвинуть дерево ближе нормы без подсветки
+    # нарушения. CLI-проверка (geo_engine.compliance) породу учитывает всегда.
+    catalogue = load_catalogue()
+    species = catalogue.get(key[2])
+    norms = load_norms(settings.planting_norms_path)
+
+    def build(territory: BaseGeometry | None) -> BaseGeometry:
+        return build_exclusion_zone(
+            utilities, zones, planting_type, norms, species, catalogue.crown_reference_diameter_m, clip_to=territory
+        )
+
+    # Обрезка по участку — внутри блокировки участка: его геометрия общая и
+    # подготовленная, а GEOS не обещает безопасного параллельного чтения
+    # (см. докстринг модуля). Без участка — полная зона, как раньше.
+    try:
+        zone = with_territory(project, build)
+    except MissingTerritoryError:
+        zone = build(None)
     if zone is not None and not zone.is_empty:
         shapely.prepare(zone)
 
@@ -98,12 +135,17 @@ def _get_or_build_locked(key: ZoneKey, project: Project, planting_type: str) -> 
     return zone
 
 
-def with_exclusion_zone(project: Project, planting_type: str, fn: Callable[[BaseGeometry | None], T]) -> T:
+def with_exclusion_zone(
+    project: Project,
+    planting_type: str,
+    fn: Callable[[BaseGeometry | None], T],
+    species: str | None = None,
+) -> T:
     """Runs `fn(zone)` while holding a lock scoped to this (project,
     planting_type, norms version) key only -- see the module docstring for
     why that's safe and why it used to be one lock for every key.
     """
-    key = _zone_key(project, planting_type)
+    key = _zone_key(project, planting_type, species)
     with _lock_for(_zone_locks, key):
         zone = _get_or_build_locked(key, project, planting_type)
         return fn(zone)

@@ -23,6 +23,19 @@ from geo_engine.species import Species
 # any setback distance we use.
 _BUFFER_QUAD_SEGS = 32
 
+# Насколько дальше границы участка зона отступов обязана совпадать с полной,
+# когда её строят с `clip_to`. Внутри участка зону читают двумя способами:
+# вычитание из площади (нужна только сама территория) и расстояние от
+# кандидата до ближайшего ограничения для ранжирования — а этот признак
+# насыщается на `ml_scoring.features.REFERENCE_CLEARANCE_M` (5 м): всё, что
+# дальше, ранжированию безразлично. Запас взят вдвое против насыщения;
+# соотношение сторожит тест, чтобы правка одной константы не сломала другую
+# молча (geo_engine не может импортировать ml_scoring — зависимость обратная).
+EXCLUSION_CLIP_MARGIN_M = 10.0
+
+# Значение по умолчанию у `shapely.buffer(mitre_limit=...)`.
+_MITRE_LIMIT = 5.0
+
 
 
 def valid_polygonal_union(geometries: list[BaseGeometry]) -> BaseGeometry:
@@ -115,6 +128,7 @@ def build_exclusion_zone(
     norms: PlantingNorms,
     species: Species | None = None,
     crown_reference_diameter_m: float = 5.0,
+    clip_to: BaseGeometry | None = None,
 ) -> BaseGeometry:
     """Union of every utility/zone buffered by its required setback for
     `planting_type`. Zone types with a 0.0 setback (e.g. lawn vs. cables)
@@ -129,8 +143,22 @@ def build_exclusion_zone(
     them produces a plan the tool's own checker rejects — measured live on a
     real street: with a wide-crown species, 80 of 121 placements came back as
     violations purely because the generator had used the unadjusted table.
+
+    `clip_to` — участок, ради которого строится зона. Съёмка почти всегда
+    шире участка в разы, а итоговый `unary_union` по всей съёмке был самой
+    дорогой операцией генерации: на «4. Харьковская улица» 172 с из 238 у
+    газона, при том что дальше от зоны используется только то, что рядом с
+    участком. Поэтому в объединение идут лишь объекты, чей буфер подходит к
+    участку ближе `EXCLUSION_CLIP_MARGIN_M` — внутри этой полосы зона
+    совпадает с полной, а дальше её никто не читает (см. константу).
+
+    «Совпадает» — с точностью до последних знаков: GEOS нодирует объединение
+    меньшего набора чуть иначе. Замер на той же улице: все 2818 посадок
+    прежнего плана на месте, добавилось одно дерево, стоящее ровно на норме
+    (2,00 м от дороги при требуемых 2,00) — кандидат на самой границе зоны.
+    Проверка его принимает; полный прогон 123 с → 92 с.
     """
-    buffered: list[BaseGeometry] = []
+    pending: list[tuple[BaseGeometry, float, str]] = []
 
     def required(object_type: str) -> float:
         return norms.resolve_setback(
@@ -145,8 +173,7 @@ def build_exclusion_zone(
     ):
         # Round join/cap: a utility is a line (possibly bent), and a rounded
         # clearance radius around a pipe/cable is physically the right shape.
-        setback = required(utility.object_type)
-        buffered.append(geometry.buffer(setback, quad_segs=_BUFFER_QUAD_SEGS))
+        pending.append((geometry, required(utility.object_type), "round"))
 
     setback_zones = [z for z in zones if z.zone_type in norms.setbacks_m]
     for zone, zone_geometry in zip(
@@ -157,14 +184,31 @@ def build_exclusion_zone(
         # rounds every corner, which for e.g. a building turns a rectangular
         # setback strip into a blob-cornered shape (visibly wrong on the map)
         # and bloats the corner into ~30 extra vertices for no reason.
-        setback = required(zone.zone_type)
-        buffered.append(zone_geometry.buffer(setback, quad_segs=_BUFFER_QUAD_SEGS, join_style="mitre"))
+        pending.append((zone_geometry, required(zone.zone_type), "mitre"))
 
-    if not buffered:
+    if clip_to is not None and pending and not clip_to.is_empty:
+        geometries = np.array([g for g, _, _ in pending], dtype=object)
+        # Острый угол буфера с `mitre` выступает дальше самого отступа — до
+        # `mitre_limit` (у shapely 5.0) отступов от вершины. Дальность отбора
+        # обязана это покрывать, иначе потерялся бы выступ, который реально
+        # дотягивается до участка.
+        reach = np.array(
+            [setback * (_MITRE_LIMIT if join_style == "mitre" else 1.0) for _, setback, join_style in pending]
+        ) + EXCLUSION_CLIP_MARGIN_M
+        shapely.prepare(clip_to)
+        near = shapely.dwithin(geometries, clip_to, reach)
+        pending = [entry for entry, keep in zip(pending, near) if keep]
+
+    if not pending:
         # No constraints at all -> empty exclusion zone (everything is candidate territory).
         return unary_union([])
 
-    return unary_union(buffered)
+    return unary_union(
+        [
+            geometry.buffer(setback, quad_segs=_BUFFER_QUAD_SEGS, join_style=join_style)
+            for geometry, setback, join_style in pending
+        ]
+    )
 
 
 # "sidewalk" joined this list once real Polygon geometry for it existed to

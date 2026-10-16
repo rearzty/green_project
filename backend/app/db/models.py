@@ -109,6 +109,10 @@ class Project:
     # OpenStreetMap basemap under the plan is honest or misleading.
     crs_verified: bool = False
     created_at: datetime = field(default_factory=_utcnow)
+    # Что пошло не так при загрузке, но не помешало её закончить: непрочитанные
+    # файлы бандла, ненайденная граница участка. Готовый русский текст для
+    # пользователя — см. project_service.create_project_from_file.
+    warnings: list[str] = field(default_factory=list)
 
     layers: list[Layer] = field(default_factory=list)
     plans: list[Plan] = field(default_factory=list)

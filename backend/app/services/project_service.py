@@ -48,11 +48,13 @@ from backend.app.services.geo_io import shape_to_db
 from geo_engine.io.dxf_reader import (
     COMBINED_LAYER_MAP,
     BundleResolutionError,
+    _warn_unreadable,
     read_dxf,
     resolve_and_read_bundle,
 )
 from geo_engine.io.shp_geojson_reader import read_vector_file
 from geo_engine.model import Utility, Zone
+from geo_engine.territory import MissingTerritoryError, territory_polygon
 
 SUPPORTED_SUFFIXES = {".dxf", ".dwg", ".zip", ".geojson", ".json", ".shp"}
 
@@ -71,7 +73,10 @@ class UnsupportedFileTypeError(ValueError):
 
 
 def _parse_dxf_bundle(
-    path: Path, workdir: Path, on_progress: ProgressCallback | None = None
+    path: Path,
+    workdir: Path,
+    on_progress: ProgressCallback | None = None,
+    warnings_out: list[str] | None = None,
 ) -> tuple[list[Utility], list[Zone], str | None]:
     """One drawing or a whole project folder -- resolve_and_read_bundle
     handles both, so a lone .dwg and a .zip full of them share this path.
@@ -87,6 +92,12 @@ def _parse_dxf_bundle(
     on_bundle_progress = (
         (lambda done, total: on_progress("Чтение файлов бандла", done, total)) if on_progress else None
     )
+    unreadable: list[str] = []
+
+    def _track_unreadable(file_path: Path, error: Exception) -> None:
+        _warn_unreadable(file_path, error)
+        unreadable.append(file_path.name)
+
     utilities, zones, warnings = resolve_and_read_bundle(
         path,
         workdir,
@@ -94,13 +105,24 @@ def _parse_dxf_bundle(
         stitch_dashes=True,
         drop_origin=True,
         reconstruct_footprints=True,
+        on_error=_track_unreadable,
         on_progress=on_bundle_progress,
     )
     for warning in warnings:
-        # Not fatal -- one unreadable xref shouldn't sink the whole upload --
-        # but worth keeping somewhere a developer can find it; nothing in the
-        # API response surfaces per-file warnings today.
+        # Not fatal -- one unreadable xref shouldn't sink the whole upload.
         print(f"  ! {warning}")
+    if warnings_out is not None:
+        warnings_out.extend(warnings)
+        if unreadable:
+            # Тот же текст по смыслу, что CLI печатает после площади участка
+            # (scripts/plan_dxf.py): веб раньше писал это только в лог
+            # сервера, и пользователь видел «успешную» загрузку с участком,
+            # который мог быть урезан из-за потерянного файла — ровно случай
+            # «10. Старый Гай ул» (633 м² вместо 56 120).
+            warnings_out.append(
+                f"Не прочитано файлов чертежа: {len(unreadable)} ({', '.join(unreadable)}). "
+                "Если граница участка лежала в них, участок может оказаться меньше настоящего."
+            )
     return utilities, zones, None
 
 
@@ -166,7 +188,10 @@ def _extract_archive(archive: zipfile.ZipFile, extract_dir: Path) -> None:
 
 
 def _parse_zip_bundle(
-    path: Path, workdir: Path, on_progress: ProgressCallback | None = None
+    path: Path,
+    workdir: Path,
+    on_progress: ProgressCallback | None = None,
+    warnings_out: list[str] | None = None,
 ) -> tuple[list[Utility], list[Zone], str | None]:
     if on_progress:
         on_progress("Распаковка архива", 0, 1)
@@ -193,11 +218,14 @@ def _parse_zip_bundle(
     # built just so.
     entries = [p for p in extract_dir.iterdir() if p.name != "__MACOSX"]
     root = entries[0] if len(entries) == 1 and entries[0].is_dir() else extract_dir
-    return _parse_dxf_bundle(root, workdir, on_progress)
+    return _parse_dxf_bundle(root, workdir, on_progress, warnings_out)
 
 
 def parse_territory_file(
-    path: Path, workdir: Path | None = None, on_progress: ProgressCallback | None = None
+    path: Path,
+    workdir: Path | None = None,
+    on_progress: ProgressCallback | None = None,
+    warnings_out: list[str] | None = None,
 ) -> tuple[list[Utility], list[Zone], str | None]:
     """The third return value is a CRS `read_vector_file` auto-detected from
     the file itself (geographic coordinates only -- see its docstring) --
@@ -229,7 +257,7 @@ def parse_territory_file(
         if workdir is None:
             raise ValueError("parse_territory_file(.dwg) requires workdir")
         try:
-            return _parse_dxf_bundle(path, workdir, on_progress)
+            return _parse_dxf_bundle(path, workdir, on_progress, warnings_out)
         except (BundleResolutionError, RuntimeError) as error:
             # RuntimeError too, not just BundleResolutionError: that's only
             # "no converter on PATH" -- a converter that IS present but chokes
@@ -241,7 +269,7 @@ def parse_territory_file(
         if workdir is None:
             raise ValueError("parse_territory_file(.zip) requires workdir")
         try:
-            return _parse_zip_bundle(path, workdir, on_progress)
+            return _parse_zip_bundle(path, workdir, on_progress, warnings_out)
         except (BundleResolutionError, RuntimeError) as error:
             raise UnsupportedFileTypeError(str(error)) from error
     if suffix in (".geojson", ".json", ".shp"):
@@ -256,6 +284,20 @@ def parse_territory_file(
     )
 
 
+def _territory_warnings(utilities: list[Utility], zones: list[Zone]) -> list[str]:
+    """Проверить границу участка сразу при загрузке, а не при генерации.
+
+    Без этого о том, что строить план не из чего, пользователь узнавал только
+    после нажатия «Сгенерировать» — загрузка при этом выглядела успешной.
+    Сама загрузка не отклоняется: чертёж всё равно можно посмотреть на карте.
+    """
+    try:
+        territory_polygon(zones, utilities)
+    except MissingTerritoryError as error:
+        return [f"Граница участка не найдена — план построить не получится. {error}"]
+    return []
+
+
 async def create_project_from_file(
     name: str,
     upload_path: Path,
@@ -268,10 +310,12 @@ async def create_project_from_file(
     # workdir (DWG conversion output, ZIP extraction) lives only as long as
     # this call -- everything it produces is read into `utilities`/`zones`
     # (plain shapely geometry) before it's cleaned up.
+    warnings: list[str] = []
     with tempfile.TemporaryDirectory(prefix="greenproject-upload-") as workdir:
         utilities, zones, detected_crs = await run_in_threadpool(
-            parse_territory_file, upload_path, Path(workdir), on_progress
+            parse_territory_file, upload_path, Path(workdir), on_progress, warnings
         )
+    warnings.extend(await run_in_threadpool(_territory_warnings, utilities, zones))
 
     # An explicit source_crs from the caller always wins; otherwise fall
     # back to what parse_territory_file auto-detected (geographic files
@@ -285,7 +329,12 @@ async def create_project_from_file(
     # have no way to check, and showing a real basemap under it would be
     # exactly the kind of overconfidence that once put a real project's
     # territory at the equator in Kenya. See Project.crs_verified's own docstring.
-    project = Project(name=name, source_crs=source_crs or detected_crs, crs_verified=source_crs is None and detected_crs is not None)
+    project = Project(
+        name=name,
+        source_crs=source_crs or detected_crs,
+        crs_verified=source_crs is None and detected_crs is not None,
+        warnings=warnings,
+    )
     project.layers = [
         Layer(
             project_id=project.id,

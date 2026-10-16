@@ -30,6 +30,9 @@ export interface ProjectOut {
    * carries no CRS metadata at all. See backend's Project.crs_verified. */
   crs_verified: boolean;
   created_at: string;
+  /** Problems the upload survived but the user should know about -- unread
+   * bundle files, no territory boundary found. Ready-to-show Russian text. */
+  warnings?: string[];
 }
 
 export interface PlanOut {
