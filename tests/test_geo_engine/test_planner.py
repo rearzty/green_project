@@ -46,7 +46,9 @@ def _constant_score_fn(candidates):
 
 def _generate(synthetic_scene, threshold):
     territory, utilities, zones = synthetic_scene["territory"], synthetic_scene["utilities"], synthetic_scene["zones"]
-    with patch.object(planner, "_PARALLEL_PLAN_THRESHOLD", threshold):
+    with patch.object(planner, "_PARALLEL_PLAN_THRESHOLD", threshold), patch.object(
+        planner, "_memory_capped_plan_workers", return_value=8
+    ):
         return plan_items("planner-test", utilities, zones, territory, ["tree", "shrub"], _constant_score_fn, NORMS)
 
 
@@ -89,9 +91,11 @@ class TestParallelThresholdGate:
 
     def test_forced_threshold_does_spin_up_a_process_pool(self, synthetic_scene):
         territory, utilities, zones = synthetic_scene["territory"], synthetic_scene["utilities"], synthetic_scene["zones"]
+        # Память подменяется: тест о пороге параллельности, а не о том,
+        # сколько свободной памяти на машине, где он запущен.
         with patch.object(planner, "_PARALLEL_PLAN_THRESHOLD", 0), patch.object(
-            planner, "ProcessPoolExecutor", wraps=planner.ProcessPoolExecutor
-        ) as mock_pool:
+            planner, "_memory_capped_plan_workers", return_value=8
+        ), patch.object(planner, "ProcessPoolExecutor", wraps=planner.ProcessPoolExecutor) as mock_pool:
             items = plan_items("planner-test", utilities, zones, territory, ["tree", "shrub"], _constant_score_fn, NORMS)
         mock_pool.assert_called_once()
         assert items

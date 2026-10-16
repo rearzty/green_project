@@ -59,6 +59,10 @@ CROWN_SCALABLE_SOURCES = frozenset({"sp42_t9_1", "ppm_743_t3_6_1"})
 SHADING_TREE_BUILDING_MIN_M = 10.0
 SHADING_SOURCE_ID = "ppm_743_t3_6_1_note3"
 POWER_LINE_SOURCE_ID = "pue_2_5_207"
+PAVING_SOURCE_ID = "ppm_743_9_8"
+# Околоствольное пространство Ø 2 м (743-ПП п. 9.8) — ствол не ближе 1 м к
+# краю покрытия, иначе решётка выходит за тротуар.
+TREE_PIT_RADIUS_M = 1.0
 
 # МГСН 1.02-02, п. 4.2.8: поимённый отступ от теплотрассы.
 HEAT_NETWORK_SPECIES_SOURCE_ID = "mgsn_1_02_02_4_2_8"
@@ -100,6 +104,25 @@ class PlantingNorms(BaseModel):
     min_candidate_area_m2: dict[PlantingType, float]
     territory_margin_m: dict[PlantingType, float]
     zoning_suitability: dict[str, float]
+    # Деревья в покрытии тротуара с приствольной решёткой (743-ПП п. 9.8) —
+    # опция, не поведение по умолчанию; см. `with_trees_in_paving`.
+    trees_in_paving: bool = False
+
+    def paving_plantable(self, planting_type: PlantingType) -> bool:
+        """Можно ли этому типу посадки стоять В покрытии тротуара."""
+        return self.trees_in_paving and planting_type == "tree"
+
+    def with_trees_in_paving(self, enabled: bool = True) -> "PlantingNorms":
+        """Копия норм с посадкой деревьев в покрытии тротуара.
+
+        743-ПП, п. 9.8 (в ред. ПП Москвы от 28.04.2022 № 787-ПП): при мощении
+        тротуаров вокруг дерева оставляется околоствольное пространство
+        диаметром не менее 2 м с приствольной решёткой. Так заказчик и сажает
+        на улицах пилота — слой «ПЧ-посадочное место» у четырёх разных бюро,
+        от 10 до 50 % реальных деревьев стоят в покрытии. Остальные отступы
+        (2 м от края проезжей части, от сетей) не меняются.
+        """
+        return self.model_copy(update={"trees_in_paving": enabled})
 
     def setback_for(self, utility_type: str, planting_type: PlantingType) -> float:
         """Required clearance in meters; unknown utility types fail safe to the
@@ -151,6 +174,20 @@ class PlantingNorms(BaseModel):
         binding = self.setback_sources.get(utility_type, {}).get(planting_type)
         source_id = binding.source if binding else ""
         row = binding.row if binding else ""
+        if utility_type == "sidewalk" and self.paving_plantable(planting_type):
+            # Дерево может стоять в самом покрытии — мерится до КРАЯ тротуара,
+            # и ствол не ближе радиуса околоствольного пространства.
+            return SetbackResolution(
+                required_m=max(table_m, TREE_PIT_RADIUS_M),
+                source_id=PAVING_SOURCE_ID,
+                row=(
+                    "край покрытия тротуара: дерево в покрытии — околоствольное пространство Ø 2 м "
+                    "с приствольной решёткой (не ближе 1 м к краю); в газоне — 0,7 м (табл. 3.6.1)"
+                ),
+                table_m=table_m,
+                crown_multiplier=1.0,
+                species_rule="",
+            )
 
         required_m = table_m
         multiplier = 1.0

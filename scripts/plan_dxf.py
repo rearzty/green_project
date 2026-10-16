@@ -214,6 +214,12 @@ def build_parser() -> argparse.ArgumentParser:
         "в остатке (по умолчанию); scatter — только россыпь; row — только ряды",
     )
     parser.add_argument(
+        "--trees-in-paving",
+        action="store_true",
+        help="Разрешить деревья в покрытии тротуара с приствольной решёткой: околоствольное "
+        "пространство Ø 2 м (743-ПП п. 9.8). Остальные отступы не меняются",
+    )
+    parser.add_argument(
         "--tree-rows",
         type=int,
         choices=(1, 2),
@@ -307,6 +313,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.shrub_spacing:
         norms = norms.with_spacing_override("shrub", args.shrub_spacing)
         keep_spacing_for.append("shrub")
+    if args.trees_in_paving:
+        norms = norms.with_trees_in_paving()
 
     clock = _StageClock()
     with tempfile.TemporaryDirectory(prefix="greenplan-") as tmp:
