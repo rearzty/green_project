@@ -5,7 +5,7 @@ import { AlertTriangle, Box, Loader2, Redo2, Shrub, SquareDashedMousePointer, Tr
 
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
-import type { ItemCompliance, PlanSummary, PlantingNorms, PlantingType, ScoringMode, ValidationViolation } from "@/lib/api";
+import type { AreaBudget, ItemCompliance, PlanSummary, PlantingNorms, PlantingType, ScoringMode, ValidationViolation } from "@/lib/api";
 import { countLabel, OBJECT_FORMS, PLANTING_TYPE_FORMS, PLANTING_TYPE_LABELS } from "@/lib/format";
 import type { JobProgress } from "@/lib/hooks/useProjectSession";
 import type { SelectionSummary } from "@/lib/hooks/useSelection";
@@ -65,6 +65,8 @@ export interface ControlPanelProps {
   hasProject: boolean;
   /** Upload warnings of the current project (ProjectOut.warnings). */
   projectWarnings?: string[];
+  /** PlanOut.area_budget of the shown plan -- why a type got few plantings. */
+  areaBudget?: AreaBudget[];
   hasPlan: boolean;
   /** True only during the brief client-side restore-from-localStorage pass
    * right after the page loads (see app/page.tsx). */
@@ -189,6 +191,7 @@ function describeSelection(selection: SelectionSummary): string {
 export function ControlPanel({
   hasProject,
   projectWarnings = [],
+  areaBudget = [],
   hasPlan,
   restoring = false,
   generating = false,
@@ -480,6 +483,7 @@ export function ControlPanel({
             Сгенерировать план
           </Button>
           {generateProgress && <ProgressBar label={generateProgress.stage} progress={generateProgress.progress} />}
+          {hasPlan && areaBudget.length > 0 && <AreaBudgetList budgets={areaBudget} />}
         </section>
       )}
       {!hasProject && (
@@ -795,5 +799,40 @@ export function ControlPanel({
         </p>
       )}
     </aside>
+  );
+}
+
+const BUDGET_TYPE_LABELS: Record<string, string> = { tree: "Деревья", shrub: "Кустарник", lawn: "Газон" };
+
+/** Why a planting type got few (or no) plantings: the share of the
+ * territory still open to it and the constraints that closed the rest. On a
+ * dense street the strict setback tables leave trees almost nowhere to go --
+ * without this, "only shrubs" reads as a generator bug instead of what the
+ * norms actually say. */
+function AreaBudgetList({ budgets }: { budgets: AreaBudget[] }) {
+  const format = (m2: number) => Math.round(m2).toLocaleString("ru-RU");
+  return (
+    <div className="flex flex-col gap-1 rounded border border-stone-700 bg-stone-900/60 p-2 text-xs text-stone-300">
+      <span className="text-stone-400">Под посадку осталось:</span>
+      {budgets.map((budget) => {
+        const scarce = budget.usable_share < 0.05;
+        return (
+          <div key={budget.planting_type} className={scarce ? "text-amber-200" : undefined}>
+            <span className="font-medium">{BUDGET_TYPE_LABELS[budget.planting_type] ?? budget.planting_type}</span>
+            {": "}
+            {format(budget.usable_m2)} м² из {format(budget.territory_m2)} ({(100 * budget.usable_share).toFixed(1)}%)
+            {scarce && budget.blockers.length > 0 && (
+              <span className="text-stone-400">
+                {" — больше всего закрывают: "}
+                {budget.blockers
+                  .slice(0, 3)
+                  .map((b) => `${b.label} ${Math.round(100 * b.share)}%`)
+                  .join(", ")}
+              </span>
+            )}
+          </div>
+        );
+      })}
+    </div>
   );
 }

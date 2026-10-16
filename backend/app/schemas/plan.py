@@ -65,10 +65,28 @@ class ExportJobStatus(BaseModel):
     error: str | None = None
 
 
+class AreaBlockerOut(BaseModel):
+    object_type: str
+    label: str
+    share: float
+
+
+class AreaBudgetOut(BaseModel):
+    """Сколько площади осталось под тип посадки и что закрыло остальное —
+    см. geo_engine/area_budget.py."""
+
+    planting_type: str
+    territory_m2: float
+    usable_m2: float
+    usable_share: float
+    blockers: list[AreaBlockerOut]
+
+
 class PlanOut(BaseModel):
     plan_id: str
     scoring_mode: ScoringMode
     features: GeoJSONFeatureCollection
+    area_budget: list[AreaBudgetOut] = []
 
 
 class PlanSummary(BaseModel):

@@ -86,6 +86,10 @@ class Plan:
     # 1 — однорядная аллея вдоль улиц, 2 — двухрядная (743-ПП табл. 3.6.2).
     # Часть рецепта, как и интервалы: ensure_materialized пересчитывает с ним.
     tree_rows: int = 1
+    # geo_engine.area_budget.AreaBudget.to_dict() по каждому типу посадки —
+    # считается при генерации, не пересчитывается при рематериализации (от
+    # рецепта не зависит ничего, кроме породы, а она та же).
+    area_budget: list[dict] = field(default_factory=list)
     created_at: datetime = field(default_factory=_utcnow)
     is_current: bool = True
     item_count: int = 0

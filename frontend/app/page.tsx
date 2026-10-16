@@ -327,6 +327,7 @@ export default function Home() {
         <ControlPanel
           hasProject={project !== null}
           projectWarnings={project?.warnings}
+          areaBudget={plan?.area_budget}
           hasPlan={plan !== null}
           restoring={session.restoring}
           generating={session.generating}

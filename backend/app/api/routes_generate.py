@@ -29,6 +29,7 @@ def _to_plan_out(plan: Plan) -> PlanOut:
         plan_id=plan.id,
         scoring_mode=plan.scoring_mode,
         features=planting_items_to_feature_collection(plan.items, display_crs(plan.project)),
+        area_budget=plan.area_budget,
     )
 
 

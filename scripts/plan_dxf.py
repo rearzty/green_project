@@ -38,6 +38,7 @@ from geo_engine.planner import (
     ROW_RATIONALE_PREFIX,
     plan_items,
 )
+from geo_engine.area_budget import area_budget
 from geo_engine.species import load_catalogue
 from geo_engine.territory import MissingTerritoryError, territory_polygon
 from ml_scoring.heuristic_scorer import HeuristicScorer
@@ -151,6 +152,9 @@ def pick_base_drawing(entity_counts: dict[Path, int], main_drawing: Path | None 
     # пару объектов, и копия такой заглушки со слоем результата формально
     # проходит, но эксперт открывает её и не видит своей подосновы).
     return max(entity_counts, key=entity_counts.get)
+
+
+PLANTING_TYPE_LABELS_RU = {"tree": "деревья", "shrub": "кустарник", "lawn": "газон"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -423,6 +427,20 @@ def main(argv: list[str] | None = None) -> int:
                     note = f"интервал {norms.spacing_for(planting_type).min_distance_m} м из planting_norms.yaml"
                 print(f"        «{species_name}» — {count}, крона {picked.crown}, {note}")
 
+        # Сколько площади осталось под каждый тип и что съело остальное — см.
+        # geo_engine/area_budget.py: без этого «одни кусты» на плотной улице
+        # выглядят сбоем генератора, а не выводом из норм.
+        budgets = []
+        for planting_type in planting_types:
+            dominant = used.get(planting_type, Counter()).most_common(1)
+            species = catalogue.get(dominant[0][0]) if dominant else None
+            budget = area_budget(
+                territory, utilities, zones, planting_type, norms, species, catalogue.crown_reference_diameter_m
+            )
+            if budget is not None:
+                budgets.append(budget)
+                print(f"     {PLANTING_TYPE_LABELS_RU.get(planting_type, planting_type)}: {budget.summary_ru()}")
+
         clock.begin("4/5 Проверка нормативных отступов и сборка обоснований...")
         records = explain_items(items, utilities, zones, norms)
         violations = [r for r in records if not r.compliant]
@@ -463,6 +481,7 @@ def main(argv: list[str] | None = None) -> int:
         scoring_mode=args.scoring,
         planting_types=planting_types,
         territory_area_m2=round(float(territory.area), 2),
+        area_budget=[budget.to_dict() for budget in budgets],
     )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

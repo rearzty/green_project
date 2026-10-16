@@ -6,6 +6,7 @@ imports the other.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable
 
 from fastapi.concurrency import run_in_threadpool
@@ -14,8 +15,10 @@ from backend.app.core.config import settings
 from backend.app.db.models import Plan, PlantingItemRow, Project
 from backend.app.services.geo_io import domain_item_to_row, layers_to_domain
 
+from geo_engine.area_budget import area_budget
 from geo_engine.norms import PlantingNorms, load_norms
 from geo_engine.planner import plan_items
+from geo_engine.species import load_catalogue
 from geo_engine.territory import MissingTerritoryError, territory_polygon  # noqa: F401  (re-exported by name for existing callers)
 from ml_scoring.heuristic_scorer import HeuristicScorer
 from ml_scoring.ml_scorer import MLScorer
@@ -112,6 +115,20 @@ def _compute_planting_rows(
         tree_rows=tree_rows,
     )
     return [domain_item_to_row(plan_id, item) for item in items]
+
+
+def _area_budgets(territory, utilities, zones, planting_types, items, norms) -> list[dict]:
+    """Объяснение площади по каждому типу посадки, с породой, которой реально
+    засажен план (от неё у деревьев зависят отступы) — см. geo_engine/area_budget.py."""
+    catalogue = load_catalogue()
+    budgets = []
+    for planting_type in planting_types:
+        names = Counter(item.species for item in items if item.planting_type == planting_type).most_common(1)
+        species = catalogue.get(names[0][0]) if names else None
+        budget = area_budget(territory, utilities, zones, planting_type, norms, species, catalogue.crown_reference_diameter_m)
+        if budget is not None:
+            budgets.append(budget.to_dict())
+    return budgets
 
 
 def _attach(plan: Plan, items: list[PlantingItemRow]) -> None:
@@ -257,6 +274,7 @@ async def generate_plan(
     )
     _attach(plan, items)
     plan.item_count = len(items)
+    plan.area_budget = await run_in_threadpool(_area_budgets, territory, utilities, zones, planting_types, items, norms)
 
     project.plans.append(plan)
     _prune_stale_plans(project, keep_plan_id=plan.id)
