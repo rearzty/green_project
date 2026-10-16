@@ -91,7 +91,7 @@ export interface ControlPanelProps {
   onGenerate: (
     plantingTypes: PlantingType[],
     scoringMode: ScoringMode,
-    spacing?: { treeSpacingM?: number; shrubSpacingM?: number; treeRows?: number }
+    spacing?: { treeSpacingM?: number; shrubSpacingM?: number; treeRows?: number; treesInPaving?: boolean }
   ) => Promise<void>;
   /** Lifted to app/page.tsx (not local state here anymore) so AssistantChat.tsx
    * can read/change the same recipe Юна talks about -- both this panel and
@@ -245,6 +245,7 @@ export function ControlPanel({
 }: ControlPanelProps) {
   const [file, setFile] = useState<File | null>(null);
   const [doubleRow, setDoubleRow] = useState(false);
+  const [treesInPaving, setTreesInPaving] = useState(false);
   const [name, setName] = useState("Тестовая территория");
   // Defaults to the CRS scripts/generate_synthetic_data.py writes test data
   // in (UTM 37N, covers Moscow) so synthetic uploads land on the real map
@@ -465,6 +466,19 @@ export function ControlPanel({
               />
               Двухрядная аллея вдоль улиц
             </label>
+            <label
+              className="flex items-center gap-2"
+              title="743-ПП п. 9.8: дерево в покрытии тротуара — околоствольное пространство Ø 2 м с приствольной решёткой; остальные отступы не меняются"
+            >
+              <input
+                type="checkbox"
+                checked={treesInPaving}
+                onChange={(e) => setTreesInPaving(e.target.checked)}
+                disabled={!plantingTypes.includes("tree")}
+                className="h-4 w-4 accent-greenery-600 disabled:opacity-50"
+              />
+              Деревья в покрытии тротуара (решётка Ø 2 м)
+            </label>
           </div>
           <div className="flex gap-3 text-sm">
             <label className="flex items-center gap-1">
@@ -478,7 +492,7 @@ export function ControlPanel({
           </div>
           <Button
             disabled={!hasProject || plantingTypes.length === 0 || busy || editBusy || generating}
-            onClick={() => guarded(() => onGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM, treeRows: doubleRow ? 2 : 1 }))}
+            onClick={() => guarded(() => onGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM, treeRows: doubleRow ? 2 : 1, treesInPaving }))}
           >
             Сгенерировать план
           </Button>

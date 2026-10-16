@@ -22,9 +22,9 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from backend.app.core.config import settings
 from backend.app.db.models import Plan
 from backend.app.services.geo_io import db_to_shape, layers_to_domain
+from backend.app.services.pipeline_service import plan_norms
 from backend.app.services.project_service import materialize_source
 from geo_engine.compliance import explain_items, report_payload, write_trace_csv
 from geo_engine.io.dwg_convert import convert_dwg_to_dxf
@@ -32,7 +32,6 @@ from geo_engine.io.dxf_reader import discover_bundle_members
 from geo_engine.io.dxf_writer import write_dxf
 from geo_engine.io.result_package import copy_references, xref_attachment_count
 from geo_engine.model import PlantingItem
-from geo_engine.norms import load_norms
 
 
 def _domain_items(plan: Plan) -> list[PlantingItem]:
@@ -62,7 +61,7 @@ def plan_to_package(plan: Plan, output_zip: str | Path) -> Path:
     project = plan.project
     items = _domain_items(plan)
     utilities, zones = layers_to_domain(project.layers)
-    norms = load_norms(settings.planting_norms_path)
+    norms = plan_norms(plan)
     records = explain_items(items, utilities, zones, norms)
 
     with tempfile.TemporaryDirectory(prefix="greenproject-export-") as tmp:
