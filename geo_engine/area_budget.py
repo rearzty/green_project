@@ -120,7 +120,10 @@ def area_budget(
     masks: dict[str, np.ndarray] = {}
     for object_type, geometries in by_type.items():
         required = norms.resolve_setback(object_type, planting_type, species, crown_reference_diameter_m).required_m
-        masks[object_type] = _blocked_by(points, [g for g in geometries if g is not None and not g.is_empty], required)
+        geometries = [g for g in geometries if g is not None and not g.is_empty]
+        if object_type == "sidewalk" and norms.paving_plantable(planting_type):
+            geometries = [g.boundary if g.geom_type in ("Polygon", "MultiPolygon") else g for g in geometries]
+        masks[object_type] = _blocked_by(points, geometries, required)
 
     margin = norms.territory_margin_for(planting_type)
     if margin > 0:
@@ -130,7 +133,9 @@ def area_budget(
     hard = [
         z.geometry
         for z in zones
-        if z.zone_type in HARD_OBSTACLE_ZONE_TYPES and z.geometry.geom_type in ("Polygon", "MultiPolygon")
+        if z.zone_type in HARD_OBSTACLE_ZONE_TYPES
+        and not (z.zone_type == "sidewalk" and norms.paving_plantable(planting_type))
+        and z.geometry.geom_type in ("Polygon", "MultiPolygon")
     ]
     masks[HARD_OBSTACLES_KEY] = _blocked_by(points, hard, 0.0)
 

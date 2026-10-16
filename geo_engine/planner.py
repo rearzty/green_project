@@ -244,7 +244,8 @@ def _fit_row_species(
             clip_to=territory,
         )
         buildable = buildable_area(
-            territory, exclusion, zones, territory_margin_m=type_norms.territory_margin_for(planting_type)
+            territory, exclusion, zones, territory_margin_m=type_norms.territory_margin_for(planting_type),
+            plantable_types=_plantable_types(type_norms, planting_type),
         )
         guides = collect_row_guides(
             zones, planting_type, type_norms, candidate_species, catalogue.crown_reference_diameter_m
@@ -575,7 +576,10 @@ def _plan_type_items(
             clip_to=territory,
         )
         margin = type_norms.territory_margin_for(planting_type)
-        buildable = buildable_area(territory, exclusion, zones, territory_margin_m=margin)
+        buildable = buildable_area(
+            territory, exclusion, zones, territory_margin_m=margin,
+            plantable_types=_plantable_types(type_norms, planting_type),
+        )
         spacing = type_norms.spacing_for(planting_type)
         remaining = buildable
 
@@ -684,6 +688,7 @@ def _plan_type_items(
             loose_buildable = buildable_area(
                 territory, loose_exclusion, zones,
                 territory_margin_m=loose_norms.territory_margin_for(planting_type),
+                plantable_types=_plantable_types(loose_norms, planting_type),
             )
             # Пересечение, а не замена: из `remaining` уже вычтены кроны
             # поставленного ряда, и терять это нельзя.
@@ -795,6 +800,39 @@ def _memory_capped_plan_workers() -> int:
 # реальные проекты пилота, а смена породы каждые несколько метров читалась
 # бы как шум.
 SPECIES_BLOCK_M = 60.0
+
+IN_PAVING_RATIONALE_PREFIX = (
+    "Посадка в покрытии тротуара: околоствольное пространство Ø 2 м с приствольной решёткой "
+    "(743-ПП п. 9.8)."
+)
+
+
+def _plantable_types(norms: PlantingNorms, planting_type: str) -> tuple[str, ...]:
+    """Типы твёрдых препятствий, в которых этому типу посадки можно стоять."""
+    return ("sidewalk",) if norms.paving_plantable(planting_type) else ()
+
+
+def _mark_in_paving(items: list[PlantingItem], zones: list[Zone], norms: PlantingNorms) -> list[PlantingItem]:
+    """Пометить деревья, вставшие в покрытие тротуара, — в обосновании должно
+    быть сказано, что это посадка с приствольной решёткой по 743-ПП п. 9.8, а
+    не дерево в газоне."""
+    if not norms.paving_plantable("tree"):
+        return items
+    paving = [
+        z.geometry for z in zones
+        if z.zone_type == "sidewalk" and z.geometry.geom_type in ("Polygon", "MultiPolygon")
+    ]
+    trees = [i for i in items if i.planting_type == "tree"]
+    if not paving or not trees:
+        return items
+    from shapely.strtree import STRtree
+
+    hits = STRtree(paving).query([i.geometry for i in trees], predicate="within")
+    for index in set(int(k) for k in hits[0]):
+        item = trees[index]
+        if not item.rationale.startswith(IN_PAVING_RATIONALE_PREFIX):
+            item.rationale = f"{IN_PAVING_RATIONALE_PREFIX} {item.rationale}"
+    return items
 
 
 def _equivalence_key(species: Species, planting_type: str, norms: PlantingNorms, catalogue: SpeciesCatalogue) -> tuple:
@@ -979,7 +1017,7 @@ def plan_items(
                     items.extend(future.result())
                     if on_progress is not None:
                         on_progress(planting_type, index, total)
-            return _diversify_species(items, plan_key, norms, catalogue, species_overrides)
+            return _mark_in_paving(_diversify_species(items, plan_key, norms, catalogue, species_overrides), zones, norms)
         except BrokenProcessPool:
             # Рабочий процесс убит извне — на реальных данных это нехватка
             # памяти: типы посадки считаются параллельно, и на самой крупной
@@ -1022,4 +1060,4 @@ def plan_items(
         )
         if on_progress is not None:
             on_progress(planting_type, index, total)
-    return _diversify_species(items, plan_key, norms, catalogue, species_overrides)
+    return _mark_in_paving(_diversify_species(items, plan_key, norms, catalogue, species_overrides), zones, norms)

@@ -467,3 +467,48 @@ def test_row_path_survives_a_geos_failure_in_the_local_clip(monkeypatch):
 
     assert survived[1] == expected[1]
     assert survived[0].equals(expected[0])
+
+
+class TestTreesInPaving:
+    """743-ПП п. 9.8: дерево в покрытии тротуара — околоствольное
+    пространство Ø 2 м с решёткой. Опция; остальные отступы не меняются."""
+
+    def _scene(self):
+        territory = Polygon([(0, 0), (200, 0), (200, 60), (0, 60)])
+        sidewalk = Polygon([(0, 31), (200, 31), (200, 39), (0, 39)])  # тротуар 8 м вдоль проезжей части
+        zones = [
+            Zone(geometry=territory, zone_type="territory"),
+            Zone(geometry=sidewalk, zone_type="sidewalk"),
+            Zone(geometry=LineString([(-50, 30), (250, 30)]), zone_type="road"),  # бордюр проезжей части
+        ]
+        return territory, zones
+
+    def _plan(self, norms, catalogue, in_paving):
+        from geo_engine.planner import plan_items
+
+        territory, zones = self._scene()
+        n = norms.with_trees_in_paving() if in_paving else norms
+        return territory, zones, n, plan_items(
+            "paving", [], zones, territory, ["tree"], lambda cs: [(1.0, "т") for _ in cs], n,
+            species_overrides={"tree": "Берёза повислая"}, catalogue=catalogue, density_per_ha={"tree": 0},
+        )
+
+    def test_without_the_option_no_tree_stands_in_the_sidewalk(self, norms, catalogue):
+        _, zones, _, items = self._plan(norms, catalogue, False)
+        sidewalk = zones[1].geometry
+        assert not [i for i in items if sidewalk.contains(i.geometry)]
+
+    def test_with_the_option_trees_stand_in_the_sidewalk_with_a_pit_and_are_compliant(self, norms, catalogue):
+        from geo_engine.compliance import explain_items
+        from geo_engine.planner import IN_PAVING_RATIONALE_PREFIX
+
+        territory, zones, n, items = self._plan(norms, catalogue, True)
+        sidewalk = zones[1].geometry
+        in_paving = [i for i in items if sidewalk.contains(i.geometry)]
+
+        assert in_paving
+        assert all(sidewalk.exterior.distance(i.geometry) >= 1.0 - 1e-3 for i in in_paving)  # решётка Ø 2 м в покрытии
+        assert all(zones[2].geometry.distance(i.geometry) >= 2.0 - 1e-3 for i in items)  # 2 м от проезжей части
+        assert all(i.rationale.startswith(IN_PAVING_RATIONALE_PREFIX) for i in in_paving)
+        records = explain_items(items, [], zones, n, catalogue)
+        assert all(r.compliant for r in records)
