@@ -35,10 +35,21 @@ export interface ProjectOut {
   warnings?: string[];
 }
 
+/** How much of the territory is left for one planting type and what took
+ * the rest -- see backend geo_engine/area_budget.py. */
+export interface AreaBudget {
+  planting_type: PlantingType;
+  territory_m2: number;
+  usable_m2: number;
+  usable_share: number;
+  blockers: { object_type: string; label: string; share: number }[];
+}
+
 export interface PlanOut {
   plan_id: string;
   scoring_mode: ScoringMode;
   features: GeoJSONFeatureCollection;
+  area_budget?: AreaBudget[];
 }
 
 export interface PlanSummary {
