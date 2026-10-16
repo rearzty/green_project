@@ -308,9 +308,16 @@ def _row_path(
     # участка. Результат тот же: вне прямоугольника кольца нет.
     minx, miny, maxx, maxy = guide.geometry.bounds
     pad = limit + 1.0
-    local = shapely.clip_by_rect(buildable_area, minx - pad, miny - pad, maxx + pad, maxy + pad)
-    if not local.is_valid:
-        local = shapely.make_valid(local)
+    try:
+        local = shapely.clip_by_rect(buildable_area, minx - pad, miny - pad, maxx + pad, maxy + pad)
+        if not local.is_valid:
+            local = shapely.make_valid(local)
+    except shapely.errors.GEOSException:
+        # Живой случай, «5. Багрицкого»: на вырожденной площади GEOS собирает
+        # при вырезке кольцо из трёх точек и падает («Invalid number of points
+        # in LinearRing found 3»). Вырезка — только ускорение, поэтому откат —
+        # пересечение со всей площадью, как до него: дольше, но то же самое.
+        local = buildable_area
     if local.is_empty:
         return None, guide.setback_m + inset_m
 

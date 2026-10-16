@@ -447,3 +447,23 @@ class TestDoubleRow:
         territory, zones = self._scene()
         records = explain_items(self._plan(norms, catalogue, 2), [], zones, norms, catalogue)
         assert records and all(r.compliant for r in records)
+
+
+def test_row_path_survives_a_geos_failure_in_the_local_clip(monkeypatch):
+    """«5. Багрицкого»: clip_by_rect упал на вырожденной площади и унёс улицу.
+    Вырезка — только ускорение; при её отказе ряд строится по всей площади."""
+    import shapely
+
+    from geo_engine import patterns
+
+    def broken_clip(*args, **kwargs):
+        raise shapely.errors.GEOSException("IllegalArgumentException: Invalid number of points in LinearRing found 3")
+
+    buildable = Polygon([(0, 0), (200, 0), (200, 60), (0, 60)])
+    guide = patterns.RowGuide(geometry=LineString([(0, -3), (200, -3)]), object_type="road", setback_m=2.0)
+    expected = patterns._row_path(guide, buildable, 6.0, 0.05, 8.0)
+    monkeypatch.setattr(patterns.shapely, "clip_by_rect", broken_clip)
+    survived = patterns._row_path(guide, buildable, 6.0, 0.05, 8.0)
+
+    assert survived[1] == expected[1]
+    assert survived[0].equals(expected[0])
