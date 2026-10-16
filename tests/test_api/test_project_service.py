@@ -250,3 +250,48 @@ class TestZipFilenameEncoding:
 
         assert (out / "ok.txt").exists()
         assert not (tmp_path / "escaped.txt").exists()
+
+
+class TestUploadWarnings:
+    """Веб должен говорить пользователю то же, что CLI печатает в консоль:
+    раньше эти предупреждения уходили только в лог сервера."""
+
+    def test_an_unreadable_bundle_member_becomes_a_user_warning(self, tmp_path):
+        site = tmp_path / "site"
+        (site / "Xrefs").mkdir(parents=True)
+        _drawing(site / "plan.dxf")
+        (site / "Xrefs" / "broken.dxf").write_text("это не DXF", encoding="utf-8")
+        zip_path = tmp_path / "site.zip"
+        _zip_dir(site, zip_path)
+
+        warnings: list[str] = []
+        parse_territory_file(zip_path, tmp_path / "work", warnings_out=warnings)
+
+        assert any("broken.dxf" in w and "участок" in w for w in warnings)
+
+    def test_a_drawing_without_a_boundary_is_flagged_at_upload(self, tmp_path):
+        import asyncio
+
+        from backend.app.services.project_service import create_project_from_file
+
+        path = tmp_path / "no_boundary.dxf"
+        doc = ezdxf.new(setup=True)
+        doc.layers.add(name="Газопровод")
+        doc.modelspace().add_lwpolyline([(0, 40), (100, 40)], dxfattribs={"layer": "Газопровод"})
+        doc.saveas(str(path))
+
+        project = asyncio.run(create_project_from_file("без границы", path))
+
+        assert any("Граница участка не найдена" in w for w in project.warnings)
+
+    def test_a_clean_drawing_has_no_warnings(self, tmp_path):
+        import asyncio
+
+        from backend.app.services.project_service import create_project_from_file
+
+        path = tmp_path / "plan.dxf"
+        _drawing(path)
+
+        project = asyncio.run(create_project_from_file("чистый", path))
+
+        assert project.warnings == []

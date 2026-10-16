@@ -79,6 +79,7 @@ def _compute_planting_rows(
     norms,
     keep_spacing_for: tuple[str, ...] = (),
     on_progress: Callable[[str, int, int], None] | None = None,
+    tree_rows: int = 1,
 ) -> list[PlantingItemRow]:
     """Pure CPU work (geometry buffers/candidates/greedy selection) — kept as
     one synchronous function so it can run in a worker thread via
@@ -108,6 +109,7 @@ def _compute_planting_rows(
         norms,
         keep_spacing_for=keep_spacing_for,
         on_progress=on_progress,
+        tree_rows=tree_rows,
     )
     return [domain_item_to_row(plan_id, item) for item in items]
 
@@ -171,6 +173,8 @@ async def ensure_materialized(plan: Plan) -> Plan:
         scorer,
         norms,
         _spacing_overridden(plan.tree_spacing_m, plan.shrub_spacing_m),
+        None,
+        plan.tree_rows,
     )
     _attach(plan, items)
     plan.materialized = True
@@ -183,6 +187,7 @@ def _find_reusable_plan(
     planting_types: list[str],
     tree_spacing_m: float | None,
     shrub_spacing_m: float | None,
+    tree_rows: int = 1,
 ) -> Plan | None:
     """If the project's *current* plan already is exactly this recipe
     (same scoring_mode + same set of planting_types + same spacing overrides)
@@ -199,6 +204,8 @@ def _find_reusable_plan(
         return None
     if current.tree_spacing_m != tree_spacing_m or current.shrub_spacing_m != shrub_spacing_m:
         return None
+    if current.tree_rows != tree_rows:
+        return None
     return current
 
 
@@ -209,8 +216,9 @@ async def generate_plan(
     tree_spacing_m: float | None = None,
     shrub_spacing_m: float | None = None,
     on_progress: Callable[[str, int, int], None] | None = None,
+    tree_rows: int = 1,
 ) -> Plan:
-    reusable = _find_reusable_plan(project, scoring_mode, planting_types, tree_spacing_m, shrub_spacing_m)
+    reusable = _find_reusable_plan(project, scoring_mode, planting_types, tree_spacing_m, shrub_spacing_m, tree_rows)
     if reusable is not None:
         return await ensure_materialized(reusable)
 
@@ -229,6 +237,7 @@ async def generate_plan(
         planting_types=planting_types,
         tree_spacing_m=tree_spacing_m,
         shrub_spacing_m=shrub_spacing_m,
+        tree_rows=tree_rows,
         is_current=True,
         project=project,
     )
@@ -244,6 +253,7 @@ async def generate_plan(
         norms,
         _spacing_overridden(tree_spacing_m, shrub_spacing_m),
         on_progress,
+        tree_rows,
     )
     _attach(plan, items)
     plan.item_count = len(items)

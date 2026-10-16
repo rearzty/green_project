@@ -27,6 +27,7 @@ import math
 import os
 import sys
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from collections.abc import Callable
 from typing import Iterable, Iterator, Literal
@@ -847,6 +848,77 @@ def _bundle_pool_worker_count(n_files: int) -> int:
     return max(1, min(n_files, usable))
 
 
+# Сколько памяти занимает чтение одного файла, в разах от его размера на
+# диске. Замер на «1. Олимпийская деревня»: DXF 125,6 МБ — пик 1139 МБ (×9,1),
+# DXF 28,3 МБ — 251 МБ (×8,9). DWG ещё не сконвертирован, а DXF из ODA
+# выходит примерно в 6 раз больше DWG (21,5 МБ → 125,6 МБ). Множители взяты с
+# запасом над замером.
+_READ_MEMORY_FACTOR_DXF = 10.0
+_READ_MEMORY_FACTOR_DWG = 60.0
+# Какую долю свободной памяти можно отдать параллельному чтению: остальное —
+# основному процессу, где копятся прочитанные объекты всего бандла.
+_READ_MEMORY_SHARE = 0.5
+
+
+def _available_memory_bytes() -> int | None:
+    """Свободная память для этого процесса: меньшее из MemAvailable и лимита
+    cgroup (контейнер видит в /proc/meminfo память всей машины, а убивают его
+    по своему лимиту). None там, где узнать нельзя (не Linux) — тогда число
+    процессов ограничивают только ядра, как раньше."""
+    candidates: list[int] = []
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                candidates.append(int(line.split()[1]) * 1024)
+    except OSError:
+        pass
+    for limit_file, usage_file in (
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+    ):
+        try:
+            raw = Path(limit_file).read_text().strip()
+            if raw.isdigit() and int(raw) < 1 << 60:
+                candidates.append(int(raw) - int(Path(usage_file).read_text().strip()))
+            break
+        except (OSError, ValueError):
+            continue
+    return min(candidates) if candidates else None
+
+
+def _read_pool_worker_count(paths: list[Path]) -> int:
+    """Сколько файлов бандла читать параллельно — по ядрам И по памяти.
+
+    Живой случай, «3. 3-я Парковая»: двенадцать файлов, четыре из них по
+    17-48 МБ DWG, вместе на чтение около 6 ГБ при 7,4 ГБ у контейнера. Ядро
+    убивало уже основной процесс (код 137), и запасной последовательный путь
+    (`_warn_pool_broken`) спасти не мог. Читаются файлы от крупных к мелким,
+    значит в худший момент параллельно идут k самых крупных — k и берётся
+    наибольшим, при котором их оценка влезает в долю свободной памяти. Не
+    меньше одного: один файл читается в любом случае.
+    """
+    workers = _bundle_pool_worker_count(len(paths))
+    available = _available_memory_bytes()
+    if available is None or workers <= 1:
+        return workers
+    budget = available * _READ_MEMORY_SHARE
+
+    def estimate(path: Path) -> float:
+        factor = _READ_MEMORY_FACTOR_DWG if path.suffix.lower() == ".dwg" else _READ_MEMORY_FACTOR_DXF
+        try:
+            return path.stat().st_size * factor
+        except OSError:
+            return 0.0
+
+    used, fits = 0.0, 0
+    for need in sorted((estimate(p) for p in paths), reverse=True)[:workers]:
+        if fits and used + need > budget:
+            break
+        used += need
+        fits += 1
+    return max(1, fits)
+
+
 def _lpt_partition(paths: list[Path], num_bins: int) -> list[list[Path]]:
     """Greedy longest-processing-time-first bin assignment: sort by file size
     descending, then always add the next file to whichever bin currently has
@@ -921,6 +993,36 @@ def _other_bundle_members(source: Path, main: Path) -> list[Path]:
     return sorted(p for p in found if "PaxHeader" not in p.parts)
 
 
+def _nested_project_main(source: Path) -> Path | None:
+    """Главный чертёж папки проекта, у которой сам чертёж лежит в подпапке.
+
+    Живой случай — «3. 3-я Парковая»: в корне папки проекта `00_Ссылки/`
+    (внешние ссылки с границей работ и сетями), а главный чертёж — в
+    `02_АПОТ/`. В корне ни одного файла, и прежняя логика отказывала с
+    «чертёж, вероятно, в подпапке», хотя пользователь указал ровно папку
+    проекта. А указать `02_АПОТ/` тоже нельзя: ссылки лежат рядом с ней, а не
+    в ней.
+
+    Отличить такую папку проекта от зонтичной («Исходные данные»: разрешения,
+    дендроизыскания, комплект чертежей — несвязанные куски) позволяет папка
+    ссылок в корне: она принадлежит одному чертежу, у зонтичной её не бывает.
+    Без неё — None, и остаётся прежний понятный отказ. Главный — самый крупный
+    чертёж вне папок ссылок, по тому же правилу «по размеру, а не по имени»,
+    что и для файлов в корне.
+    """
+    subdirs = [p for p in source.iterdir() if p.is_dir()]
+    if not any(_looks_like_xref_dir(p.name) for p in subdirs):
+        return None
+    drawings = [
+        path
+        for subdir in subdirs
+        if not _looks_like_xref_dir(subdir.name)
+        for path in subdir.rglob("*")
+        if path.suffix.lower() in (".dxf", ".dwg") and "PaxHeader" not in path.parts and path.is_file()
+    ]
+    return max(drawings, key=lambda p: p.stat().st_size) if drawings else None
+
+
 def _discover_bundle_members(source: Path) -> tuple[Path, list[Path]]:
     """(main file, every file belonging to the bundle including main), before
     any DWG->DXF conversion.
@@ -934,6 +1036,9 @@ def _discover_bundle_members(source: Path) -> tuple[Path, list[Path]]:
     """
     if source.is_dir():
         candidates = sorted(p for p in source.iterdir() if p.suffix.lower() in (".dxf", ".dwg"))
+        nested_main = None if candidates else _nested_project_main(source)
+        if nested_main is not None:
+            return nested_main, [nested_main, *_other_bundle_members(source, nested_main)]
         if not candidates:
             # A real delivery's top level holds the drawing directly -- zero
             # files here usually means this is an umbrella folder one level
@@ -1075,6 +1180,27 @@ def resolve_bundle_inputs(
     return converted_main, [converted_main, *convert_each(others)], warnings
 
 
+def _warn_pool_broken(warned: list[bool]) -> None:
+    """Пул чтения развалился — дочитываем в этом процессе, по одному файлу.
+
+    Живой случай, «3. 3-я Парковая»: при нехватке памяти ядро убивает
+    рабочий процесс, и `BrokenProcessPool` приходит на ВСЕ ещё не собранные
+    файлы разом. Раньше каждый уходил в `on_error` как «не прочитан» — в том
+    числе главный чертёж, и план тихо строился по остаткам. Тот же приём, что
+    у генерации (`planner.plan_items`): последовательно медленнее, но держит в
+    памяти один файл, а не все сразу, и ничего не теряет. Если не хватит и
+    так — наружу выйдет уже настоящая ошибка конкретного файла.
+    """
+    if not warned:
+        warned.append(True)
+        print(
+            "  ! параллельное чтение не удалось (рабочий процесс убит, обычно это нехватка памяти) — "
+            "дочитываю оставшиеся файлы последовательно",
+            file=sys.stderr,
+        )
+
+
+
 def _read_one_bundle_file(
     path: Path,
     layer_map: LayerMap | None,
@@ -1171,7 +1297,7 @@ def read_dxf_bundle(
     zones: list[Zone] = []
 
     if len(paths) > 1:
-        worker_count = _bundle_pool_worker_count(len(paths))
+        worker_count = _read_pool_worker_count([Path(p) for p in paths])
         # Largest files first: a size-descending submission queue is greedy
         # LPT scheduling at runtime (the pool hands the next queued task to
         # whichever worker frees up first), so the file that would otherwise
@@ -1181,6 +1307,7 @@ def read_dxf_bundle(
         # documented "same order paths was given" guarantee is unaffected by
         # how submission was scheduled.
         ordered = sorted(paths, key=lambda p: p.stat().st_size, reverse=True)
+        pool_broken: list[bool] = []
         with ProcessPoolExecutor(max_workers=worker_count) as pool:
             future_by_path = {
                 path: pool.submit(
@@ -1198,7 +1325,15 @@ def read_dxf_bundle(
             for path in paths:  # canonical order, not dispatch order
                 future = future_by_path[path]
                 try:
-                    file_utilities, file_zones, entity_count = future.result()
+                    try:
+                        file_utilities, file_zones, entity_count = future.result()
+                    except BrokenProcessPool:
+                        # См. `_warn_pool_broken`: дочитать здесь, а не терять файл.
+                        _warn_pool_broken(pool_broken)
+                        file_utilities, file_zones, entity_count = _read_one_bundle_file(
+                            Path(path), layer_map, explode_blocks, symbol_layers, drop_origin,
+                            use_layer_rules, reconstruct_footprints,
+                        )
                 except Exception as error:  # noqa: BLE001 — судьбу решает вызывающий
                     if on_error is None:
                         raise
@@ -1465,8 +1600,11 @@ def resolve_and_read_bundle(
     converted_main = convert_if_needed(main)  # hard failure, same as resolve_bundle_inputs
     others = [p for p in all_members if p != main]
 
+    read_target: dict[Future, Path] = {}
+    pool_broken: list[bool] = []
+
     def submit_read(pool: ProcessPoolExecutor, dxf_path: Path) -> Future:
-        return pool.submit(
+        future = pool.submit(
             _read_one_bundle_file,
             dxf_path,
             layer_map,
@@ -1476,11 +1614,13 @@ def resolve_and_read_bundle(
             use_layer_rules,
             reconstruct_footprints,
         )
+        read_target[future] = dxf_path
+        return future
 
     utilities: list[Utility] = []
     zones: list[Zone] = []
 
-    with ProcessPoolExecutor(max_workers=_bundle_pool_worker_count(len(all_members))) as read_pool:
+    with ProcessPoolExecutor(max_workers=_read_pool_worker_count(all_members)) as read_pool:
         # The main file needs no waiting -- already converted above -- so its
         # read starts immediately, overlapped with every other file below
         # instead of just being "first in line" the way the old sequential
@@ -1521,7 +1661,14 @@ def resolve_and_read_bundle(
                     on_progress(index, total)
                 continue  # conversion failed and was already warned about above
             try:
-                file_utilities, file_zones, _entity_count = future.result()
+                try:
+                    file_utilities, file_zones, _entity_count = future.result()
+                except BrokenProcessPool:
+                    _warn_pool_broken(pool_broken)
+                    file_utilities, file_zones, _entity_count = _read_one_bundle_file(
+                        read_target[future], layer_map, explode_blocks, symbol_layers, drop_origin,
+                        use_layer_rules, reconstruct_footprints,
+                    )
             except Exception as error:  # noqa: BLE001 — судьбу решает вызывающий
                 if on_error is None:
                     raise

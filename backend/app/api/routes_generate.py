@@ -39,6 +39,7 @@ async def _run_generate_job(
     scoring_mode: str,
     tree_spacing_m: float | None,
     shrub_spacing_m: float | None,
+    tree_rows: int = 1,
 ) -> None:
     """Runs on the event loop after POST /generate has already returned."""
     try:
@@ -49,6 +50,7 @@ async def _run_generate_job(
             scoring_mode=scoring_mode,
             tree_spacing_m=tree_spacing_m,
             shrub_spacing_m=shrub_spacing_m,
+            tree_rows=tree_rows,
             on_progress=lambda ptype, done, total: generation_jobs.update_progress(job_id, ptype, done, total),
         )
         generation_jobs.mark_done(job_id, plan.id)
@@ -71,7 +73,13 @@ async def generate(request: GenerateRequest, project: ProjectDep) -> GenerateJob
     job_id = generation_jobs.create_job()
     task = asyncio.create_task(
         _run_generate_job(
-            job_id, project.id, request.planting_types, request.scoring_mode, request.tree_spacing_m, request.shrub_spacing_m
+            job_id,
+            project.id,
+            request.planting_types,
+            request.scoring_mode,
+            request.tree_spacing_m,
+            request.shrub_spacing_m,
+            request.tree_rows,
         )
     )
     _background_tasks.add(task)

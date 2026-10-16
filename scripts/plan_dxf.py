@@ -18,6 +18,7 @@ import argparse
 import json
 import sys
 import tempfile
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -43,6 +44,29 @@ from ml_scoring.heuristic_scorer import HeuristicScorer
 from ml_scoring.ml_scorer import MLScorer, ModelNotTrainedError
 
 PLANTING_TYPES = ("tree", "shrub", "lawn")
+
+
+class _StageClock:
+    """Печатает, сколько занял предыдущий этап, когда начинается следующий.
+
+    Нужно и для разбора, где на конкретной улице уходит время, и тому, кто
+    запускает CLI: прогон крупной улицы идёт минутами, и строка без времени
+    не говорит, на чём он стоит.
+    """
+
+    def __init__(self) -> None:
+        self._started: float | None = None
+        self.total_started = time.perf_counter()
+
+    def begin(self, line: str) -> None:
+        self.finish()
+        print(line)
+        self._started = time.perf_counter()
+
+    def finish(self) -> None:
+        if self._started is not None:
+            print(f"     время этапа: {time.perf_counter() - self._started:.1f} с")
+            self._started = None
 
 
 def resolve_inputs(source: Path, workdir: Path) -> tuple[Path, list[Path]]:
@@ -183,6 +207,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Схема расстановки: auto — ряд вдоль проездов/тротуаров/границы участка плюс россыпь "
         "в остатке (по умолчанию); scatter — только россыпь; row — только ряды",
     )
+    parser.add_argument(
+        "--tree-rows",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="Деревья вдоль улиц: 1 — однорядная аллея (по умолчанию), 2 — двухрядная "
+        "в шахматном порядке (743-ПП табл. 3.6.2, интервал 7-8 м)",
+    )
     return parser
 
 
@@ -270,9 +302,10 @@ def main(argv: list[str] | None = None) -> int:
         norms = norms.with_spacing_override("shrub", args.shrub_spacing)
         keep_spacing_for.append("shrub")
 
+    clock = _StageClock()
     with tempfile.TemporaryDirectory(prefix="greenplan-") as tmp:
         workdir = Path(tmp)
-        print(f"1/5 Чтение чертежа: {args.input}")
+        clock.begin(f"1/5 Чтение чертежа: {args.input}")
         main_drawing, bundle = resolve_inputs(args.input, workdir)
         print(f"     файлов в бандле: {len(bundle)}")
 
@@ -309,7 +342,7 @@ def main(argv: list[str] | None = None) -> int:
             territory = territory_polygon(zones, utilities)
         except MissingTerritoryError as error:
             raise SystemExit(f"\nОШИБКА: {error}") from error
-        print(f"2/5 Граница участка: {territory.geom_type}, площадь {territory.area:,.0f} м²".replace(",", " "))
+        clock.begin(f"2/5 Граница участка: {territory.geom_type}, площадь {territory.area:,.0f} м²".replace(",", " "))
         if unreadable:
             # Found live, «10. Старый Гай ул»: the file carrying the real
             # boundary failed to parse (DXFStructureError), a different,
@@ -340,7 +373,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             scorer = HeuristicScorer(norms, existing_greenery=existing_greenery)
 
-        print(f"3/5 Генерация ({args.scoring}, схема: {args.pattern}, типы: {', '.join(planting_types)})...")
+        clock.begin(f"3/5 Генерация ({args.scoring}, схема: {args.pattern}, типы: {', '.join(planting_types)})...")
         items = plan_items(
             args.plan_key,
             utilities,
@@ -353,6 +386,7 @@ def main(argv: list[str] | None = None) -> int:
             species_overrides=species_overrides,
             pattern=args.pattern,
             density_per_ha=densities,
+            tree_rows=args.tree_rows,
         )
         counts = Counter(i.planting_type for i in items)
         print(f"     посадок: {len(items)} ({', '.join(f'{k}: {v}' for k, v in counts.most_common())})")
@@ -389,14 +423,14 @@ def main(argv: list[str] | None = None) -> int:
                     note = f"интервал {norms.spacing_for(planting_type).min_distance_m} м из planting_norms.yaml"
                 print(f"        «{species_name}» — {count}, крона {picked.crown}, {note}")
 
-        print("4/5 Проверка нормативных отступов и сборка обоснований...")
+        clock.begin("4/5 Проверка нормативных отступов и сборка обоснований...")
         records = explain_items(items, utilities, zones, norms)
         violations = [r for r in records if not r.compliant]
         print(f"     соблюдено: {len(records) - len(violations)} из {len(records)}")
         if violations:
             print(f"     ВНИМАНИЕ: нарушений {len(violations)} — см. отчёт")
 
-        print(f"5/5 Запись результата на слои {args.prefix}$*")
+        clock.begin(f"5/5 Запись результата на слои {args.prefix}$*")
         args.output.parent.mkdir(parents=True, exist_ok=True)
         base = pick_base_drawing(entity_counts, main_drawing)
         if base is None:
@@ -439,7 +473,8 @@ def main(argv: list[str] | None = None) -> int:
         rows = write_trace_csv(records, csv_path)
         csv_line = f"\n  CSV:   {csv_path} ({rows} строк трассировки)"
 
-    print(f"\nГотово.\n  DXF:   {args.output}\n  отчёт: {report_path}{csv_line}")
+    clock.finish()
+    print(f"\nГотово за {time.perf_counter() - clock.total_started:.1f} с.\n  DXF:   {args.output}\n  отчёт: {report_path}{csv_line}")
     if unverified:
         print("\nНесверенные ссылки на нормативы (значение применено, но с текстом акта не сверялось):")
         for citation, count in sorted(unverified.items(), key=lambda kv: -kv[1]):

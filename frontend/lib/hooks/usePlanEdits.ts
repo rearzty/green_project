@@ -61,6 +61,10 @@ export function usePlanEdits(
   setSelection: (ids: string[]) => void
 ) {
   const [violations, setViolations] = useState<ValidationViolation[] | null>(null);
+  // Read from revalidateTouched, which runs after an await -- the closure's
+  // own `violations` would be the render's snapshot, not the latest.
+  const violationsRef = useRef(violations);
+  violationsRef.current = violations;
   const [validating, setValidating] = useState(false);
   const [editBusy, setEditBusy] = useState(false);
   const editBusyRef = useRef(false);
@@ -123,8 +127,13 @@ export function usePlanEdits(
   async function revalidateTouched(projectId: string, forPlanId: string, ids: string[]) {
     if (ids.length === 0) return;
     try {
-      const { violations: fresh } = await validateItems(projectId, forPlanId, ids);
-      if (planIdRef.current === forPlanId) setViolations((prev) => mergeViolations(prev, ids, fresh));
+      // Already-flagged items go along too: a tree flagged for being too close
+      // to one that has just moved away isn't among `ids`, and without a
+      // recheck its stale highlight would stay forever.
+      const flagged = (violationsRef.current ?? []).map((v) => v.item_id);
+      const request = Array.from(new Set([...ids, ...flagged]));
+      const { violations: fresh, checked_ids } = await validateItems(projectId, forPlanId, request);
+      if (planIdRef.current === forPlanId) setViolations((prev) => mergeViolations(prev, checked_ids ?? request, fresh));
     } catch (e) {
       toast.error(`Не удалось проверить нормативы: ${errorMessage(e)}`);
     }

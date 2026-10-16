@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
 
 from backend.app.api.deps import ProjectDep, ProjectMetaDep
 from backend.app.schemas.geo import GeoJSONFeatureCollection
@@ -21,6 +22,7 @@ from backend.app.services import project_jobs
 from backend.app.services.geo_io import display_crs, layers_to_feature_collection
 from backend.app.services.layer_raster import get_layer_raster
 from backend.app.services.project_service import UnsupportedFileTypeError, create_project_from_file
+from backend.app.services.scene3d_service import scene_layers
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 logger = logging.getLogger(__name__)
@@ -104,6 +106,7 @@ async def get_project(project: ProjectMetaDep) -> ProjectOut:
         source_crs=project.source_crs,
         crs_verified=project.crs_verified,
         created_at=project.created_at,
+        warnings=project.warnings,
     )
 
 
@@ -113,7 +116,14 @@ async def get_project_layers(project: ProjectDep) -> GeoJSONFeatureCollection:
     own lazy endpoint, fetched only by the 3D view (see ProjectOut's own
     docstring for why: on a real-scale project this is a genuinely slow,
     genuinely large response, and most sessions never open 3D at all)."""
-    return layers_to_feature_collection(project.layers, display_crs(project))
+    return await run_in_threadpool(layers_to_feature_collection, project.layers, display_crs(project))
+
+
+@router.get("/{project_id}/layers-3d", response_model=GeoJSONFeatureCollection)
+async def get_project_layers_3d(project: ProjectDep) -> GeoJSONFeatureCollection:
+    """Только то, что рисует 3D-сцена, и только вокруг участка — см.
+    scene3d_service.py, почему полный /layers для 3D не годился."""
+    return await run_in_threadpool(scene_layers, project)
 
 
 @router.get("/{project_id}/layers-raster", response_model=LayersRasterOut)

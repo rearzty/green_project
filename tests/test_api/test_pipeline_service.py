@@ -60,6 +60,13 @@ class TestFindReusablePlanWithSpacing:
         result = _find_reusable_plan(project, "heuristic", ["tree", "shrub"], 8.0, None)
         assert result is None
 
+    def test_does_not_reuse_when_the_number_of_tree_rows_differs(self):
+        """Двухрядная аллея — часть рецепта: переключение галочки при тех же
+        интервалах не должно молча вернуть однорядный план."""
+        project = _project_with(_plan())
+        assert _find_reusable_plan(project, "heuristic", ["tree", "shrub"], None, None, tree_rows=2) is None
+        assert _find_reusable_plan(project, "heuristic", ["tree", "shrub"], None, None, tree_rows=1) is project.plans[0]
+
     def test_does_not_reuse_when_shrub_spacing_differs(self):
         project = _project_with(_plan(shrub_spacing_m=3.0))
         result = _find_reusable_plan(project, "heuristic", ["tree", "shrub"], None, 4.0)

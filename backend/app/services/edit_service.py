@@ -8,8 +8,11 @@ them to the designer as-is in its toast notifications.
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 import shapely
+from shapely import STRtree
 from shapely.affinity import translate
 from shapely.geometry import Point, shape
 from shapely.geometry.base import BaseGeometry
@@ -17,6 +20,8 @@ from shapely.geometry.base import BaseGeometry
 from backend.app.db.models import Plan, PlantingItemRow, Project
 from backend.app.services import exclusion_cache
 from backend.app.services.geo_io import db_to_shape, from_wgs84, planting_items_to_geojson_dicts, shape_to_db
+from geo_engine.compliance import SPACING_CHECKED_TYPES
+from geo_engine.species import SpeciesCatalogue, load_catalogue
 
 _POINT_PLANTING_TYPES = {"tree", "shrub"}
 _POLYGON_PLANTING_TYPES = {"lawn"}
@@ -303,14 +308,19 @@ def violation_mask(geometries: list[BaseGeometry], exclusion: BaseGeometry | Non
 
 
 def _check_violations(project: Project, items: list[PlantingItemRow]) -> list[dict]:
-    by_type: dict[str, list[PlantingItemRow]] = {}
+    # По (тип, порода), а не только по типу: у деревьев отступ зависит от
+    # породы (см. exclusion_cache._species_key) — и в одном плане их бывает
+    # несколько (ряд одной породой, россыпь другой).
+    by_type: dict[tuple[str, str | None], list[PlantingItemRow]] = {}
     for item in items:
-        by_type.setdefault(item.planting_type, []).append(item)
+        by_type.setdefault((item.planting_type, item.species), []).append(item)
 
     violations: list[dict] = []
-    for planting_type, type_items in by_type.items():
+    for (planting_type, species), type_items in by_type.items():
         geometries = [db_to_shape(item.geometry) for item in type_items]
-        mask = exclusion_cache.with_exclusion_zone(project, planting_type, lambda zone: violation_mask(geometries, zone))
+        mask = exclusion_cache.with_exclusion_zone(
+            project, planting_type, lambda zone: violation_mask(geometries, zone), species=species
+        )
         label = _PLANTING_TYPE_LABELS.get(planting_type, planting_type)
         violations.extend(
             {"item_id": item.id, "message": f"{label}: нарушен норматив отступа от сетей или зданий."}
@@ -318,6 +328,77 @@ def _check_violations(project: Project, items: list[PlantingItemRow]) -> list[di
             if violated
         )
     return violations
+
+
+# Тот же допуск, что у geo_engine.compliance: веб и отчёт обоснований не
+# должны расходиться в вердикте на одной и той же паре деревьев.
+_SPACING_TOLERANCE_M = 1e-3
+
+
+@lru_cache(maxsize=1)
+def _catalogue() -> SpeciesCatalogue:
+    return load_catalogue()
+
+
+def _crown_interval(catalogue: SpeciesCatalogue, species: str | None) -> float | None:
+    found = catalogue.get(species)
+    return catalogue.spacing_for_crown(found.crown) if found is not None else None
+
+
+def _spacing_violations(plan: Plan, ids: list[str] | None) -> tuple[list[dict], set[str]]:
+    """Интервал между стволами соседних деревьев (МГСН 1.02-02 п. 4.2.9.2).
+
+    Та же семантика, что `geo_engine.compliance._neighbour_checks` — до
+    ближайшего соседа, требуется больший из интервалов двух пород, — чтобы
+    подсветка на карте и отчёт обоснований никогда не расходились. Раньше веб
+    этого не проверял вовсе: два дерева, сдвинутые руками вплотную, на карте
+    выглядели законными.
+
+    Вторым значением — чьи вердикты пересчитаны. При точечной проверке это не
+    только сами `ids`: у дерева рядом с перенесённым мог смениться ближайший
+    сосед, и его подсветку тоже надо обновить — поэтому в пересчёт идут все
+    деревья в пределах наибольшего интервала каталога от тронутых.
+    """
+    trees = [item for item in plan.items if item.planting_type in SPACING_CHECKED_TYPES]
+    if len(trees) < 2:
+        return [], set(ids or ())
+    catalogue = _catalogue()
+    geometries = np.empty(len(trees), dtype=object)
+    geometries[:] = [db_to_shape(item.geometry) for item in trees]
+    index = STRtree(geometries)
+
+    if ids is None:
+        check = np.arange(len(trees))
+    else:
+        wanted = set(ids)
+        seed = [k for k, item in enumerate(trees) if item.id in wanted]
+        if not seed:
+            return [], wanted
+        reach = max((v for v in catalogue.crown_spacing_m.values() if v), default=0.0)
+        near = index.query(geometries[seed], predicate="dwithin", distance=reach)
+        check = np.unique(np.concatenate([np.array(seed), near[1]]))
+
+    pairs, distances = index.query_nearest(geometries[check], exclusive=True, all_matches=False, return_distance=True)
+    violations: list[dict] = []
+    for local, neighbour, distance in zip(pairs[0], pairs[1], distances):
+        own = trees[int(check[int(local)])]
+        other = trees[int(neighbour)]
+        known = [v for v in (_crown_interval(catalogue, own.species), _crown_interval(catalogue, other.species)) if v]
+        if not known:
+            continue
+        required = max(known)
+        if float(distance) + _SPACING_TOLERANCE_M < required:
+            violations.append(
+                {
+                    "item_id": own.id,
+                    "message": (
+                        f"Дерево: до соседнего дерева {float(distance):.2f} м при интервале {required:.1f} м "
+                        "(МГСН 1.02-02 п. 4.2.9.2)."
+                    ),
+                }
+            )
+    checked = {trees[int(k)].id for k in check}
+    return violations, checked | set(ids or ())
 
 
 def validate_plan(project: Project, plan: Plan) -> list[dict]:
@@ -328,7 +409,18 @@ def validate_plan(project: Project, plan: Plan) -> list[dict]:
     edit. Zones come from exclusion_cache, so repeated calls don't rebuild
     them.
     """
-    return _check_violations(project, plan.items)
+    spacing, _ = _spacing_violations(plan, None)
+    return _check_violations(project, plan.items) + spacing
+
+
+def validate_items_scoped(project: Project, plan: Plan, ids: list[str]) -> tuple[list[dict], list[str]]:
+    """`validate_items` плюс список id, чьи вердикты пересчитаны (тронутые и
+    их соседи по интервалу) — фронт заменяет подсветку именно у них, см.
+    `_spacing_violations`."""
+    wanted = set(ids)
+    setback = _check_violations(project, [item for item in plan.items if item.id in wanted])
+    spacing, checked = _spacing_violations(plan, ids)
+    return setback + spacing, sorted(checked)
 
 
 def validate_items(project: Project, plan: Plan, ids: list[str]) -> list[dict]:
@@ -341,6 +433,9 @@ def validate_items(project: Project, plan: Plan, ids: list[str]) -> list[dict]:
     its own violation set by id -- avoids a full plan's worth of checks
     (cheap per item thanks to exclusion_cache, but still linear in plan size)
     on every single edit.
+
+    Интервал между деревьями — исключение из «только тронутые»: он зависит
+    от соседей, поэтому может вернуть нарушение и у соседа тронутого дерева
+    (см. `validate_items_scoped`).
     """
-    wanted = set(ids)
-    return _check_violations(project, [item for item in plan.items if item.id in wanted])
+    return validate_items_scoped(project, plan, ids)[0]

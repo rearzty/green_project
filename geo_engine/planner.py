@@ -27,6 +27,7 @@ from geo_engine.candidates import ExclusionIndex, ZoningIndex, generate_candidat
 from geo_engine.model import PlantingItem, Utility, Zone
 from geo_engine.norms import PlantingNorms
 from geo_engine.patterns import (
+    DOUBLE_ROW_PITCH_M,
     GROUP_PITCH_M,
     GROUP_PLANTING_TYPES,
     GROUP_RADIUS_M,
@@ -171,6 +172,7 @@ def _fit_row_species(
     keep_spacing_for: Collection[str],
     catalogue: SpeciesCatalogue,
     row_pitch_override_m: float | None = None,
+    tree_rows: int = 1,
 ):
     """Выбрать из палитры породу, которой на этой площадке реально есть место.
 
@@ -229,8 +231,17 @@ def _fit_row_species(
             type_norms = norms_for_species(norms, planting_type, candidate_species, catalogue)
         if row_pitch_override_m is not None and planting_type not in keep_spacing_for:
             type_norms = type_norms.with_spacing_override(planting_type, row_pitch_override_m)
+        row_count = tree_rows if planting_type == "tree" else 1
+        if row_count >= 2 and planting_type not in keep_spacing_for:
+            # Интервал двухрядной посадки — на весь отбор, а не только на шаг
+            # точек вдоль линии: greedy_select держит расстояние по радиусу
+            # кроны из норм, и с прежними 5 м (средняя крона) пропускал
+            # соседей из разных рядов в 5 м друг от друга при норме 7.
+            interval = type_norms.spacing_for(planting_type).min_distance_m
+            type_norms = type_norms.with_spacing_override(planting_type, max(interval, DOUBLE_ROW_PITCH_M))
         exclusion = build_exclusion_zone(
-            utilities, zones, planting_type, type_norms, candidate_species, catalogue.crown_reference_diameter_m
+            utilities, zones, planting_type, type_norms, candidate_species, catalogue.crown_reference_diameter_m,
+            clip_to=territory,
         )
         buildable = buildable_area(
             territory, exclusion, zones, territory_margin_m=type_norms.territory_margin_for(planting_type)
@@ -241,13 +252,17 @@ def _fit_row_species(
         boundary = territory_guide(territory, planting_type, type_norms)
         if boundary is not None:
             guides.append(boundary)
+        pitch = type_norms.spacing_for(planting_type).min_distance_m
+        if row_count >= 2:
+            pitch = max(pitch, DOUBLE_ROW_PITCH_M)
         rows = row_candidates(
             guides,
             buildable,
             exclusion,
             planting_type,
-            type_norms.spacing_for(planting_type).min_distance_m,
+            pitch,
             zoning_zones=zones,
+            rows=row_count,
         )
         if best is None or len(rows) > len(best[2]):
             best = (candidate_species, type_norms, rows, guides, exclusion, buildable)
@@ -460,6 +475,7 @@ def _plan_type_items(
     pattern: str,
     density_per_ha: float | None,
     catalogue: SpeciesCatalogue,
+    tree_rows: int = 1,
 ) -> list[PlantingItem]:
     """Полная генерация одного типа посадки: палитра пород -> ряд вдоль
     ориентиров -> куртины -> россыпь в остатке -> ограничение по плотности.
@@ -523,6 +539,7 @@ def _plan_type_items(
             keep_spacing_for,
             catalogue,
             row_pitch_override_m=IN_ROW_PITCH_M.get(planting_type),
+            tree_rows=tree_rows,
         )
         spacing = type_norms.spacing_for(planting_type)
         # НЕ пересчитывается заново: `_fit_row_species` уже вернула
@@ -555,6 +572,7 @@ def _plan_type_items(
             type_norms,
             species,
             catalogue.crown_reference_diameter_m,
+            clip_to=territory,
         )
         margin = type_norms.territory_margin_for(planting_type)
         buildable = buildable_area(territory, exclusion, zones, territory_margin_m=margin)
@@ -661,7 +679,7 @@ def _plan_type_items(
                 loose_norms = norms_for_species(norms, planting_type, loose_species, catalogue)
             loose_exclusion = build_exclusion_zone(
                 utilities, zones, planting_type, loose_norms, loose_species,
-                catalogue.crown_reference_diameter_m,
+                catalogue.crown_reference_diameter_m, clip_to=territory,
             )
             loose_buildable = buildable_area(
                 territory, loose_exclusion, zones,
@@ -747,8 +765,12 @@ def plan_items(
     density_per_ha: dict[str, float] | None = None,
     catalogue: SpeciesCatalogue | None = None,
     on_progress: Callable[[str, int, int], None] | None = None,
+    tree_rows: int = 1,
 ) -> list[PlantingItem]:
     """Сгенерировать посадки для одного плана.
+
+    `tree_rows=2` — деревья вдоль улиц двухрядной аллеей (743-ПП табл. 3.6.2),
+    см. `patterns.row_candidates`. По умолчанию однорядная, как и было.
 
     `on_progress`, when given, is called `(planting_type, types_done,
     types_total)` once per finished type -- in `planting_types` submission
@@ -833,6 +855,7 @@ def plan_items(
                         pattern,
                         density_per_ha.get(planting_type),
                         catalogue,
+                        tree_rows,
                     )
                     for planting_type in planting_types
                 ]
@@ -879,6 +902,7 @@ def plan_items(
                 pattern,
                 density_per_ha.get(planting_type),
                 catalogue,
+                tree_rows,
             )
         )
         if on_progress is not None:
