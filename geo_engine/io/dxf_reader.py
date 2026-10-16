@@ -27,6 +27,7 @@ import math
 import os
 import sys
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from collections.abc import Callable
 from typing import Iterable, Iterator, Literal
@@ -1108,6 +1109,27 @@ def resolve_bundle_inputs(
     return converted_main, [converted_main, *convert_each(others)], warnings
 
 
+def _warn_pool_broken(warned: list[bool]) -> None:
+    """Пул чтения развалился — дочитываем в этом процессе, по одному файлу.
+
+    Живой случай, «3. 3-я Парковая»: при нехватке памяти ядро убивает
+    рабочий процесс, и `BrokenProcessPool` приходит на ВСЕ ещё не собранные
+    файлы разом. Раньше каждый уходил в `on_error` как «не прочитан» — в том
+    числе главный чертёж, и план тихо строился по остаткам. Тот же приём, что
+    у генерации (`planner.plan_items`): последовательно медленнее, но держит в
+    памяти один файл, а не все сразу, и ничего не теряет. Если не хватит и
+    так — наружу выйдет уже настоящая ошибка конкретного файла.
+    """
+    if not warned:
+        warned.append(True)
+        print(
+            "  ! параллельное чтение не удалось (рабочий процесс убит, обычно это нехватка памяти) — "
+            "дочитываю оставшиеся файлы последовательно",
+            file=sys.stderr,
+        )
+
+
+
 def _read_one_bundle_file(
     path: Path,
     layer_map: LayerMap | None,
@@ -1214,6 +1236,7 @@ def read_dxf_bundle(
         # documented "same order paths was given" guarantee is unaffected by
         # how submission was scheduled.
         ordered = sorted(paths, key=lambda p: p.stat().st_size, reverse=True)
+        pool_broken: list[bool] = []
         with ProcessPoolExecutor(max_workers=worker_count) as pool:
             future_by_path = {
                 path: pool.submit(
@@ -1231,7 +1254,15 @@ def read_dxf_bundle(
             for path in paths:  # canonical order, not dispatch order
                 future = future_by_path[path]
                 try:
-                    file_utilities, file_zones, entity_count = future.result()
+                    try:
+                        file_utilities, file_zones, entity_count = future.result()
+                    except BrokenProcessPool:
+                        # См. `_warn_pool_broken`: дочитать здесь, а не терять файл.
+                        _warn_pool_broken(pool_broken)
+                        file_utilities, file_zones, entity_count = _read_one_bundle_file(
+                            Path(path), layer_map, explode_blocks, symbol_layers, drop_origin,
+                            use_layer_rules, reconstruct_footprints,
+                        )
                 except Exception as error:  # noqa: BLE001 — судьбу решает вызывающий
                     if on_error is None:
                         raise
@@ -1498,8 +1529,11 @@ def resolve_and_read_bundle(
     converted_main = convert_if_needed(main)  # hard failure, same as resolve_bundle_inputs
     others = [p for p in all_members if p != main]
 
+    read_target: dict[Future, Path] = {}
+    pool_broken: list[bool] = []
+
     def submit_read(pool: ProcessPoolExecutor, dxf_path: Path) -> Future:
-        return pool.submit(
+        future = pool.submit(
             _read_one_bundle_file,
             dxf_path,
             layer_map,
@@ -1509,6 +1543,8 @@ def resolve_and_read_bundle(
             use_layer_rules,
             reconstruct_footprints,
         )
+        read_target[future] = dxf_path
+        return future
 
     utilities: list[Utility] = []
     zones: list[Zone] = []
@@ -1554,7 +1590,14 @@ def resolve_and_read_bundle(
                     on_progress(index, total)
                 continue  # conversion failed and was already warned about above
             try:
-                file_utilities, file_zones, _entity_count = future.result()
+                try:
+                    file_utilities, file_zones, _entity_count = future.result()
+                except BrokenProcessPool:
+                    _warn_pool_broken(pool_broken)
+                    file_utilities, file_zones, _entity_count = _read_one_bundle_file(
+                        read_target[future], layer_map, explode_blocks, symbol_layers, drop_origin,
+                        use_layer_rules, reconstruct_footprints,
+                    )
             except Exception as error:  # noqa: BLE001 — судьбу решает вызывающий
                 if on_error is None:
                     raise
