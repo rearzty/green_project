@@ -58,6 +58,7 @@ CROWN_SCALABLE_SOURCES = frozenset({"sp42_t9_1", "ppm_743_t3_6_1"})
 # помещения, — не ближе 10 м от здания (вместо табличных 5).
 SHADING_TREE_BUILDING_MIN_M = 10.0
 SHADING_SOURCE_ID = "ppm_743_t3_6_1_note3"
+POWER_LINE_SOURCE_ID = "pue_2_5_207"
 
 # МГСН 1.02-02, п. 4.2.8: поимённый отступ от теплотрассы.
 HEAT_NETWORK_SPECIES_SOURCE_ID = "mgsn_1_02_02_4_2_8"
@@ -166,6 +167,14 @@ class PlantingNorms(BaseModel):
                         f"в {multiplier:.2f} раза"
                     )
 
+            if utility_type == "power_line_corridor" and source_id == POWER_LINE_SOURCE_ID:
+                # ПУЭ табл. 2.5.21 нормирует расстояние от провода до КРОНЫ,
+                # а не до ствола: к табличному значению добавляется радиус
+                # кроны породы. Это не масштабирование прим. 1 к табл. 9.1, а
+                # сама формулировка нормы, поэтому применяется всегда.
+                required_m = table_m + species.crown_diameter_m / 2
+                species_rule = f"до кроны {table_m:g} м + радиус кроны {species.crown_diameter_m / 2:g} м"
+
             if utility_type == "heat_network" and species.heat_network_min_m:
                 if species.heat_network_min_m > required_m:
                     required_m = species.heat_network_min_m
@@ -182,6 +191,12 @@ class PlantingNorms(BaseModel):
                         f"должны сажаться не ближе 10 м от здания»; порода «{species.name}»"
                     )
                     species_rule = "широкая крона, затеняющая жилые помещения"
+
+        elif planting_type == "tree" and utility_type == "power_line_corridor" and source_id == POWER_LINE_SOURCE_ID:
+            # Порода не известна — радиус кроны по опорному диаметру из
+            # примечания 1 к табл. 9.1 (5 м), а не ноль: норма про крону.
+            required_m = table_m + crown_reference_diameter_m / 2
+            species_rule = f"до кроны {table_m:g} м + радиус опорной кроны {crown_reference_diameter_m / 2:g} м"
 
         return SetbackResolution(
             required_m=required_m,
