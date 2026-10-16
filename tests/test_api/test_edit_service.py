@@ -486,3 +486,46 @@ def test_web_validation_uses_the_species_setback_the_generator_used():
 
     assert "oak" in violated
     assert "birch" not in violated
+
+
+class TestTreeSpacingInWebValidation:
+    """Интервал между стволами (МГСН 1.02-02 п. 4.2.9.2) — тем же правилом,
+    что отчёт обоснований: до ближайшего соседа, больший из двух интервалов."""
+
+    def _plan(self, positions):
+        plan = _plan_with_territory(BIG_TERRITORY)
+        plan.project.id = "spacing-project"
+        plan.items = [
+            PlantingItemRow(id=name, plan_id=plan.id, geometry=shape_to_db(Point(*xy)), planting_type="tree",
+                            species="Дуб черешчатый", score=0.5, rationale="")
+            for name, xy in positions.items()
+        ]
+        return plan
+
+    def test_two_oaks_three_metres_apart_are_both_flagged(self):
+        from backend.app.services.edit_service import validate_plan
+
+        plan = self._plan({"a": (50, 50), "b": (53, 50), "far": (90, 90)})
+        flagged = {v["item_id"] for v in validate_plan(plan.project, plan) if "соседнего дерева" in v["message"]}
+        assert flagged == {"a", "b"}
+
+    def test_moving_one_away_clears_its_former_neighbour_too(self):
+        from backend.app.services.edit_service import validate_items_scoped
+
+        plan = self._plan({"a": (50, 50), "b": (53, 50), "far": (90, 90)})
+        plan.items[1].geometry = shape_to_db(Point(20, 20))  # «b» уехал
+        # Фронт шлёт тронутое и уже подсвеченное: «a» подсвечен с прошлого раза.
+        violations, checked = validate_items_scoped(plan.project, plan, ["b", "a"])
+
+        assert not [v for v in violations if "соседнего дерева" in v["message"]]
+        assert {"a", "b"} <= set(checked)
+
+    def test_a_neighbour_of_the_moved_tree_is_rechecked(self):
+        from backend.app.services.edit_service import validate_items_scoped
+
+        plan = self._plan({"a": (50, 50), "b": (20, 20), "far": (90, 90)})
+        plan.items[1].geometry = shape_to_db(Point(52, 50))  # «b» подъехал к «a»
+        violations, checked = validate_items_scoped(plan.project, plan, ["b"])
+
+        assert {v["item_id"] for v in violations if "соседнего дерева" in v["message"]} == {"a", "b"}
+        assert "a" in checked
