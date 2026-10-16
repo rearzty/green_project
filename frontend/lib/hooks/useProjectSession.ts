@@ -220,7 +220,7 @@ export function useProjectSession() {
   async function handleGenerate(
     plantingTypes: PlantingType[],
     scoringMode: ScoringMode,
-    spacing?: { treeSpacingM?: number; shrubSpacingM?: number }
+    spacing?: { treeSpacingM?: number; shrubSpacingM?: number; treeRows?: number }
   ) {
     if (!project) return;
     setGenerating(true);

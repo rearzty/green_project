@@ -51,6 +51,7 @@ class ProjectOut(BaseModel):
     # decide whether a real OpenStreetMap basemap under the plan is honest.
     crs_verified: bool
     created_at: datetime
+    warnings: list[str] = []
 
 
 class LayersRasterGroupOut(BaseModel):

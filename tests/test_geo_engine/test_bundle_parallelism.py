@@ -275,3 +275,118 @@ class TestResolveAndReadBundleOverlap:
         assert all(total == 2 for _done, total in calls), "total must not change mid-run"
         dones = [done for done, _total in calls]
         assert dones == sorted(dones), "done count must never go backwards"
+
+
+class _BrokenPool:
+    """Пул, у которого рабочий процесс «убит»: каждая задача падает так же,
+    как при нехватке памяти на реальной улице («3. 3-я Парковая»)."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def submit(self, *args, **kwargs):
+        from concurrent.futures import Future
+        from concurrent.futures.process import BrokenProcessPool
+
+        future = Future()
+        future.set_exception(BrokenProcessPool("A process in the process pool was terminated abruptly"))
+        return future
+
+
+def test_a_broken_read_pool_reads_the_rest_sequentially_instead_of_dropping_files(tmp_path, monkeypatch, capsys):
+    import ezdxf
+
+    from geo_engine.io import dxf_reader
+
+    paths = []
+    for name, layer, points in (
+        ("a.dxf", "Газопровод", [(0, 0), (50, 0)]),
+        ("b.dxf", "!Граница работ", [(0, 0), (60, 0), (60, 40), (0, 40)]),
+    ):
+        doc = ezdxf.new(setup=True)
+        doc.layers.add(name=layer)
+        doc.modelspace().add_lwpolyline(points, close=len(points) > 2, dxfattribs={"layer": layer})
+        doc.saveas(str(tmp_path / name))
+        paths.append(tmp_path / name)
+
+    monkeypatch.setattr(dxf_reader, "ProcessPoolExecutor", _BrokenPool)
+    errors = []
+    utilities, zones = dxf_reader.read_dxf_bundle(
+        paths, layer_map=dxf_reader.COMBINED_LAYER_MAP, on_error=lambda p, e: errors.append(p)
+    )
+
+    assert errors == []
+    assert any(u.object_type == "gas_pipe" for u in utilities)
+    assert any(z.zone_type == "territory" for z in zones)
+    assert "последовательно" in capsys.readouterr().err
+
+
+def test_the_web_read_path_also_survives_a_broken_pool(tmp_path, monkeypatch):
+    import ezdxf
+
+    from geo_engine.io import dxf_reader
+
+    site = tmp_path / "site"
+    (site / "Xrefs").mkdir(parents=True)
+    main_doc = ezdxf.new(setup=True)
+    main_doc.layers.add(name="Газопровод")
+    main_doc.modelspace().add_lwpolyline([(0, 0), (50, 0)], dxfattribs={"layer": "Газопровод"})
+    main_doc.saveas(str(site / "plan.dxf"))
+    boundary = ezdxf.new(setup=True)
+    boundary.layers.add(name="!Граница работ")
+    boundary.modelspace().add_lwpolyline([(0, 0), (60, 0), (60, 40), (0, 40)], close=True, dxfattribs={"layer": "!Граница работ"})
+    boundary.saveas(str(site / "Xrefs" / "b.dxf"))
+
+    monkeypatch.setattr(dxf_reader, "ProcessPoolExecutor", _BrokenPool)
+    errors = []
+    utilities, zones, _ = dxf_reader.resolve_and_read_bundle(
+        site, tmp_path / "work", layer_map=dxf_reader.COMBINED_LAYER_MAP, on_error=lambda p, e: errors.append(p)
+    )
+
+    assert errors == []
+    assert any(u.object_type == "gas_pipe" for u in utilities)
+    assert any(z.zone_type == "territory" for z in zones)
+
+
+class TestReadPoolMemoryCap:
+    """Чтение файла держит в памяти ~9× его размера (замер на Олимпийской),
+    и на «3-я Парковая» восемь параллельных чтений убивали процесс по памяти."""
+
+    def _files(self, tmp_path, sizes_mb):
+        paths = []
+        for k, mb in enumerate(sizes_mb):
+            p = tmp_path / f"f{k}.dxf"
+            with open(p, "wb") as f:
+                f.truncate(int(mb * 1024 * 1024))
+            paths.append(p)
+        return paths
+
+    def test_big_files_and_little_memory_read_one_at_a_time(self, tmp_path, monkeypatch):
+        from geo_engine.io import dxf_reader
+
+        monkeypatch.setattr(dxf_reader.os, "cpu_count", lambda: 8)
+        monkeypatch.setattr(dxf_reader, "_available_memory_bytes", lambda: 2 * 1024**3)
+        paths = self._files(tmp_path, [300, 200, 150, 1, 1])
+        assert dxf_reader._read_pool_worker_count(paths) == 1
+
+    def test_plenty_of_memory_keeps_the_core_based_count(self, tmp_path, monkeypatch):
+        from geo_engine.io import dxf_reader
+
+        monkeypatch.setattr(dxf_reader.os, "cpu_count", lambda: 8)
+        monkeypatch.setattr(dxf_reader, "_available_memory_bytes", lambda: 64 * 1024**3)
+        paths = self._files(tmp_path, [10, 10, 10, 10, 10])
+        assert dxf_reader._read_pool_worker_count(paths) == 5
+
+    def test_unknown_memory_falls_back_to_cores(self, tmp_path, monkeypatch):
+        from geo_engine.io import dxf_reader
+
+        monkeypatch.setattr(dxf_reader.os, "cpu_count", lambda: 8)
+        monkeypatch.setattr(dxf_reader, "_available_memory_bytes", lambda: None)
+        paths = self._files(tmp_path, [300, 300, 300])
+        assert dxf_reader._read_pool_worker_count(paths) == 3

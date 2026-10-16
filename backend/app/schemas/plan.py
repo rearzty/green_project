@@ -21,6 +21,8 @@ class GenerateRequest(BaseModel):
     # claim about what's landscaping-correct.
     tree_spacing_m: float | None = Field(default=None, ge=0.5, le=15.0)
     shrub_spacing_m: float | None = Field(default=None, ge=0.3, le=10.0)
+    # 2 — деревья вдоль улиц двухрядной аллеей (743-ПП табл. 3.6.2).
+    tree_rows: int = Field(default=1, ge=1, le=2)
 
 
 class GenerateJobOut(BaseModel):
@@ -176,6 +178,10 @@ class ValidationViolation(BaseModel):
 
 class ValidateResponse(BaseModel):
     violations: list[ValidationViolation]
+    # Только у /validate/items: чьи вердикты пересчитаны — тронутые плюс
+    # соседние деревья, у которых мог смениться ближайший сосед. Фронт
+    # заменяет подсветку именно у них, а не только у тронутых.
+    checked_ids: list[str] | None = None
 
 
 class ValidateItemsRequest(BaseModel):

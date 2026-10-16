@@ -397,3 +397,53 @@ class TestPlannerPatterns:
         for row_item in rows:
             for group_item in groups:
                 assert row_item.geometry.distance(group_item.geometry) >= IN_ROW_PITCH_M["shrub"] - 1e-3
+
+
+class TestDoubleRow:
+    """Двухрядная аллея (743-ПП табл. 3.6.2): второй ряд в шахматном порядке,
+    интервал между стволами соблюдён и вдоль, и поперёк рядов."""
+
+    def _scene(self):
+        territory = Polygon([(0, 0), (200, 0), (200, 120), (0, 120)])
+        zones = [
+            Zone(geometry=territory, zone_type="territory"),
+            # Проезд через квартал: аллея по обе его стороны.
+            Zone(geometry=LineString([(-50, 60), (250, 60)]), zone_type="road"),
+        ]
+        return territory, zones
+
+    def _plan(self, norms, catalogue, tree_rows):
+        from geo_engine.planner import ROW_RATIONALE_PREFIX, plan_items
+
+        territory, zones = self._scene()
+        items = plan_items(
+            "double", [], zones, territory, ["tree"], lambda cs: [(1.0, "тест") for _ in cs], norms,
+            species_overrides={"tree": "Берёза повислая"}, pattern="row", catalogue=catalogue,
+            tree_rows=tree_rows,
+        )
+        return [i for i in items if i.rationale.startswith(ROW_RATIONALE_PREFIX)]
+
+    def test_the_second_row_appears_along_the_street(self, norms, catalogue):
+        # Первый ряд — в ~2 м от оси проезда (отступ от дороги), второй
+        # дальше на шаг·√3/2 ≈ 6 м: полоса 5-12 м от проезда пуста у
+        # однорядной аллеи и занята у двухрядной.
+        def second_band(items):
+            return [i for i in items if 5 < abs(i.geometry.y - 60) < 12 and 20 < i.geometry.x < 180]
+
+        assert not second_band(self._plan(norms, catalogue, 1))
+        assert len(second_band(self._plan(norms, catalogue, 2))) >= 15
+
+    def test_trunks_keep_the_double_row_interval_across_rows_too(self, norms, catalogue):
+        from geo_engine.patterns import DOUBLE_ROW_PITCH_M
+
+        items = self._plan(norms, catalogue, 2)
+        points = [i.geometry for i in items]
+        nearest = min(a.distance(b) for k, a in enumerate(points) for b in points[k + 1 :])
+        assert nearest >= DOUBLE_ROW_PITCH_M - 1e-3
+
+    def test_the_plan_passes_the_services_own_check(self, norms, catalogue):
+        from geo_engine.compliance import explain_items
+
+        territory, zones = self._scene()
+        records = explain_items(self._plan(norms, catalogue, 2), [], zones, norms, catalogue)
+        assert records and all(r.compliant for r in records)

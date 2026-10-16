@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Box, Loader2, Redo2, Shrub, SquareDashedMousePointer, Trash2, TreeDeciduous, Undo2, X } from "lucide-react";
+import { AlertTriangle, Box, Loader2, Redo2, Shrub, SquareDashedMousePointer, Trash2, TreeDeciduous, Undo2, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
@@ -63,6 +63,8 @@ function ProgressBar({ label, progress }: { label: string; progress: number | nu
 
 export interface ControlPanelProps {
   hasProject: boolean;
+  /** Upload warnings of the current project (ProjectOut.warnings). */
+  projectWarnings?: string[];
   hasPlan: boolean;
   /** True only during the brief client-side restore-from-localStorage pass
    * right after the page loads (see app/page.tsx). */
@@ -87,7 +89,7 @@ export interface ControlPanelProps {
   onGenerate: (
     plantingTypes: PlantingType[],
     scoringMode: ScoringMode,
-    spacing?: { treeSpacingM?: number; shrubSpacingM?: number }
+    spacing?: { treeSpacingM?: number; shrubSpacingM?: number; treeRows?: number }
   ) => Promise<void>;
   /** Lifted to app/page.tsx (not local state here anymore) so AssistantChat.tsx
    * can read/change the same recipe Юна talks about -- both this panel and
@@ -186,6 +188,7 @@ function describeSelection(selection: SelectionSummary): string {
 
 export function ControlPanel({
   hasProject,
+  projectWarnings = [],
   hasPlan,
   restoring = false,
   generating = false,
@@ -238,6 +241,7 @@ export function ControlPanel({
   onDownloadComplianceReport,
 }: ControlPanelProps) {
   const [file, setFile] = useState<File | null>(null);
+  const [doubleRow, setDoubleRow] = useState(false);
   const [name, setName] = useState("Тестовая территория");
   // Defaults to the CRS scripts/generate_synthetic_data.py writes test data
   // in (UTM 37N, covers Moscow) so synthetic uploads land on the real map
@@ -380,6 +384,16 @@ export function ControlPanel({
           {busy ? "Загружаю…" : "Загрузить чертёж"}
         </Button>
         {uploadProgress && <ProgressBar label={uploadProgress.stage} progress={uploadProgress.progress} />}
+        {hasProject && projectWarnings.length > 0 && (
+          <ul className="flex flex-col gap-1 rounded border border-amber-700/60 bg-amber-950/40 p-2 text-xs text-amber-200">
+            {projectWarnings.map((warning) => (
+              <li key={warning} className="flex gap-1.5">
+                <AlertTriangle className="mt-0.5 h-3 w-3 flex-none" aria-hidden />
+                <span>{warning}</span>
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
 
       {hasProject && (
@@ -435,6 +449,19 @@ export function ControlPanel({
                 className="w-20 rounded border border-stone-600 bg-stone-900 px-2 py-0.5 disabled:opacity-50"
               />
             </label>
+            <label
+              className="flex items-center gap-2"
+              title="743-ПП табл. 3.6.2: двухрядная посадка, интервал 7–8 м, второй ряд в шахматном порядке"
+            >
+              <input
+                type="checkbox"
+                checked={doubleRow}
+                onChange={(e) => setDoubleRow(e.target.checked)}
+                disabled={!plantingTypes.includes("tree")}
+                className="h-4 w-4 accent-greenery-600 disabled:opacity-50"
+              />
+              Двухрядная аллея вдоль улиц
+            </label>
           </div>
           <div className="flex gap-3 text-sm">
             <label className="flex items-center gap-1">
@@ -448,7 +475,7 @@ export function ControlPanel({
           </div>
           <Button
             disabled={!hasProject || plantingTypes.length === 0 || busy || editBusy || generating}
-            onClick={() => guarded(() => onGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM }))}
+            onClick={() => guarded(() => onGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM, treeRows: doubleRow ? 2 : 1 }))}
           >
             Сгенерировать план
           </Button>

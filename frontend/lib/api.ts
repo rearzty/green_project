@@ -30,6 +30,9 @@ export interface ProjectOut {
    * carries no CRS metadata at all. See backend's Project.crs_verified. */
   crs_verified: boolean;
   created_at: string;
+  /** Problems the upload survived but the user should know about -- unread
+   * bundle files, no territory boundary found. Ready-to-show Russian text. */
+  warnings?: string[];
 }
 
 export interface PlanOut {
@@ -174,6 +177,12 @@ export async function getProjectLayers(projectId: string): Promise<GeoJSONFeatur
   return request(`/api/projects/${projectId}/layers`);
 }
 
+/** What the 3D view draws, clipped to the territory's surroundings -- see
+ * backend scene3d_service.py for why the full /layers didn't work for 3D. */
+export async function getProjectLayers3d(projectId: string): Promise<GeoJSONFeatureCollection> {
+  return request(`/api/projects/${projectId}/layers-3d`);
+}
+
 export interface LayersRasterGroup {
   key: string;
   label: string;
@@ -226,7 +235,8 @@ function startGenerate(
   plantingTypes: PlantingType[],
   scoringMode: ScoringMode,
   treeSpacingM?: number,
-  shrubSpacingM?: number
+  shrubSpacingM?: number,
+  treeRows?: number
 ): Promise<{ job_id: string }> {
   // tree_spacing_m/shrub_spacing_m left undefined when not overridden --
   // JSON.stringify drops undefined object properties, so the field is simply
@@ -237,6 +247,7 @@ function startGenerate(
     scoring_mode: scoringMode,
     tree_spacing_m: treeSpacingM,
     shrub_spacing_m: shrubSpacingM,
+    tree_rows: treeRows,
   });
 }
 
@@ -264,9 +275,17 @@ export async function generatePlan(
     onPoll?: (status: GenerateJobStatus) => void;
     treeSpacingM?: number;
     shrubSpacingM?: number;
+    treeRows?: number;
   }
 ): Promise<PlanOut> {
-  const { job_id } = await startGenerate(projectId, plantingTypes, scoringMode, options?.treeSpacingM, options?.shrubSpacingM);
+  const { job_id } = await startGenerate(
+    projectId,
+    plantingTypes,
+    scoringMode,
+    options?.treeSpacingM,
+    options?.shrubSpacingM,
+    options?.treeRows
+  );
   for (;;) {
     if (options?.signal?.aborted) throw new ApiError("Генерация отменена.", 0);
     const status = await getGenerateStatus(projectId, job_id);
@@ -372,7 +391,14 @@ export async function validatePlan(
  * and independent of every other planting, so an edit can only ever change
  * violation status for the items it actually touched; callers merge this
  * into their own violation set by id instead of replacing it wholesale. */
-export async function validateItems(projectId: string, planId: string, ids: string[]): Promise<{ violations: ValidationViolation[] }> {
+/** `checked_ids` -- whose verdicts were recomputed: the requested ids plus
+ * neighbouring trees whose nearest neighbour may have changed (tree spacing
+ * depends on neighbours, see backend edit_service._spacing_violations). */
+export async function validateItems(
+  projectId: string,
+  planId: string,
+  ids: string[]
+): Promise<{ violations: ValidationViolation[]; checked_ids?: string[] | null }> {
   return postJson(`/api/projects/${projectId}/plans/${planId}/validate/items`, { ids });
 }
 

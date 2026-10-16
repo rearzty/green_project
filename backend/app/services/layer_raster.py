@@ -83,6 +83,7 @@ _ZONE_COLORS = {
     # patterns) -- a lighter stone than road/building so it reads as related
     # hardscape without being mistaken for either.
     "sidewalk": "#a8a29e",
+    "sidewalk_kerb": "#78716c",
     # Existing lawn (Заливки.dwg's "гзн" surface-fill code) -- deliberately a
     # paler lime than existing_greenery's forest-green: this is real ground
     # cover, not a hard obstacle (see layer_rules.py), and shouldn't read as
@@ -112,6 +113,7 @@ _LAYER_TYPE_LABELS = {
     "building": "Здания",
     "road": "Дороги",
     "sidewalk": "Тротуары",
+    "sidewalk_kerb": "Бордюр тротуара",
     "existing_greenery": "Существующая зелень",
     "existing_lawn": "Существующий газон",
     "utility": "Инженерные сети",
