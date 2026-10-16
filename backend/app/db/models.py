@@ -120,6 +120,10 @@ class Project:
     # файлы бандла, ненайденная граница участка. Готовый русский текст для
     # пользователя — см. project_service.create_project_from_file.
     warnings: list[str] = field(default_factory=list)
+    # Загруженный файл как есть (.zip/.dwg/.dxf) — нужен экспорту, чтобы
+    # положить план поверх ИСХОДНОГО чертежа со ссылками, как делает CLI
+    # (см. export_service.py). None для проектов из GeoJSON.
+    source_file: str | None = None
 
     layers: list[Layer] = field(default_factory=list)
     plans: list[Plan] = field(default_factory=list)
