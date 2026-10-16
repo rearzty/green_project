@@ -921,6 +921,36 @@ def _other_bundle_members(source: Path, main: Path) -> list[Path]:
     return sorted(p for p in found if "PaxHeader" not in p.parts)
 
 
+def _nested_project_main(source: Path) -> Path | None:
+    """Главный чертёж папки проекта, у которой сам чертёж лежит в подпапке.
+
+    Живой случай — «3. 3-я Парковая»: в корне папки проекта `00_Ссылки/`
+    (внешние ссылки с границей работ и сетями), а главный чертёж — в
+    `02_АПОТ/`. В корне ни одного файла, и прежняя логика отказывала с
+    «чертёж, вероятно, в подпапке», хотя пользователь указал ровно папку
+    проекта. А указать `02_АПОТ/` тоже нельзя: ссылки лежат рядом с ней, а не
+    в ней.
+
+    Отличить такую папку проекта от зонтичной («Исходные данные»: разрешения,
+    дендроизыскания, комплект чертежей — несвязанные куски) позволяет папка
+    ссылок в корне: она принадлежит одному чертежу, у зонтичной её не бывает.
+    Без неё — None, и остаётся прежний понятный отказ. Главный — самый крупный
+    чертёж вне папок ссылок, по тому же правилу «по размеру, а не по имени»,
+    что и для файлов в корне.
+    """
+    subdirs = [p for p in source.iterdir() if p.is_dir()]
+    if not any(_looks_like_xref_dir(p.name) for p in subdirs):
+        return None
+    drawings = [
+        path
+        for subdir in subdirs
+        if not _looks_like_xref_dir(subdir.name)
+        for path in subdir.rglob("*")
+        if path.suffix.lower() in (".dxf", ".dwg") and "PaxHeader" not in path.parts and path.is_file()
+    ]
+    return max(drawings, key=lambda p: p.stat().st_size) if drawings else None
+
+
 def _discover_bundle_members(source: Path) -> tuple[Path, list[Path]]:
     """(main file, every file belonging to the bundle including main), before
     any DWG->DXF conversion.
@@ -934,6 +964,9 @@ def _discover_bundle_members(source: Path) -> tuple[Path, list[Path]]:
     """
     if source.is_dir():
         candidates = sorted(p for p in source.iterdir() if p.suffix.lower() in (".dxf", ".dwg"))
+        nested_main = None if candidates else _nested_project_main(source)
+        if nested_main is not None:
+            return nested_main, [nested_main, *_other_bundle_members(source, nested_main)]
         if not candidates:
             # A real delivery's top level holds the drawing directly -- zero
             # files here usually means this is an umbrella folder one level

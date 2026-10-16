@@ -309,6 +309,34 @@ def test_an_umbrella_folder_with_no_drawing_at_its_own_level_names_its_subfolder
     assert "10000176_Генплан_Олимп - Standard" in message
 
 
+def test_a_project_folder_with_the_main_drawing_one_level_down_is_read_whole(tmp_path):
+    """Живой случай, «3. 3-я Парковая»: в корне папки проекта `00_Ссылки/` с
+    границей работ и сетями, главный чертёж — в `02_АПОТ/`. Папка ссылок в
+    корне отличает папку проекта от зонтичной «Исходные данные» (тест выше),
+    поэтому здесь не отказ, а чтение всего проекта."""
+    site = tmp_path / "10001759_3-я Парковая ул"
+    (site / "00_Ссылки").mkdir(parents=True)
+    (site / "02_АПОТ").mkdir(parents=True)
+
+    main_doc = ezdxf.new(setup=True)
+    main_doc.layers.add(name="Газопровод")
+    main_doc.modelspace().add_lwpolyline([(0, 45), (120, 45)], dxfattribs={"layer": "Газопровод"})
+    main_doc.saveas(str(site / "02_АПОТ" / "01-25-ДВ-ВАО-10001759-АПОТ.dxf"))
+
+    boundary = ezdxf.new(setup=True)
+    boundary.layers.add(name="!Граница работ")
+    boundary.modelspace().add_lwpolyline(
+        [(0, 0), (120, 0), (120, 90), (0, 90)], close=True, dxfattribs={"layer": "!Граница работ"}
+    )
+    boundary.saveas(str(site / "00_Ссылки" / "01_Границы работ.dxf"))
+
+    out = tmp_path / "plan.dxf"
+    assert main(["--input", str(site), "--output", str(out), "--types", "tree"]) == 0
+    report = json.loads(out.with_suffix(".report.json").read_text(encoding="utf-8"))
+    assert report["total_items"] > 0
+    assert any(check["object_type"] == "gas_pipe" for item in report["items"] for check in item["checks"])
+
+
 def test_an_unreadable_bundle_member_warns_that_the_territory_may_be_short(tmp_path, capsys):
     """Живая находка, «10. Старый Гай ул»: файл, где реально лежала граница
     участка, не прочитался (DXFStructureError), другой, читаемый файл того же
