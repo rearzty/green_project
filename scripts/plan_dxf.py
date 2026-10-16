@@ -183,6 +183,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Схема расстановки: auto — ряд вдоль проездов/тротуаров/границы участка плюс россыпь "
         "в остатке (по умолчанию); scatter — только россыпь; row — только ряды",
     )
+    parser.add_argument(
+        "--tree-rows",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="Деревья вдоль улиц: 1 — однорядная аллея (по умолчанию), 2 — двухрядная "
+        "в шахматном порядке (743-ПП табл. 3.6.2, интервал 7-8 м)",
+    )
     return parser
 
 
@@ -353,6 +361,7 @@ def main(argv: list[str] | None = None) -> int:
             species_overrides=species_overrides,
             pattern=args.pattern,
             density_per_ha=densities,
+            tree_rows=args.tree_rows,
         )
         counts = Counter(i.planting_type for i in items)
         print(f"     посадок: {len(items)} ({', '.join(f'{k}: {v}' for k, v in counts.most_common())})")

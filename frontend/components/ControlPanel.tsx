@@ -89,7 +89,7 @@ export interface ControlPanelProps {
   onGenerate: (
     plantingTypes: PlantingType[],
     scoringMode: ScoringMode,
-    spacing?: { treeSpacingM?: number; shrubSpacingM?: number }
+    spacing?: { treeSpacingM?: number; shrubSpacingM?: number; treeRows?: number }
   ) => Promise<void>;
   /** Lifted to app/page.tsx (not local state here anymore) so AssistantChat.tsx
    * can read/change the same recipe Юна talks about -- both this panel and
@@ -241,6 +241,7 @@ export function ControlPanel({
   onDownloadComplianceReport,
 }: ControlPanelProps) {
   const [file, setFile] = useState<File | null>(null);
+  const [doubleRow, setDoubleRow] = useState(false);
   const [name, setName] = useState("Тестовая территория");
   // Defaults to the CRS scripts/generate_synthetic_data.py writes test data
   // in (UTM 37N, covers Moscow) so synthetic uploads land on the real map
@@ -448,6 +449,19 @@ export function ControlPanel({
                 className="w-20 rounded border border-stone-600 bg-stone-900 px-2 py-0.5 disabled:opacity-50"
               />
             </label>
+            <label
+              className="flex items-center gap-2"
+              title="743-ПП табл. 3.6.2: двухрядная посадка, интервал 7–8 м, второй ряд в шахматном порядке"
+            >
+              <input
+                type="checkbox"
+                checked={doubleRow}
+                onChange={(e) => setDoubleRow(e.target.checked)}
+                disabled={!plantingTypes.includes("tree")}
+                className="h-4 w-4 accent-greenery-600 disabled:opacity-50"
+              />
+              Двухрядная аллея вдоль улиц
+            </label>
           </div>
           <div className="flex gap-3 text-sm">
             <label className="flex items-center gap-1">
@@ -461,7 +475,7 @@ export function ControlPanel({
           </div>
           <Button
             disabled={!hasProject || plantingTypes.length === 0 || busy || editBusy || generating}
-            onClick={() => guarded(() => onGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM }))}
+            onClick={() => guarded(() => onGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM, treeRows: doubleRow ? 2 : 1 }))}
           >
             Сгенерировать план
           </Button>

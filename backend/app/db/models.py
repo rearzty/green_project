@@ -83,6 +83,9 @@ class Plan:
     # recompute a collapsed plan identically to how it was first generated.
     tree_spacing_m: float | None = None
     shrub_spacing_m: float | None = None
+    # 1 — однорядная аллея вдоль улиц, 2 — двухрядная (743-ПП табл. 3.6.2).
+    # Часть рецепта, как и интервалы: ensure_materialized пересчитывает с ним.
+    tree_rows: int = 1
     created_at: datetime = field(default_factory=_utcnow)
     is_current: bool = True
     item_count: int = 0

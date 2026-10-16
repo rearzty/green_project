@@ -229,7 +229,8 @@ function startGenerate(
   plantingTypes: PlantingType[],
   scoringMode: ScoringMode,
   treeSpacingM?: number,
-  shrubSpacingM?: number
+  shrubSpacingM?: number,
+  treeRows?: number
 ): Promise<{ job_id: string }> {
   // tree_spacing_m/shrub_spacing_m left undefined when not overridden --
   // JSON.stringify drops undefined object properties, so the field is simply
@@ -240,6 +241,7 @@ function startGenerate(
     scoring_mode: scoringMode,
     tree_spacing_m: treeSpacingM,
     shrub_spacing_m: shrubSpacingM,
+    tree_rows: treeRows,
   });
 }
 
@@ -267,9 +269,17 @@ export async function generatePlan(
     onPoll?: (status: GenerateJobStatus) => void;
     treeSpacingM?: number;
     shrubSpacingM?: number;
+    treeRows?: number;
   }
 ): Promise<PlanOut> {
-  const { job_id } = await startGenerate(projectId, plantingTypes, scoringMode, options?.treeSpacingM, options?.shrubSpacingM);
+  const { job_id } = await startGenerate(
+    projectId,
+    plantingTypes,
+    scoringMode,
+    options?.treeSpacingM,
+    options?.shrubSpacingM,
+    options?.treeRows
+  );
   for (;;) {
     if (options?.signal?.aborted) throw new ApiError("Генерация отменена.", 0);
     const status = await getGenerateStatus(projectId, job_id);
