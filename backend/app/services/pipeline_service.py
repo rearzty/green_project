@@ -56,6 +56,14 @@ def _effective_norms(norms: PlantingNorms, tree_spacing_m: float | None, shrub_s
     return norms
 
 
+def plan_norms(plan: Plan) -> PlantingNorms:
+    """Нормы, по которым построен план: интервалы и режим «деревья в покрытии»
+    из его рецепта. Одна точка — для генерации, отчёта, экспорта и проверки,
+    иначе дерево в покрытии засветилось бы нарушением там, где режим забыт."""
+    norms = _effective_norms(load_norms(settings.planting_norms_path), plan.tree_spacing_m, plan.shrub_spacing_m)
+    return norms.with_trees_in_paving(plan.trees_in_paving) if plan.trees_in_paving else norms
+
+
 def _spacing_overridden(tree_spacing_m: float | None, shrub_spacing_m: float | None) -> tuple[str, ...]:
     """Типы, интервал которых задал пользователь.
 
@@ -174,7 +182,7 @@ async def ensure_materialized(plan: Plan) -> Plan:
     if plan.materialized:
         return plan
 
-    norms = _effective_norms(load_norms(settings.planting_norms_path), plan.tree_spacing_m, plan.shrub_spacing_m)
+    norms = plan_norms(plan)
     utilities, zones = layers_to_domain(plan.project.layers)
     territory = territory_polygon(zones, utilities)
     existing_greenery = _existing_greenery(zones)
@@ -205,6 +213,7 @@ def _find_reusable_plan(
     tree_spacing_m: float | None,
     shrub_spacing_m: float | None,
     tree_rows: int = 1,
+    trees_in_paving: bool = False,
 ) -> Plan | None:
     """If the project's *current* plan already is exactly this recipe
     (same scoring_mode + same set of planting_types + same spacing overrides)
@@ -221,7 +230,7 @@ def _find_reusable_plan(
         return None
     if current.tree_spacing_m != tree_spacing_m or current.shrub_spacing_m != shrub_spacing_m:
         return None
-    if current.tree_rows != tree_rows:
+    if current.tree_rows != tree_rows or current.trees_in_paving != trees_in_paving:
         return None
     return current
 
@@ -234,12 +243,17 @@ async def generate_plan(
     shrub_spacing_m: float | None = None,
     on_progress: Callable[[str, int, int], None] | None = None,
     tree_rows: int = 1,
+    trees_in_paving: bool = False,
 ) -> Plan:
-    reusable = _find_reusable_plan(project, scoring_mode, planting_types, tree_spacing_m, shrub_spacing_m, tree_rows)
+    reusable = _find_reusable_plan(
+        project, scoring_mode, planting_types, tree_spacing_m, shrub_spacing_m, tree_rows, trees_in_paving
+    )
     if reusable is not None:
         return await ensure_materialized(reusable)
 
     norms = _effective_norms(load_norms(settings.planting_norms_path), tree_spacing_m, shrub_spacing_m)
+    if trees_in_paving:
+        norms = norms.with_trees_in_paving()
     utilities, zones = layers_to_domain(project.layers)
     territory = territory_polygon(zones, utilities)
     existing_greenery = _existing_greenery(zones)
@@ -255,6 +269,7 @@ async def generate_plan(
         tree_spacing_m=tree_spacing_m,
         shrub_spacing_m=shrub_spacing_m,
         tree_rows=tree_rows,
+        trees_in_paving=trees_in_paving,
         is_current=True,
         project=project,
     )

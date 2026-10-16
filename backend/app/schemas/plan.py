@@ -23,6 +23,8 @@ class GenerateRequest(BaseModel):
     shrub_spacing_m: float | None = Field(default=None, ge=0.3, le=10.0)
     # 2 — деревья вдоль улиц двухрядной аллеей (743-ПП табл. 3.6.2).
     tree_rows: int = Field(default=1, ge=1, le=2)
+    # Деревья в покрытии тротуара с приствольной решёткой (743-ПП п. 9.8).
+    trees_in_paving: bool = False
 
 
 class GenerateJobOut(BaseModel):

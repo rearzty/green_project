@@ -58,7 +58,7 @@ _MAX_TERRITORY_ENTRIES = 64  # one entry per project, not per planting type -- c
 # (project_id, planting_type, species, mtime planting_norms.yaml). Порода в
 # ключе только у деревьев — у остальных типов отступ от неё не зависит (см.
 # _species_key), иначе кэш дробился бы на копии одной и той же зоны.
-ZoneKey = tuple[str, str, str | None, int]
+ZoneKey = tuple[str, str, str | None, bool, int]
 
 _struct_lock = threading.Lock()
 _cache: OrderedDict[ZoneKey, BaseGeometry | None] = OrderedDict()
@@ -88,11 +88,12 @@ def _species_key(planting_type: str, species: str | None) -> str | None:
     return species if planting_type in CROWN_SPACING_TYPES else None
 
 
-def _zone_key(project: Project, planting_type: str, species: str | None) -> ZoneKey:
+def _zone_key(project: Project, planting_type: str, species: str | None, trees_in_paving: bool = False) -> ZoneKey:
     return (
         str(project.id),
         planting_type,
         _species_key(planting_type, species),
+        trees_in_paving,
         settings.planting_norms_path.stat().st_mtime_ns,
     )
 
@@ -111,6 +112,8 @@ def _get_or_build_locked(key: ZoneKey, project: Project, planting_type: str) -> 
     catalogue = load_catalogue()
     species = catalogue.get(key[2])
     norms = load_norms(settings.planting_norms_path)
+    if key[3]:
+        norms = norms.with_trees_in_paving()
 
     def build(territory: BaseGeometry | None) -> BaseGeometry:
         return build_exclusion_zone(
@@ -140,12 +143,13 @@ def with_exclusion_zone(
     planting_type: str,
     fn: Callable[[BaseGeometry | None], T],
     species: str | None = None,
+    trees_in_paving: bool = False,
 ) -> T:
     """Runs `fn(zone)` while holding a lock scoped to this (project,
     planting_type, norms version) key only -- see the module docstring for
     why that's safe and why it used to be one lock for every key.
     """
-    key = _zone_key(project, planting_type, species)
+    key = _zone_key(project, planting_type, species, trees_in_paving)
     with _lock_for(_zone_locks, key):
         zone = _get_or_build_locked(key, project, planting_type)
         return fn(zone)

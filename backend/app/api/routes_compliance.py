@@ -22,12 +22,11 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 
 from backend.app.api.deps import PlanDep
-from backend.app.core.config import settings
 from backend.app.db.models import Plan
 from backend.app.schemas.compliance import ComplianceCheckOut, ItemComplianceOut, ItemsComplianceRequest, ItemsComplianceResponse
 from backend.app.services import compliance_service
-from backend.app.services.pipeline_service import _effective_norms
-from geo_engine.norms import PlantingNorms, load_norms
+from backend.app.services.pipeline_service import plan_norms
+from geo_engine.norms import PlantingNorms
 
 router = APIRouter(prefix="/api/projects/{project_id}/plans/{plan_id}", tags=["compliance"])
 
@@ -37,7 +36,7 @@ def _norms_for(plan: Plan) -> PlantingNorms:
     # (backend/app/services/pipeline_service.py) -- setbacks_m itself doesn't
     # depend on tree/shrub spacing today, but computing it any other way here
     # would be a second place to forget updating if that ever changes.
-    return _effective_norms(load_norms(settings.planting_norms_path), plan.tree_spacing_m, plan.shrub_spacing_m)
+    return plan_norms(plan)
 
 
 def _to_schema(item_id: str, record) -> ItemComplianceOut:
