@@ -64,10 +64,16 @@ def copy_references(main: Path, members: list[Path], dest_dir: Path) -> list[Pat
 def xref_attachment_count(dxf_path: Path) -> int:
     """Сколько внешних ссылок прикреплено к чертежу. Главный чертёж проекта
     обычно маленький (ссылки и рамка), так что открыть его целиком дёшево."""
+    import ezdxf
     import ezdxf.recover
 
+    # Сначала обычное чтение: на тяжёлом главном чертеже («3. 3-я Парковая»,
+    # 175 МБ) recover тратил ~150 с только на то, чтобы сосчитать ссылки.
     try:
-        doc, _ = ezdxf.recover.readfile(str(dxf_path))
-    except Exception:  # noqa: BLE001 — нечитаемый чертёж ссылок не несёт
-        return 0
+        doc = ezdxf.readfile(str(dxf_path))
+    except Exception:  # noqa: BLE001 — не прочиталось обычным способом
+        try:
+            doc, _ = ezdxf.recover.readfile(str(dxf_path))
+        except Exception:  # noqa: BLE001 — нечитаемый чертёж ссылок не несёт
+            return 0
     return sum(1 for block in doc.blocks if block.block_record.is_xref)
