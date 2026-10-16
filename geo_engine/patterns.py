@@ -119,6 +119,18 @@ ROW_SEARCH_BAND_M = 6.0
 # аллеи вдоль трёхметрового бордюрного огрызка не бывает.
 MIN_GUIDE_LENGTH_M = 15.0
 
+# Двухрядная посадка деревьев — 743-ПП п. 3.6.4 табл. 3.6.2: «7-8 м». Берётся
+# нижняя граница, по тому же правилу, что везде в проекте для интервала
+# («не менее»), но не меньше интервала по классу кроны (МГСН 1.02-02
+# п. 4.2.9.2) — широкой кроне нужно 8, и снижать его ради схемы нельзя.
+DOUBLE_ROW_PITCH_M = 7.0
+
+# Второй ряд — в шахматном порядке, на расстоянии шаг·√3/2 от первого: тогда
+# дерево второго ряда стоит в вершине равностороннего треугольника с двумя
+# соседями первого, и до любого из них ровно шаг — интервал между стволами
+# соблюдён и поперёк рядов, а не только вдоль.
+DOUBLE_ROW_GAP_FACTOR = 3 ** 0.5 / 2
+
 
 @dataclass(frozen=True)
 class RowGuide:
@@ -220,7 +232,7 @@ def _as_lines(geometry: BaseGeometry | None) -> list[LineString]:
     return lines
 
 
-def points_along(line: LineString, pitch_m: float) -> list[Point]:
+def points_along(line: LineString, pitch_m: float, phase: float = 0.0) -> list[Point]:
     """Точки вдоль линии с шагом `pitch_m`.
 
     Для незамкнутой линии — отцентрованные по её длине. Центрирование, а не
@@ -234,6 +246,9 @@ def points_along(line: LineString, pitch_m: float) -> list[Point]:
     нарушением интервала между стволами. Поэтому остаток раскладывается
     поровну на все промежутки — шаг выходит чуть больше номинального и
     никогда меньше, а ряд замыкается без шва.
+
+    `phase` — сдвиг в долях шага: 0.5 даёт шахматный порядок второго ряда
+    двухрядной посадки относительно первого.
     """
     if pitch_m <= 0:
         return []
@@ -245,8 +260,11 @@ def points_along(line: LineString, pitch_m: float) -> list[Point]:
     count = int(length // pitch_m)
     if line.is_closed:
         step = length / count
-        return [line.interpolate(index * step) for index in range(count)]
+        return [line.interpolate((index + phase) * step) for index in range(count)]
     start = (length - count * pitch_m) / 2
+    if phase:
+        # Сдвиг на долю шага съедает одну точку на дальнем конце.
+        return [line.interpolate(start + (index + phase) * pitch_m) for index in range(count)]
     return [line.interpolate(start + index * pitch_m) for index in range(count + 1)]
 
 
@@ -256,9 +274,10 @@ def _row_path(
     band_m: float,
     inset_m: float,
     pitch_m: float,
-) -> BaseGeometry | None:
+) -> tuple[BaseGeometry | None, float]:
     """Линия, вдоль которой пойдёт ряд: эквидистанта ориентира на связывающем
-    расстоянии.
+    расстоянии, и само это расстояние (от него отсчитывается второй ряд
+    двухрядной посадки).
 
     Почему не край допустимой площади напрямую. Край — это контур со всеми
     вырезами от буферов сетей и зданий, он извилист, и ряд по нему получается
@@ -283,6 +302,7 @@ def _row_path(
         distance += step
 
     best: BaseGeometry | None = None
+    best_offset = guide.setback_m + inset_m
     best_length = 0.0
     for offset in offsets:
         ring = guide.geometry.buffer(offset).boundary
@@ -291,10 +311,10 @@ def _row_path(
         if length >= pitch_m * 2:
             # Первая же эквидистанта, на которой помещается настоящий ряд, —
             # она и самая близкая к ориентиру, то есть самая правильная.
-            return ring
+            return ring, offset
         if length > best_length:
-            best, best_length = ring, length
-    return best
+            best, best_offset, best_length = ring, offset, length
+    return best, best_offset
 
 
 def row_candidates(
@@ -306,6 +326,7 @@ def row_candidates(
     zoning_zones: list[Zone] | None = None,
     inset_m: float = ROW_INSET_M,
     band_m: float | None = None,
+    rows: int = 1,
 ) -> list[PlantingCandidate]:
     """Кандидаты рядовой посадки вдоль каждого ориентира.
 
@@ -323,6 +344,12 @@ def row_candidates(
     `band_m` ограничивает поиск полосой вдоль ориентира: без неё в ряд попал бы
     весь контур допустимой площади, включая противоположный край участка,
     который к этой улице отношения не имеет.
+
+    `rows=2` — двухрядная посадка: второй ряд на эквидистанте дальше первого
+    на `DOUBLE_ROW_GAP_FACTOR` шага, в шахматном порядке. Только вдоль улиц —
+    у границы участка второй ряд ушёл бы внутрь двора, это уже не аллея.
+    Там, где второму ряду нет места (сети, здания), его точки отсеиваются той
+    же проверкой допустимой площади, и аллея остаётся однорядной.
     """
     zoning_zones = zoning_zones or []
     # Индексы строятся один раз на вызов, а не на точку: `ZoningIndex`
@@ -340,10 +367,10 @@ def row_candidates(
     band_m = ROW_SEARCH_BAND_M if band_m is None else band_m
 
     candidates: list[PlantingCandidate] = []
-    for guide in guides:
-        usable = _row_path(guide, buildable_area, band_m, inset_m, pitch_m)
-        for line in _as_lines(usable):
-            for point in points_along(line, pitch_m):
+
+    def add_along(path: BaseGeometry | None, phase: float) -> None:
+        for line in _as_lines(path):
+            for point in points_along(line, pitch_m, phase):
                 if not buildable_area.contains(point):
                     continue
                 candidates.append(
@@ -354,6 +381,13 @@ def row_candidates(
                         zoning=zoning_index.category_at(point),
                     )
                 )
+
+    for guide in guides:
+        usable, offset = _row_path(guide, buildable_area, band_m, inset_m, pitch_m)
+        add_along(usable, 0.0)
+        if rows >= 2 and usable is not None and guide.object_type != "territory":
+            second = guide.geometry.buffer(offset + pitch_m * DOUBLE_ROW_GAP_FACTOR).boundary
+            add_along(second, 0.5)
     return candidates
 
 
