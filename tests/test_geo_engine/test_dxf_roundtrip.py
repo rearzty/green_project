@@ -181,3 +181,36 @@ def test_justification_survives_the_parallel_multi_type_export_path(tmp_path, mo
         text = "".join(value for code, value in xdata if code == 1000)
         assert text, f"entity on layer {circle.dxf.layer} lost its XDATA through the parallel merge"
         assert "743-ПП" in text or "СП 42.13330.2016" in text
+
+
+def test_a_base_that_the_fast_reader_rejects_still_gets_the_plan_via_recover(tmp_path, monkeypatch, capsys):
+    """Обычное чтение подосновы в разы быстрее recover («3-я Парковая»: 20 с
+    против 149), но recover остаётся запасным путём для чертежей, которые
+    обычным способом читаются или сохраняются с ошибкой."""
+    import ezdxf as ezdxf_module
+    from shapely.geometry import Point
+
+    from geo_engine.io import dxf_writer
+    from geo_engine.model import PlantingItem
+
+    base = tmp_path / "base.dxf"
+    doc = ezdxf_module.new(setup=True)
+    doc.layers.add(name="Исходный слой")
+    doc.modelspace().add_line((0, 0), (10, 10), dxfattribs={"layer": "Исходный слой"})
+    doc.saveas(str(base))
+
+    def broken_readfile(*args, **kwargs):
+        raise ezdxf_module.DXFStructureError("broken on purpose")
+
+    monkeypatch.setattr(dxf_writer.ezdxf, "readfile", broken_readfile)
+    out = tmp_path / "plan.dxf"
+    dxf_writer.write_dxf(
+        [PlantingItem(geometry=Point(5, 5), planting_type="tree", species="x", score=1.0, rationale="r")],
+        out,
+        base_dxf=base,
+    )
+
+    result = ezdxf_module.recover.readfile(str(out))[0]
+    assert "Исходный слой" in result.layers
+    assert any(e.dxf.layer.startswith("GREEN_AI") for e in result.modelspace())
+    assert "с восстановлением" in capsys.readouterr().out

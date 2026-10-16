@@ -210,22 +210,43 @@ def write_dxf(
     `records` are ComplianceRecords from geo_engine.compliance, positionally
     matching `items`; when given, each entity carries its justification as XDATA.
     """
-    if base_dxf is not None:
-        # ezdxf.recover, not ezdxf.readfile: the base drawing is third-party by
-        # definition, and a DWG->DXF conversion can leave tables that load fine
-        # and then break on save. Hit live on the pilot general plan — its
-        # MATERIAL table came back with a string where an entity belonged, and
-        # `doc.saveas()` died with AttributeError after the whole plan had
-        # already been computed. recover repairs that on load; readfile cannot,
-        # and the failure does not surface until the last step.
-        doc, auditor = ezdxf.recover.readfile(str(base_dxf))
-        if auditor.has_errors:
-            print(f"  ! в исходном чертеже исправлено структурных ошибок: {len(auditor.errors)}")
-        existing = {layer.dxf.name for layer in doc.layers}
-    else:
-        doc = ezdxf.new(setup=True)
-        existing = set()
+    if base_dxf is None:
+        _fill_and_save(ezdxf.new(setup=True), set(), items, path, records, prefix)
+        return
 
+    # Сначала обычное чтение: на тяжёлом главном чертеже («3. 3-я Парковая»,
+    # DXF 175 МБ) `recover` читал 149 с и сохранял 54, обычный путь — 20 и 16,
+    # и сохранение проходит. `recover` остаётся запасным путём на случай, ради
+    # которого он здесь появился (см. ниже) — если обычное чтение или запись
+    # упали, всё повторяется через него.
+    try:
+        doc = ezdxf.readfile(str(base_dxf))
+        _fill_and_save(doc, {layer.dxf.name for layer in doc.layers}, items, path, records, prefix)
+        return
+    except ResultLayerCollisionError:
+        raise
+    except Exception as error:  # noqa: BLE001 — любой отказ быстрого пути ведёт на recover
+        print(
+            f"  ! исходный чертёж не прочитался/не записался обычным способом ({type(error).__name__}) — "
+            "открываю с восстановлением"
+        )
+
+    # ezdxf.recover, not ezdxf.readfile: the base drawing is third-party by
+    # definition, and a DWG->DXF conversion can leave tables that load fine
+    # and then break on save. Hit live on the pilot general plan — its
+    # MATERIAL table came back with a string where an entity belonged, and
+    # `doc.saveas()` died with AttributeError after the whole plan had
+    # already been computed. recover repairs that on load; readfile cannot,
+    # and the failure does not surface until the last step.
+    doc, auditor = ezdxf.recover.readfile(str(base_dxf))
+    if auditor.has_errors:
+        print(f"  ! в исходном чертеже исправлено структурных ошибок: {len(auditor.errors)}")
+    existing = {layer.dxf.name for layer in doc.layers}
+    _fill_and_save(doc, existing, items, path, records, prefix)
+
+
+def _fill_and_save(doc, existing: set[str], items: list[PlantingItem], path, records, prefix: str) -> None:
+    """Слои результата и посадки — в уже открытый документ, затем сохранение."""
     msp = doc.modelspace()
 
     needed = {result_layer_name(t, prefix) for t in {i.planting_type for i in items}} or {
