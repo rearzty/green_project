@@ -230,7 +230,8 @@ def _fit_row_species(
         if row_pitch_override_m is not None and planting_type not in keep_spacing_for:
             type_norms = type_norms.with_spacing_override(planting_type, row_pitch_override_m)
         exclusion = build_exclusion_zone(
-            utilities, zones, planting_type, type_norms, candidate_species, catalogue.crown_reference_diameter_m
+            utilities, zones, planting_type, type_norms, candidate_species, catalogue.crown_reference_diameter_m,
+            clip_to=territory,
         )
         buildable = buildable_area(
             territory, exclusion, zones, territory_margin_m=type_norms.territory_margin_for(planting_type)
@@ -555,6 +556,7 @@ def _plan_type_items(
             type_norms,
             species,
             catalogue.crown_reference_diameter_m,
+            clip_to=territory,
         )
         margin = type_norms.territory_margin_for(planting_type)
         buildable = buildable_area(territory, exclusion, zones, territory_margin_m=margin)
@@ -661,7 +663,7 @@ def _plan_type_items(
                 loose_norms = norms_for_species(norms, planting_type, loose_species, catalogue)
             loose_exclusion = build_exclusion_zone(
                 utilities, zones, planting_type, loose_norms, loose_species,
-                catalogue.crown_reference_diameter_m,
+                catalogue.crown_reference_diameter_m, clip_to=territory,
             )
             loose_buildable = buildable_area(
                 territory, loose_exclusion, zones,

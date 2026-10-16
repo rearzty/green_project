@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Box, Loader2, Redo2, Shrub, SquareDashedMousePointer, Trash2, TreeDeciduous, Undo2, X } from "lucide-react";
+import { AlertTriangle, Box, Loader2, Redo2, Shrub, SquareDashedMousePointer, Trash2, TreeDeciduous, Undo2, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
@@ -63,6 +63,8 @@ function ProgressBar({ label, progress }: { label: string; progress: number | nu
 
 export interface ControlPanelProps {
   hasProject: boolean;
+  /** Upload warnings of the current project (ProjectOut.warnings). */
+  projectWarnings?: string[];
   hasPlan: boolean;
   /** True only during the brief client-side restore-from-localStorage pass
    * right after the page loads (see app/page.tsx). */
@@ -186,6 +188,7 @@ function describeSelection(selection: SelectionSummary): string {
 
 export function ControlPanel({
   hasProject,
+  projectWarnings = [],
   hasPlan,
   restoring = false,
   generating = false,
@@ -380,6 +383,16 @@ export function ControlPanel({
           {busy ? "Загружаю…" : "Загрузить чертёж"}
         </Button>
         {uploadProgress && <ProgressBar label={uploadProgress.stage} progress={uploadProgress.progress} />}
+        {hasProject && projectWarnings.length > 0 && (
+          <ul className="flex flex-col gap-1 rounded border border-amber-700/60 bg-amber-950/40 p-2 text-xs text-amber-200">
+            {projectWarnings.map((warning) => (
+              <li key={warning} className="flex gap-1.5">
+                <AlertTriangle className="mt-0.5 h-3 w-3 flex-none" aria-hidden />
+                <span>{warning}</span>
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
 
       {hasProject && (

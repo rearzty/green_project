@@ -395,7 +395,7 @@ class TestValidateItems:
     worth of checks after every single edit."""
 
     def test_only_checks_the_requested_ids(self, monkeypatch):
-        monkeypatch.setattr(exclusion_cache, "build_exclusion_zone", lambda utilities, zones, planting_type, norms: box(0, 0, 10, 10))
+        monkeypatch.setattr(exclusion_cache, "build_exclusion_zone", lambda utilities, zones, planting_type, norms, *a, **k: box(0, 0, 10, 10))
         exclusion_cache._cache.clear()
         plan = _plan_with_items(
             BIG_TERRITORY,
@@ -410,7 +410,7 @@ class TestValidateItems:
         assert {v["item_id"] for v in violations} == {"violating"}
 
     def test_matches_validate_plan_when_given_every_id(self, monkeypatch):
-        monkeypatch.setattr(exclusion_cache, "build_exclusion_zone", lambda utilities, zones, planting_type, norms: box(0, 0, 10, 10))
+        monkeypatch.setattr(exclusion_cache, "build_exclusion_zone", lambda utilities, zones, planting_type, norms, *a, **k: box(0, 0, 10, 10))
         exclusion_cache._cache.clear()
         items = [_row("a", Point(5, 5), "tree"), _row("b", Point(50, 50), "tree")]
         plan = _plan_with_items(BIG_TERRITORY, items, project_id="validate-items-project-2")
@@ -424,7 +424,7 @@ class TestValidateItems:
 def test_exclusion_zone_is_built_once_per_project_and_type(monkeypatch):
     calls = []
 
-    def fake_build(utilities, zones, planting_type, norms):
+    def fake_build(utilities, zones, planting_type, norms, *args, **kwargs):
         calls.append(planting_type)
         return box(0, 0, 1, 1)
 
@@ -459,3 +459,30 @@ def test_territory_is_looked_up_once_per_project(monkeypatch):
     move_items(plan=plan, ids=["a"], from_point=(1, 1), to_point=(2, 2), source_crs=None)
 
     assert len(calls) == 1
+
+
+def test_web_validation_uses_the_species_setback_the_generator_used():
+    """Дуб — широкая крона: 743-ПП табл. 3.6.1 прим. 3 отодвигает его от
+    здания на 10 м против табличных 5. Генератор и CLI-проверка это
+    учитывают; веб раньше проверял по таблице и не видел нарушения у дуба,
+    подвинутого руками на 7 м от дома."""
+    from backend.app.services.edit_service import validate_plan
+
+    plan = _plan_with_territory(BIG_TERRITORY)
+    project = plan.project
+    project.id = "species-setback-project"
+    project.layers.append(
+        Layer(id="layer-building", project_id=project.id, kind="zone", object_type="building",
+              geometry=shape_to_db(box(10, 10, 30, 30)))
+    )
+    near_house = Point(37, 20)  # 7 м от стены
+    oak = PlantingItemRow(id="oak", plan_id=plan.id, geometry=shape_to_db(near_house), planting_type="tree",
+                          species="Дуб черешчатый", score=0.5, rationale="")
+    birch = PlantingItemRow(id="birch", plan_id=plan.id, geometry=shape_to_db(near_house), planting_type="tree",
+                            species="Берёза повислая", score=0.5, rationale="")
+    plan.items = [oak, birch]
+
+    violated = {v["item_id"] for v in validate_plan(project, plan)}
+
+    assert "oak" in violated
+    assert "birch" not in violated
