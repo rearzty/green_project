@@ -392,3 +392,28 @@ class TestParallelPlanFallback:
         )
 
         assert items, "последовательный пересчёт обязан дать результат"
+
+
+class TestPlanWorkersMemoryCap:
+    """«3. 3-я Парковая»: воркер генерации ~2,5× памяти основного процесса,
+    и два таких не помещались — пул падал каждый раз."""
+
+    def test_too_little_memory_means_one_worker(self, monkeypatch):
+        from geo_engine.io import dxf_reader
+
+        monkeypatch.setattr(dxf_reader, "_available_memory_bytes", lambda: 4 * 1024**3)
+        monkeypatch.setattr(planner, "_current_rss_bytes", lambda: 2.5 * 1024**3)
+        assert planner._memory_capped_plan_workers() == 1
+
+    def test_plenty_of_memory_allows_parallel_types(self, monkeypatch):
+        from geo_engine.io import dxf_reader
+
+        monkeypatch.setattr(dxf_reader, "_available_memory_bytes", lambda: 6 * 1024**3)
+        monkeypatch.setattr(planner, "_current_rss_bytes", lambda: 0.6 * 1024**3)
+        assert planner._memory_capped_plan_workers() >= 3
+
+    def test_unknown_memory_does_not_limit(self, monkeypatch):
+        from geo_engine.io import dxf_reader
+
+        monkeypatch.setattr(dxf_reader, "_available_memory_bytes", lambda: None)
+        assert planner._memory_capped_plan_workers() >= 1

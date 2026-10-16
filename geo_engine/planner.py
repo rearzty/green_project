@@ -751,6 +751,45 @@ def _plan_type_items(
     return row_items + _limit_by_density(selected, loose_area.area, density_per_ha)
 
 
+# Сколько памяти держит воркер генерации, в разах от памяти основного процесса
+# на момент запуска пула (воркер получает свою копию сетей и зон и строит из
+# них зону отступов, ряды, куртины). Замер: «4. Харьковская» 436 МБ ->
+# воркер 728 МБ (×1,7), «1. Олимпийская деревня» 607 -> 1537 МБ (×2,5). Взято
+# с запасом над худшим.
+_PLAN_WORKER_MEMORY_FACTOR = 2.6
+
+
+def _current_rss_bytes() -> int | None:
+    try:
+        with open("/proc/self/status", encoding="utf-8") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        return None
+    return None
+
+
+def _memory_capped_plan_workers() -> int:
+    """Сколько типов посадки считать параллельно, чтобы не упереться в память.
+
+    Живой случай, «3. 3-я Парковая»: основной процесс после чтения держит
+    2,5 ГБ, воркер — около 6 ГБ, а у контейнера 7,4. Пул падал каждый раз
+    (`BrokenProcessPool`), и только после этого шёл последовательный пересчёт
+    — то есть время на заведомо проваленную попытку и риск, что ядро убьёт
+    уже основной процесс. Теперь, если два воркера не помещаются, считается
+    последовательно сразу. Где память не узнать (не Linux), ограничения нет —
+    как раньше; запасной путь на `BrokenProcessPool` остаётся в любом случае.
+    """
+    from geo_engine.io.dxf_reader import _available_memory_bytes
+
+    available = _available_memory_bytes()
+    rss = _current_rss_bytes()
+    if not available or not rss:
+        return os.cpu_count() or 1
+    return max(1, int(available // (rss * _PLAN_WORKER_MEMORY_FACTOR)))
+
+
 def plan_items(
     plan_key: str,
     utilities: list[Utility],
@@ -836,6 +875,13 @@ def plan_items(
     density_per_ha = {**DEFAULT_DENSITY_PER_HA, **(density_per_ha or {})}
 
     worker_count = min(len(planting_types), os.cpu_count() or 1)
+    memory_cap = _memory_capped_plan_workers()
+    if memory_cap < worker_count and len(utilities) + len(zones) >= _PARALLEL_PLAN_THRESHOLD:
+        print(
+            "  ! памяти на параллельный расчёт типов посадки не хватает — считаю последовательно",
+            file=sys.stderr,
+        )
+    worker_count = min(worker_count, memory_cap)
     if worker_count > 1 and len(utilities) + len(zones) >= _PARALLEL_PLAN_THRESHOLD:
         items: list[PlantingItem] = []
         try:
