@@ -63,7 +63,9 @@ python -m scripts.plan_dxf \
 
 DWG на входе поддерживается, если на PATH есть конвертер (ODA File Converter — основной путь, LibreDWG **0.14+** — фолбэк) — см. `geo_engine/io/dwg_convert.py`.
 
-Ключи: `--types tree,shrub,lawn`, `--scoring heuristic|ml`, `--pattern auto|row|scatter`, `--tree-spacing`, `--shrub-spacing`, `--density tree=25,shrub=250`, `--prefix` (префикс слоёв результата), `--plan-key` (одинаковый ключ даёт побитово тот же план).
+Ключи: `--types tree,shrub,lawn`, `--scoring heuristic|ml`, `--pattern auto|row|scatter`, `--tree-spacing`, `--shrub-spacing`, `--density tree=25,shrub=250`, `--tree-rows 2` (двухрядная аллея деревьев вдоль улиц по 743-ПП табл. 3.6.2, по умолчанию однорядная), `--prefix` (префикс слоёв результата), `--plan-key` (одинаковый ключ даёт побитово тот же план).
+
+В консоли печатается время каждого этапа (чтение, граница, генерация, проверка, запись) и общее время прогона.
 
 ## Локальная разработка без Docker
 
