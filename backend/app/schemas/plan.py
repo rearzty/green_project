@@ -178,6 +178,10 @@ class ValidationViolation(BaseModel):
 
 class ValidateResponse(BaseModel):
     violations: list[ValidationViolation]
+    # Только у /validate/items: чьи вердикты пересчитаны — тронутые плюс
+    # соседние деревья, у которых мог смениться ближайший сосед. Фронт
+    # заменяет подсветку именно у них, а не только у тронутых.
+    checked_ids: list[str] | None = None
 
 
 class ValidateItemsRequest(BaseModel):

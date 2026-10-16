@@ -385,7 +385,14 @@ export async function validatePlan(
  * and independent of every other planting, so an edit can only ever change
  * violation status for the items it actually touched; callers merge this
  * into their own violation set by id instead of replacing it wholesale. */
-export async function validateItems(projectId: string, planId: string, ids: string[]): Promise<{ violations: ValidationViolation[] }> {
+/** `checked_ids` -- whose verdicts were recomputed: the requested ids plus
+ * neighbouring trees whose nearest neighbour may have changed (tree spacing
+ * depends on neighbours, see backend edit_service._spacing_violations). */
+export async function validateItems(
+  projectId: string,
+  planId: string,
+  ids: string[]
+): Promise<{ violations: ValidationViolation[]; checked_ids?: string[] | null }> {
   return postJson(`/api/projects/${projectId}/plans/${planId}/validate/items`, { ids });
 }
 

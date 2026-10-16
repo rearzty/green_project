@@ -33,7 +33,7 @@ from backend.app.services.edit_service import (
     move_items,
     restore_items,
     retype_items,
-    validate_items,
+    validate_items_scoped,
     validate_plan,
 )
 from backend.app.services.geo_io import display_crs, planting_item_to_geojson_feature
@@ -119,5 +119,5 @@ async def validate(plan: PlanDep) -> ValidateResponse:
 async def validate_items_route(request: ValidateItemsRequest, plan: PlanDep) -> ValidateResponse:
     """Recheck only specific items -- what an edit actually touched -- rather
     than the whole plan (see edit_service.validate_items)."""
-    violations = await run_in_threadpool(validate_items, plan.project, plan, request.ids)
-    return ValidateResponse(violations=[ValidationViolation(**v) for v in violations])
+    violations, checked_ids = await run_in_threadpool(validate_items_scoped, plan.project, plan, request.ids)
+    return ValidateResponse(violations=[ValidationViolation(**v) for v in violations], checked_ids=checked_ids)
