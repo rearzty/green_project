@@ -762,7 +762,7 @@ export function ControlPanel({
             onClick={() => guarded(() => onExportDxf())}
           >
             {exporting && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" aria-hidden />}
-            {exporting ? "Экспортируем…" : "Экспорт в DXF"}
+            {exporting ? "Экспортируем…" : "Экспорт в DXF (архив с подосновой)"}
           </Button>
           {/* Полное обоснование по НПА для всего плана -- то же, что CLI пишет
               в report.json/--csv (geo_engine/compliance.py), но по HTTP.

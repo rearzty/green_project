@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from backend.app.api.deps import get_plan_or_404
 from backend.app.schemas.plan import ExportJobOut, ExportJobStatus
 from backend.app.services import export_jobs
-from backend.app.services.export_service import plan_to_dxf
+from backend.app.services.export_service import plan_to_package
 
 router = APIRouter(prefix="/api/projects/{project_id}/plans/{plan_id}", tags=["export"])
 logger = logging.getLogger(__name__)
@@ -26,9 +26,11 @@ async def _run_export_job(job_id: str, project_id: str, plan_id: str) -> None:
     """Runs on the event loop after POST /export-dxf has already returned."""
     try:
         plan = await get_plan_or_404(project_id, plan_id)
-        output_path = Path(tempfile.gettempdir()) / f"export_{job_id}.dxf"
-        await run_in_threadpool(plan_to_dxf, plan, output_path)
-        export_jobs.mark_done(job_id, output_path, f"planting_plan_{plan_id}.dxf")
+        # Архив, а не голый .dxf: план поверх исходного чертежа плюс файлы его
+        # внешних ссылок и отчёт обоснований — см. export_service.py.
+        output_path = Path(tempfile.gettempdir()) / f"export_{job_id}.zip"
+        await run_in_threadpool(plan_to_package, plan, output_path)
+        export_jobs.mark_done(job_id, output_path, f"planting_plan_{plan_id}.zip")
     except HTTPException as exc:
         export_jobs.mark_error(job_id, str(exc.detail))
     except Exception:
@@ -70,4 +72,4 @@ async def export_dxf_download(project_id: str, plan_id: str, job_id: str, backgr
     # here, which would race the response and could delete the file out
     # from under an in-flight read.
     background_tasks.add_task(export_jobs.discard, job_id)
-    return FileResponse(path=job.output_path, media_type="application/dxf", filename=job.download_filename)
+    return FileResponse(path=job.output_path, media_type="application/zip", filename=job.download_filename)

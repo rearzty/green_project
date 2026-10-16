@@ -26,6 +26,7 @@ from geo_engine.compliance import explain_items, report_payload, unverified_sour
 from geo_engine.io.dxf_reader import (
     COMBINED_LAYER_MAP,
     BundleResolutionError,
+    discover_bundle_members,
     read_dxf_bundle,
     resolve_bundle_inputs,
 )
@@ -39,6 +40,7 @@ from geo_engine.planner import (
     plan_items,
 )
 from geo_engine.area_budget import area_budget
+from geo_engine.io.result_package import copy_references, xref_attachment_count
 from geo_engine.species import load_catalogue
 from geo_engine.territory import MissingTerritoryError, territory_polygon
 from ml_scoring.heuristic_scorer import HeuristicScorer
@@ -451,6 +453,15 @@ def main(argv: list[str] | None = None) -> int:
         clock.begin(f"5/5 Запись результата на слои {args.prefix}$*")
         args.output.parent.mkdir(parents=True, exist_ok=True)
         base = pick_base_drawing(entity_counts, main_drawing)
+        references = 0
+        if main_drawing in entity_counts:
+            references = xref_attachment_count(main_drawing)
+            if references:
+                # Главный чертёж — набор внешних ссылок: как холст он и есть
+                # проект целиком, если ссылки лежат рядом (копируются ниже).
+                # Раньше такой «почти пустой» главный проигрывал листу съёмки
+                # — см. geo_engine/io/result_package.py.
+                base = main_drawing
         if base is None:
             raise SystemExit(
                 "\nОШИБКА: ни один чертёж бандла не открывается — не в копию чего писать результат."
@@ -469,6 +480,13 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"     основа: {base.name} (главный чертёж не читается)")
         write_dxf(items, args.output, base_dxf=base, records=records, prefix=args.prefix)
+        if base == main_drawing and references:
+            original_main, original_members = discover_bundle_members(Path(args.input))
+            copied = copy_references(original_main, original_members, args.output.parent)
+            print(
+                f"     внешних ссылок в чертеже: {references}; файлы ссылок положены рядом с результатом "
+                f"({len(copied)} шт.) — AutoCAD подгрузит все листы проекта"
+            )
 
     report_path = args.report or args.output.with_suffix(".report.json")
     unverified = unverified_sources(records)
