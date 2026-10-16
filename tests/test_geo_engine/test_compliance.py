@@ -97,20 +97,30 @@ def test_an_object_type_with_no_citation_says_so_instead_of_inventing_one():
 
 def test_unverified_citations_are_counted_not_hidden():
     """A traceability feature fails quietly when a citation nobody checked looks
-    exactly like one that was checked. Power lines are the honest remaining
-    gap: СП 42.13330.2016's table 9.1 note 2 defers to ПУЭ, which has not been
-    read, so the value applied here is ours and must say so.
+    exactly like one that was checked. A shrub next to a water main is the
+    honest remaining gap: СП 42.13330.2016 table 9.1 has a dash there, so the
+    value applied is ours and must say so.
     """
     norms = load_norms()
-    power_line = Utility(
-        geometry=LineString([(-100, 0), (100, 0)]), object_type="power_line_corridor"
-    )
+    water = Utility(geometry=LineString([(-100, 0), (100, 0)]), object_type="water_pipe")
+    shrub = PlantingItem(geometry=Point(0, 3.2), planting_type="shrub", species="Спирея японская", score=1.0, rationale="")
 
-    records = explain_items([_tree(0, 3.2)], [power_line], [], norms)
+    records = explain_items([shrub], [water], [], norms)
     counts = unverified_sources(records)
 
+    assert records[0].binding_constraint == "water_pipe"
+    assert any("прочерк" in citation or "не сверено" in citation for citation in counts)
+
+
+def test_power_line_setback_is_measured_to_the_crown_per_pue():
+    """ПУЭ табл. 2.5.21: 3 м от провода ВЛ до КРОНЫ, не до ствола."""
+    norms = load_norms()
+    power_line = Utility(geometry=LineString([(-100, 0), (100, 0)]), object_type="power_line_corridor")
+
+    records = explain_items([_tree(0, 3.2)], [power_line], [], norms)
+
     assert records[0].binding_constraint == "power_line_corridor"
-    assert any("ПУЭ" in citation for citation in counts)
+    assert not records[0].compliant  # 3,2 м до ствола — крона заходит ближе 3 м к проводу
 
 
 def test_report_payload_normalizes_sources_instead_of_repeating_them():
