@@ -848,6 +848,77 @@ def _bundle_pool_worker_count(n_files: int) -> int:
     return max(1, min(n_files, usable))
 
 
+# Сколько памяти занимает чтение одного файла, в разах от его размера на
+# диске. Замер на «1. Олимпийская деревня»: DXF 125,6 МБ — пик 1139 МБ (×9,1),
+# DXF 28,3 МБ — 251 МБ (×8,9). DWG ещё не сконвертирован, а DXF из ODA
+# выходит примерно в 6 раз больше DWG (21,5 МБ → 125,6 МБ). Множители взяты с
+# запасом над замером.
+_READ_MEMORY_FACTOR_DXF = 10.0
+_READ_MEMORY_FACTOR_DWG = 60.0
+# Какую долю свободной памяти можно отдать параллельному чтению: остальное —
+# основному процессу, где копятся прочитанные объекты всего бандла.
+_READ_MEMORY_SHARE = 0.5
+
+
+def _available_memory_bytes() -> int | None:
+    """Свободная память для этого процесса: меньшее из MemAvailable и лимита
+    cgroup (контейнер видит в /proc/meminfo память всей машины, а убивают его
+    по своему лимиту). None там, где узнать нельзя (не Linux) — тогда число
+    процессов ограничивают только ядра, как раньше."""
+    candidates: list[int] = []
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                candidates.append(int(line.split()[1]) * 1024)
+    except OSError:
+        pass
+    for limit_file, usage_file in (
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+    ):
+        try:
+            raw = Path(limit_file).read_text().strip()
+            if raw.isdigit() and int(raw) < 1 << 60:
+                candidates.append(int(raw) - int(Path(usage_file).read_text().strip()))
+            break
+        except (OSError, ValueError):
+            continue
+    return min(candidates) if candidates else None
+
+
+def _read_pool_worker_count(paths: list[Path]) -> int:
+    """Сколько файлов бандла читать параллельно — по ядрам И по памяти.
+
+    Живой случай, «3. 3-я Парковая»: двенадцать файлов, четыре из них по
+    17-48 МБ DWG, вместе на чтение около 6 ГБ при 7,4 ГБ у контейнера. Ядро
+    убивало уже основной процесс (код 137), и запасной последовательный путь
+    (`_warn_pool_broken`) спасти не мог. Читаются файлы от крупных к мелким,
+    значит в худший момент параллельно идут k самых крупных — k и берётся
+    наибольшим, при котором их оценка влезает в долю свободной памяти. Не
+    меньше одного: один файл читается в любом случае.
+    """
+    workers = _bundle_pool_worker_count(len(paths))
+    available = _available_memory_bytes()
+    if available is None or workers <= 1:
+        return workers
+    budget = available * _READ_MEMORY_SHARE
+
+    def estimate(path: Path) -> float:
+        factor = _READ_MEMORY_FACTOR_DWG if path.suffix.lower() == ".dwg" else _READ_MEMORY_FACTOR_DXF
+        try:
+            return path.stat().st_size * factor
+        except OSError:
+            return 0.0
+
+    used, fits = 0.0, 0
+    for need in sorted((estimate(p) for p in paths), reverse=True)[:workers]:
+        if fits and used + need > budget:
+            break
+        used += need
+        fits += 1
+    return max(1, fits)
+
+
 def _lpt_partition(paths: list[Path], num_bins: int) -> list[list[Path]]:
     """Greedy longest-processing-time-first bin assignment: sort by file size
     descending, then always add the next file to whichever bin currently has
@@ -1226,7 +1297,7 @@ def read_dxf_bundle(
     zones: list[Zone] = []
 
     if len(paths) > 1:
-        worker_count = _bundle_pool_worker_count(len(paths))
+        worker_count = _read_pool_worker_count([Path(p) for p in paths])
         # Largest files first: a size-descending submission queue is greedy
         # LPT scheduling at runtime (the pool hands the next queued task to
         # whichever worker frees up first), so the file that would otherwise
@@ -1549,7 +1620,7 @@ def resolve_and_read_bundle(
     utilities: list[Utility] = []
     zones: list[Zone] = []
 
-    with ProcessPoolExecutor(max_workers=_bundle_pool_worker_count(len(all_members))) as read_pool:
+    with ProcessPoolExecutor(max_workers=_read_pool_worker_count(all_members)) as read_pool:
         # The main file needs no waiting -- already converted above -- so its
         # read starts immediately, overlapped with every other file below
         # instead of just being "first in line" the way the old sequential

@@ -352,3 +352,41 @@ def test_the_web_read_path_also_survives_a_broken_pool(tmp_path, monkeypatch):
     assert errors == []
     assert any(u.object_type == "gas_pipe" for u in utilities)
     assert any(z.zone_type == "territory" for z in zones)
+
+
+class TestReadPoolMemoryCap:
+    """Чтение файла держит в памяти ~9× его размера (замер на Олимпийской),
+    и на «3-я Парковая» восемь параллельных чтений убивали процесс по памяти."""
+
+    def _files(self, tmp_path, sizes_mb):
+        paths = []
+        for k, mb in enumerate(sizes_mb):
+            p = tmp_path / f"f{k}.dxf"
+            with open(p, "wb") as f:
+                f.truncate(int(mb * 1024 * 1024))
+            paths.append(p)
+        return paths
+
+    def test_big_files_and_little_memory_read_one_at_a_time(self, tmp_path, monkeypatch):
+        from geo_engine.io import dxf_reader
+
+        monkeypatch.setattr(dxf_reader.os, "cpu_count", lambda: 8)
+        monkeypatch.setattr(dxf_reader, "_available_memory_bytes", lambda: 2 * 1024**3)
+        paths = self._files(tmp_path, [300, 200, 150, 1, 1])
+        assert dxf_reader._read_pool_worker_count(paths) == 1
+
+    def test_plenty_of_memory_keeps_the_core_based_count(self, tmp_path, monkeypatch):
+        from geo_engine.io import dxf_reader
+
+        monkeypatch.setattr(dxf_reader.os, "cpu_count", lambda: 8)
+        monkeypatch.setattr(dxf_reader, "_available_memory_bytes", lambda: 64 * 1024**3)
+        paths = self._files(tmp_path, [10, 10, 10, 10, 10])
+        assert dxf_reader._read_pool_worker_count(paths) == 5
+
+    def test_unknown_memory_falls_back_to_cores(self, tmp_path, monkeypatch):
+        from geo_engine.io import dxf_reader
+
+        monkeypatch.setattr(dxf_reader.os, "cpu_count", lambda: 8)
+        monkeypatch.setattr(dxf_reader, "_available_memory_bytes", lambda: None)
+        paths = self._files(tmp_path, [300, 300, 300])
+        assert dxf_reader._read_pool_worker_count(paths) == 3

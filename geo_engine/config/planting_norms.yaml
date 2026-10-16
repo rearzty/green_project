@@ -174,6 +174,7 @@ setbacks_m:
   building:            { tree: 5.0, shrub: 1.5, lawn: 0.5 }   # наружная стена здания/сооружения
   road:                { tree: 2.0, shrub: 1.0, lawn: 0.3 }   # край проезжей части
   sidewalk:            { tree: 0.7, shrub: 0.5, lawn: 0.0 }   # край тротуара и садовой дорожки
+  sidewalk_kerb:       { tree: 0.7, shrub: 0.5, lawn: 0.0 }   # тротуарный бордюр — та же строка «край тротуара»
   lighting_pole:       { tree: 4.0, shrub: 1.0, lawn: 0.0 }   # мачта/опора осветительной сети, трамвая, эстакады
   retaining_wall:      { tree: 3.0, shrub: 1.0, lawn: 0.3 }   # подошва или внутренняя грань подпорной стенки
   tram_track:          { tree: 5.0, shrub: 3.0, lawn: 0.3 }   # край трамвайного полотна / ось трамвайных путей
@@ -216,6 +217,10 @@ setback_sources:
     shrub: { source: sp42_t9_1, row: "Край проезжей части улиц, кромка укрепленной полосы обочины дороги или бровка канавы" }
     lawn:  { source: practice }
   sidewalk:
+    tree:  { source: sp42_t9_1, row: "Край тротуара и садовой дорожки" }
+    shrub: { source: sp42_t9_1, row: "Край тротуара и садовой дорожки" }
+    lawn:  { source: practice }
+  sidewalk_kerb:
     tree:  { source: sp42_t9_1, row: "Край тротуара и садовой дорожки" }
     shrub: { source: sp42_t9_1, row: "Край тротуара и садовой дорожки" }
     lawn:  { source: practice }

@@ -177,6 +177,12 @@ export async function getProjectLayers(projectId: string): Promise<GeoJSONFeatur
   return request(`/api/projects/${projectId}/layers`);
 }
 
+/** What the 3D view draws, clipped to the territory's surroundings -- see
+ * backend scene3d_service.py for why the full /layers didn't work for 3D. */
+export async function getProjectLayers3d(projectId: string): Promise<GeoJSONFeatureCollection> {
+  return request(`/api/projects/${projectId}/layers-3d`);
+}
+
 export interface LayersRasterGroup {
   key: string;
   label: string;
