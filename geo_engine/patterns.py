@@ -457,6 +457,7 @@ ACCENT_GAP_INTERVALS = 3.0
 _ACCENT_MAX_PER_PART = 12
 _ACCENT_MAX_PARTS = 400
 _ACCENT_TOLERANCE_M = 0.2
+_RING_PHASES = 6
 
 
 def _ring_points(center: Point, radius: float, count: int, phase: float) -> list[Point]:
@@ -494,7 +495,6 @@ def accent_layout(
     parts.sort(key=lambda p: -p.area)
     parts = parts[:_ACCENT_MAX_PARTS]
 
-    rng = random.Random(seed)
     found: list[tuple[float, str, list[Point]]] = []
     for part in parts:
         remainder = part
@@ -509,8 +509,16 @@ def accent_layout(
             points = [center]
             if radius >= pitch:
                 shapely.prepare(remainder)
-                ring = _ring_points(center, pitch, TREE_GROUP_RING, rng.uniform(0, 2 * math.pi))
-                points += [p for p in ring if remainder.contains(p)]
+                # Поворот кольца — тот, при котором в группу помещается больше
+                # деревьев (кольцо симметрично, хватает поворотов в пределах
+                # 60°). Перебор, а не жребий: результат не зависит от плана.
+                best_ring: list[Point] = []
+                for step in range(_RING_PHASES):
+                    phase = 2 * math.pi / TREE_GROUP_RING * step / _RING_PHASES
+                    ring = [p for p in _ring_points(center, pitch, TREE_GROUP_RING, phase) if remainder.contains(p)]
+                    if len(ring) > len(best_ring):
+                        best_ring = ring
+                points += best_ring
             kind = "group" if len(points) >= TREE_GROUP_MIN else "solitaire"
             found.append((radius, kind, points))
             footprint = shapely.union_all([p.buffer(gap if kind == "solitaire" else pitch + gap / 2) for p in points])
