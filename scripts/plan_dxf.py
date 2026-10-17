@@ -37,6 +37,8 @@ from geo_engine.planner import (
     GROUP_RATIONALE_PREFIX,
     PLACEMENT_PATTERNS,
     ROW_RATIONALE_PREFIX,
+    SOLITAIRE_RATIONALE_PREFIX,
+    TREE_GROUP_RATIONALE_PREFIX,
     plan_items,
 )
 from geo_engine.area_budget import area_budget
@@ -210,8 +212,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--pattern",
         choices=PLACEMENT_PATTERNS,
         default="auto",
-        help="Схема расстановки: auto — ряд вдоль проездов/тротуаров/границы участка плюс россыпь "
-        "в остатке (по умолчанию); scatter — только россыпь; row — только ряды",
+        help="Схема расстановки: auto — ряд вдоль проездов/тротуаров/границы участка, деревья в "
+        "остатке — группами и солитерами (743-ПП табл. 3.6.2, прил. п. 10.8.1), кустарник — "
+        "куртинами (по умолчанию); scatter — только россыпь; row — только ряды; accent — только "
+        "группы деревьев и солитеры",
     )
     parser.add_argument(
         "--trees-in-paving",
@@ -404,14 +408,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         counts = Counter(i.planting_type for i in items)
         print(f"     посадок: {len(items)} ({', '.join(f'{k}: {v}' for k, v in counts.most_common())})")
-        in_rows = sum(1 for i in items if i.rationale.startswith(ROW_RATIONALE_PREFIX))
-        in_groups = sum(1 for i in items if i.rationale.startswith(GROUP_RATIONALE_PREFIX))
-        loose = len(items) - in_rows - in_groups
-        parts = [
-            f"{label}: {count}"
-            for label, count in (("рядом", in_rows), ("куртинами", in_groups), ("россыпью", loose))
-            if count
+        # «in», а не startswith: перед схемой может стоять пометка о посадке в покрытии.
+        schemes = [
+            ("рядом", ROW_RATIONALE_PREFIX),
+            ("группами деревьев", TREE_GROUP_RATIONALE_PREFIX),
+            ("солитерами", SOLITAIRE_RATIONALE_PREFIX),
+            ("куртинами", GROUP_RATIONALE_PREFIX),
         ]
+        scheme_counts = [(label, sum(1 for i in items if prefix in i.rationale)) for label, prefix in schemes]
+        loose = len(items) - sum(count for _, count in scheme_counts)
+        parts = [f"{label}: {count}" for label, count in [*scheme_counts, ("россыпью", loose)] if count]
         if parts:
             print(f"     схемы посадки — {', '.join(parts)}")
         catalogue = load_catalogue()

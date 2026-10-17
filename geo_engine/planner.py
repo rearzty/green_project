@@ -24,7 +24,7 @@ from shapely.ops import unary_union
 
 from geo_engine.buffers import build_exclusion_zone, buildable_area
 from geo_engine.candidates import ExclusionIndex, ZoningIndex, generate_candidates
-from geo_engine.model import PlantingItem, Utility, Zone
+from geo_engine.model import PlantingCandidate, PlantingItem, Utility, Zone
 from geo_engine.norms import PlantingNorms
 from geo_engine.patterns import (
     DOUBLE_ROW_PITCH_M,
@@ -32,6 +32,8 @@ from geo_engine.patterns import (
     GROUP_PLANTING_TYPES,
     GROUP_RADIUS_M,
     ROW_PLANTING_TYPES,
+    ACCENT_PLANTING_TYPES,
+    accent_layout,
     collect_row_guides,
     fill_group,
     group_positions,
@@ -67,13 +69,20 @@ CROWN_SPACING_TYPES = ("tree",)
 # свободные группы во дворе. "scatter" — только россыпь, прежнее поведение,
 # оставлено как способ воспроизвести старый результат и как запасной путь для
 # площадок без единого линейного ориентира.
-PLACEMENT_PATTERNS = ("auto", "scatter", "row", "group")
+PLACEMENT_PATTERNS = ("auto", "scatter", "row", "group", "accent")
 
 # По этой приставке в rationale CLI и отчёт отличают рядовую посадку от
 # россыпи. Обоснование выбора места у них разное, и смешивать их в отчёте
 # значило бы потерять единственный признак, по которому видно схему.
 ROW_RATIONALE_PREFIX = "Рядовая посадка вдоль линейного ориентира."
 GROUP_RATIONALE_PREFIX = "Групповая посадка (куртина)."
+TREE_GROUP_RATIONALE_PREFIX = (
+    "Групповая посадка деревьев: интервал по 743-ПП табл. 3.6.2 (5-7 м), "
+    "композиция — ядро и контур, по 743-ПП прил., п. 10.8.1 (по аналогии)."
+)
+SOLITAIRE_RATIONALE_PREFIX = (
+    "Солитер: одиночное дерево на открытом месте, 743-ПП прил., п. 10.8.1 (по аналогии)."
+)
 
 # Интервал внутри куртины. 743-ПП, табл. 3.6.2: «групповая посадка
 # кустарников — 0,3 м». Берётся 0,5 м, а не 0,3: таблица даёт ориентир для
@@ -350,6 +359,52 @@ def _limit_by_density(
     if len(items) <= allowed:
         return items
     return sorted(items, key=lambda item: item.score, reverse=True)[:allowed]
+
+
+def _accent_items(
+    area: BaseGeometry,
+    exclusion: BaseGeometry,
+    type_norms: PlantingNorms,
+    planting_type: str,
+    zones: list[Zone],
+    score_fn: Callable,
+    seed: int,
+    density_per_ha: float | None,
+) -> list[PlantingItem]:
+    """Группы деревьев и солитеры на площади, оставшейся после ряда.
+
+    Бюджет плотности применяется при раскладке, а не срезом после: срез по
+    оценке оставил бы от группы одно-два дерева, и она перестала бы быть
+    группой.
+    """
+    if area is None or area.is_empty:
+        return []
+    interval = type_norms.spacing_for(planting_type).min_distance_m
+    max_trees = None
+    if density_per_ha is not None and density_per_ha > 0:
+        max_trees = max(1, int(round(density_per_ha * area.area / 10_000)))
+    layout = accent_layout(area, interval, seed, max_trees=max_trees)
+    if not layout:
+        return []
+    exclusion_index = ExclusionIndex(exclusion)
+    zoning_index = ZoningIndex(zones)
+    items: list[PlantingItem] = []
+    for kind, points in layout:
+        clearances = exclusion_index.distances(points)
+        candidates = [
+            PlantingCandidate(
+                geometry=point,
+                planting_type=planting_type,
+                clearance_m=float(clearance),
+                zoning=zoning_index.category_at(point),
+            )
+            for point, clearance in zip(points, clearances)
+        ]
+        prefix = TREE_GROUP_RATIONALE_PREFIX if kind == "group" else SOLITAIRE_RATIONALE_PREFIX
+        for item in greedy_select(candidates, score_fn, type_norms):
+            item.rationale = f"{prefix} {item.rationale}"
+            items.append(item)
+    return items
 
 
 def _limit_row_and_group_by_density(
@@ -728,6 +783,25 @@ def _plan_type_items(
                 loose_norms.spacing_for(planting_type).min_distance_m,
             )
             loose_area = _subtract_item_footprints(loose_area, row_items, clearance)
+        wants_accents = pattern in ("auto", "accent") and planting_type in ACCENT_PLANTING_TYPES
+        accents: list[PlantingItem] = []
+        if wants_accents:
+            accents = _accent_items(
+                loose_area, loose_exclusion, loose_norms, planting_type, zones, score_fn,
+                seed, density_per_ha,
+            )
+            for item in accents:
+                if loose_species is not None:
+                    item.species = loose_species.name
+        if accents or (wants_accents and pattern == "accent"):
+            # Акценты уже ограничены бюджетом плотности при раскладке — целыми
+            # группами, а не по одной посадке: срез по оценке разорвал бы группу.
+            return row_items + accents
+        if wants_accents and row_items:
+            # Есть ряд, а мест под группу или солитер нет: россыпью в щели
+            # между рядом и сетями не досыпаем — одиночное дерево, прижатое к
+            # краю, на чертеже читается промахом, а не замыслом.
+            return row_items
         scattered = generate_candidates(
             loose_area, loose_exclusion, planting_type, loose_norms, zoning_zones=zones, seed=seed
         )
