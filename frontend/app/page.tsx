@@ -24,6 +24,7 @@ import { usePlanEdits } from "@/lib/hooks/usePlanEdits";
 import { useProjectSession } from "@/lib/hooks/useProjectSession";
 import { useSelection } from "@/lib/hooks/useSelection";
 import { AssistantChat } from "@/components/AssistantChat";
+import type { AssistantAction } from "@/lib/api";
 import {
   complianceReportUrl,
   getItemsCompliance,
@@ -86,6 +87,8 @@ export default function Home() {
   // falls back to planting_norms.yaml's own tree_default/shrub_default.
   const [treeSpacingM, setTreeSpacingM] = useState<number | undefined>(undefined);
   const [shrubSpacingM, setShrubSpacingM] = useState<number | undefined>(undefined);
+  const [treeRows, setTreeRows] = useState(1);
+  const [treesInPaving, setTreesInPaving] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   // Defaults open (matches the always-visible panel this replaces) and is
   // corrected once on mount for phones -- SSR has no window to check, so a
@@ -224,14 +227,19 @@ export default function Home() {
    * plan-history refresh, session persistence, and the shared `generating`
    * indicator all just work), after first updating the lifted state so the
    * panel's own inputs immediately reflect what Юна just set. */
-  async function handleAssistantAction(action: { planting_types: PlantingType[]; tree_spacing_m?: number; shrub_spacing_m?: number }) {
+  async function handleAssistantAction(action: AssistantAction) {
     setPlantingTypes(action.planting_types);
     setTreeSpacingM(action.tree_spacing_m);
     setShrubSpacingM(action.shrub_spacing_m);
+    setScoringMode(action.scoring_mode);
+    setTreeRows(action.tree_rows);
+    setTreesInPaving(action.trees_in_paving);
     try {
-      await session.handleGenerate(action.planting_types, scoringMode, {
+      await session.handleGenerate(action.planting_types, action.scoring_mode, {
         treeSpacingM: action.tree_spacing_m,
         shrubSpacingM: action.shrub_spacing_m,
+        treeRows: action.tree_rows,
+        treesInPaving: action.trees_in_paving,
       });
     } catch (e) {
       toast.error(errorMessage(e));
@@ -344,6 +352,10 @@ export default function Home() {
           onTreeSpacingMChange={setTreeSpacingM}
           shrubSpacingM={shrubSpacingM}
           onShrubSpacingMChange={setShrubSpacingM}
+          treeRows={treeRows}
+          onTreeRowsChange={setTreeRows}
+          treesInPaving={treesInPaving}
+          onTreesInPavingChange={setTreesInPaving}
           plantingNorms={plantingNorms}
           onExportDxf={session.handleExportDxf}
           onDownloadComplianceReport={handleDownloadComplianceReport}
@@ -445,7 +457,16 @@ export default function Home() {
       <AssistantChat
         projectId={project?.id}
         generating={session.generating}
-        settings={{ planting_types: plantingTypes, tree_spacing_m: treeSpacingM, shrub_spacing_m: shrubSpacingM }}
+        settings={{
+          planting_types: plantingTypes,
+          tree_spacing_m: treeSpacingM,
+          shrub_spacing_m: shrubSpacingM,
+          scoring_mode: scoringMode,
+          tree_rows: treeRows,
+          trees_in_paving: treesInPaving,
+        }}
+        planId={plan?.plan_id}
+        selectedItemId={singleSelectedId}
         onApplyAction={handleAssistantAction}
       />
     </main>
