@@ -449,3 +449,29 @@ class TestSpeciesDiversity:
     def test_an_explicit_species_choice_is_respected(self, synthetic_scene):
         items = self._plan(synthetic_scene, overrides={"shrub": "Спирея японская"})
         assert {i.species for i in items if i.planting_type == "shrub"} == {"Спирея японская"}
+
+
+def test_tree_species_is_chosen_by_the_site_not_by_the_plan_key():
+    """«6. Камчатская» давала 108 или 247 деревьев в зависимости от того,
+    какие три породы из пяти выпали по сиду плана. Порода ряда теперь
+    выбирается перебором всех нормативно разных вариантов."""
+    from shapely.geometry import LineString, box
+
+    from geo_engine import planner
+    from geo_engine.model import Zone
+    from geo_engine.norms import load_norms
+
+    territory = box(0, 0, 160, 60)
+    zones = [
+        Zone(geometry=territory, zone_type="territory"),
+        Zone(geometry=LineString([(0, 0), (160, 0)]), zone_type="road"),
+    ]
+    results = []
+    for key in ("a", "b", "c", "d", "e"):
+        items = planner.plan_items(
+            key, [], zones, territory, ["tree"], lambda c: [(1.0, "т") for _ in c], load_norms(),
+            pattern="row",
+        )
+        results.append(len(items))
+
+    assert len(set(results)) == 1
