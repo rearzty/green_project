@@ -16,9 +16,11 @@ import sys
 import random
 import zlib
 from collections.abc import Callable, Collection
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from geo_engine.parallel import process_pool
 from concurrent.futures.process import BrokenProcessPool
 
+import shapely
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
@@ -182,8 +184,13 @@ def _fit_row_species(
     catalogue: SpeciesCatalogue,
     row_pitch_override_m: float | None = None,
     tree_rows: int = 1,
+    area_cache: dict | None = None,
 ):
     """Выбрать из палитры породу, которой на этой площадке реально есть место.
+
+    `area_cache` (имя породы -> (зона отступов, допустимая площадь)) заполняется
+    по ходу перебора: те же зоны потом нужны групповой/акцентной породе, и
+    строить их второй раз — это ещё один `union_all` на всю улицу.
 
     Возвращает (порода, нормы под неё, кандидаты ряда, ориентиры).
 
@@ -233,8 +240,7 @@ def _fit_row_species(
     """
     if planting_type not in CROWN_SPACING_TYPES:
         palette = palette[:1]
-    best = None
-    for candidate_species in palette or [None]:
+    def evaluate(candidate_species, territory=territory):
         type_norms = norms
         if candidate_species is not None and planting_type not in keep_spacing_for:
             type_norms = norms_for_species(norms, planting_type, candidate_species, catalogue)
@@ -274,9 +280,67 @@ def _fit_row_species(
             zoning_zones=zones,
             rows=row_count,
         )
-        if best is None or len(rows) > len(best[2]):
-            best = (candidate_species, type_norms, rows, guides, exclusion, buildable)
+        return (candidate_species, type_norms, rows, guides, exclusion, buildable), _row_score(
+            candidate_species, rows, planting_type
+        )
+
+    candidates = palette or [None]
+    if len(candidates) > 1:
+        # Породы проверяются параллельно в потоках: основное время — объединение
+        # буферов в зону отступов (GEOS отпускает GIL), а порядок сравнения ниже
+        # тот же, что и при последовательном переборе, — результат не меняется.
+        # Два потока, не больше: каждая зона на крупной улице — сотни МБ.
+        # Своя копия участка на каждую породу: build_exclusion_zone готовит его
+        # (`shapely.prepare`), а подготовленная геометрия GEOS не рассчитана на
+        # одновременный доступ из нескольких потоков.
+        copies = [shapely.from_wkb(shapely.to_wkb(territory)) for _ in candidates]
+        with ThreadPoolExecutor(max_workers=_SPECIES_EVAL_THREADS) as pool:
+            evaluated = list(pool.map(evaluate, candidates, copies))
+    else:
+        evaluated = [evaluate(candidates[0])]
+    best = None
+    best_score: tuple = ()
+    for result, score in evaluated:
+        if area_cache is not None and result[0] is not None:
+            # Зона отступов и площадь от интервала не зависят — только от
+            # отступов породы, — поэтому годятся и для других фаз посадки.
+            area_cache[result[0].name] = (result[4], result[5])
+        if best is None or score > best_score:
+            best, best_score = result, score
     return best
+
+
+def _row_score(species: Species | None, rows: list, planting_type: str) -> tuple:
+    """Чем лучше порода для ряда на этой площадке: суммарная площадь крон, при
+    равенстве — число деревьев.
+
+    Не просто число стволов: иначе всегда выигрывала бы самая узкая крона
+    (интервал 3 м против 8), и улица получала бы частокол рябин там, где
+    поместились бы липы. Площадь крон — это и есть «сколько зелени» — та
+    величина, ради которой озеленение делается.
+    """
+    count = len(rows)
+    if planting_type not in CROWN_SPACING_TYPES or species is None:
+        return (count, count)
+    diameter = species.crown_diameter_m or 0.0
+    return (round(count * diameter * diameter, 6), count)
+
+
+def _tree_species_candidates(norms: PlantingNorms, catalogue: SpeciesCatalogue) -> list[Species]:
+    """Все нормативно разные варианты дерева — по одному на класс
+    (`_equivalence_key`: те же отступы и тот же интервал), самая широкая крона
+    первой.
+
+    Раньше палитра была тремя случайными породами из пяти по сиду плана, и
+    результат зависел от жребия: на «6. Камчатской» одна и та же улица давала
+    108 или 247 деревьев в зависимости от того, попала ли в тройку рябина.
+    Теперь перебираются все классы, а порода внутри класса потом всё равно
+    разнообразится `_diversify_species` — нормы от этого не меняются.
+    """
+    by_class: dict[tuple, Species] = {}
+    for species in sorted(catalogue.for_type("tree"), key=lambda s: (-(s.crown_diameter_m or 0.0), s.name)):
+        by_class.setdefault(_equivalence_key(species, "tree", norms, catalogue), species)
+    return list(by_class.values())
 
 
 def _other_species(palette: list[Species], besides: Species | None) -> Species | None:
@@ -549,7 +613,12 @@ def _plan_type_items(
     `PlantingCandidate` — оба уже пиклятся тем же путём, что `Utility`/`Zone`.
     """
     override = species_override
-    palette = choose_species_palette(plan_key, planting_type, catalogue)
+    if planting_type in CROWN_SPACING_TYPES:
+        # Порода дерева решает число и размер посадок — её выбирает площадка
+        # по объективному критерию, а не жребий (см. _tree_species_candidates).
+        palette = _tree_species_candidates(norms, catalogue)
+    else:
+        palette = choose_species_palette(plan_key, planting_type, catalogue)
     # Породу ряда берём первой из палитры: в ряду однородность и есть
     # смысл, а остальные породы уходят по куртинам.
     species = catalogue.get(override) if override else (palette[0] if palette else None)
@@ -558,6 +627,7 @@ def _plan_type_items(
         type_norms = norms_for_species(norms, planting_type, species, catalogue)
 
     selected: list[PlantingItem] = []
+    area_cache: dict[str, tuple] = {}
     row_items: list[PlantingItem] = []
     group_items: list[PlantingItem] = []
 
@@ -596,6 +666,7 @@ def _plan_type_items(
             catalogue,
             row_pitch_override_m=IN_ROW_PITCH_M.get(planting_type),
             tree_rows=tree_rows,
+            area_cache=area_cache,
         )
         spacing = type_norms.spacing_for(planting_type)
         # НЕ пересчитывается заново: `_fit_row_species` уже вернула
@@ -736,15 +807,19 @@ def _plan_type_items(
             # ошибки, что уже ловили на буферах.
             if planting_type not in keep_spacing_for:
                 loose_norms = norms_for_species(norms, planting_type, loose_species, catalogue)
-            loose_exclusion = build_exclusion_zone(
-                utilities, zones, planting_type, loose_norms, loose_species,
-                catalogue.crown_reference_diameter_m, clip_to=territory,
-            )
-            loose_buildable = buildable_area(
-                territory, loose_exclusion, zones,
-                territory_margin_m=loose_norms.territory_margin_for(planting_type),
-                plantable_types=_plantable_types(loose_norms, planting_type),
-            )
+            cached = area_cache.get(loose_species.name)
+            if cached is not None:
+                loose_exclusion, loose_buildable = cached
+            else:
+                loose_exclusion = build_exclusion_zone(
+                    utilities, zones, planting_type, loose_norms, loose_species,
+                    catalogue.crown_reference_diameter_m, clip_to=territory,
+                )
+                loose_buildable = buildable_area(
+                    territory, loose_exclusion, zones,
+                    territory_margin_m=loose_norms.territory_margin_for(planting_type),
+                    plantable_types=_plantable_types(loose_norms, planting_type),
+                )
             # Пересечение, а не замена: из `remaining` уже вычтены кроны
             # поставленного ряда, и терять это нельзя.
             loose_area = loose_buildable.intersection(remaining)
@@ -874,6 +949,8 @@ def _memory_capped_plan_workers() -> int:
 # реальные проекты пилота, а смена породы каждые несколько метров читалась
 # бы как шум.
 SPECIES_BLOCK_M = 60.0
+
+_SPECIES_EVAL_THREADS = 2
 
 IN_PAVING_RATIONALE_PREFIX = (
     "Посадка в покрытии тротуара: околоствольное пространство Ø 2 м с приствольной решёткой "
@@ -1066,7 +1143,7 @@ def plan_items(
     if worker_count > 1 and len(utilities) + len(zones) >= _PARALLEL_PLAN_THRESHOLD:
         items: list[PlantingItem] = []
         try:
-            with ProcessPoolExecutor(max_workers=worker_count) as pool:
+            with process_pool(max_workers=worker_count) as pool:
                 futures = [
                     pool.submit(
                         _plan_type_items,

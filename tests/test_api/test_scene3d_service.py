@@ -42,3 +42,15 @@ def test_long_roads_are_clipped_and_invalid_polygons_repaired():
     assert road.bounds[0] >= -31 and road.bounds[2] <= 131
     for f in features:
         assert shape(f.geometry.model_dump()).is_valid
+
+
+def test_sliver_building_fragments_do_not_become_walls_in_3d():
+    """Обрывок контура здания, раздутый на 0,3 м при чтении, в 3D дал бы
+    стену-пластину высотой с дом («5. Багрицкого»: 2667 из 2734)."""
+    from shapely.geometry import LineString
+
+    project = _project()
+    project.layers.append(_layer("building", LineString([(10, 50), (35, 50)]).buffer(0.3)))
+    types = [f.properties["object_type"] for f in scene_layers(project).features]
+
+    assert types.count("building") == 2
