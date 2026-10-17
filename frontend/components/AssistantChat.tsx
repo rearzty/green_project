@@ -25,7 +25,19 @@ export interface AssistantChatProps {
   generating: boolean;
   settings: AssistantGenerationSettings;
   onApplyAction: (action: AssistantAction) => Promise<void>;
+  /** План на экране и выделенная посадка — по ним Юна отвечает по фактам. */
+  planId?: string;
+  selectedItemId?: string;
 }
+
+/** Готовые вопросы — чтобы на показе не печатать вживую. */
+const SUGGESTIONS = [
+  "Почему так мало деревьев?",
+  "Почему эта посадка здесь?",
+  "Посади деревья двумя рядами",
+  "Разреши деревья в тротуаре",
+  "Кусты пореже",
+];
 
 /** Floating chat widget, bottom-left (Toaster owns bottom-right -- see
  * CLAUDE.md's z-index registry for the rest of the floating UI). Messages
@@ -33,7 +45,7 @@ export interface AssistantChatProps {
  * open, forgotten on reload" is exactly what useState already gives for
  * free -- no sessionStorage, no backend persistence, matching the backend
  * being a stateless proxy (assistant_service.py's own docstring explains why). */
-export function AssistantChat({ projectId, generating, settings, onApplyAction }: AssistantChatProps) {
+export function AssistantChat({ projectId, generating, settings, onApplyAction, planId, selectedItemId }: AssistantChatProps) {
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
   const [draft, setDraft] = useState("");
@@ -58,10 +70,10 @@ export function AssistantChat({ projectId, generating, settings, onApplyAction }
 
   const busy = sending || generating;
 
-  async function send() {
-    const text = draft.trim();
+  async function send(preset?: string) {
+    const text = (preset ?? draft).trim();
     if (!text || !projectId || busy) return;
-    setDraft("");
+    if (!preset) setDraft("");
     // The backend holds no conversation state of its own (see
     // assistant_service.py) -- the full transcript rides along on every
     // message, built from what's already on screen rather than a second
@@ -70,7 +82,7 @@ export function AssistantChat({ projectId, generating, settings, onApplyAction }
     setMessages((prev) => [...prev, { role: "user", content: text }]);
     setSending(true);
     try {
-      const result = await askAssistant(projectId, text, history, settings);
+      const result = await askAssistant(projectId, text, history, settings, { planId, selectedItemId });
       setMessages((prev) => [...prev, { role: "assistant", content: result.reply }]);
       if (result.action) {
         try {
@@ -105,9 +117,24 @@ export function AssistantChat({ projectId, generating, settings, onApplyAction }
 
           <div ref={scrollRef} className="flex-1 overflow-y-auto px-3 py-2">
             {messages.length === 0 && (
-              <p className="mt-2 text-xs text-stone-400">
-                Привет! Помогу настроить план — например «побольше деревьев» или «посади кусты пореже».
-              </p>
+              <div className="mt-2 flex flex-col gap-2">
+                <p className="text-xs text-stone-400">
+                  Привет! Объясню план и поменяю настройки — например «почему так мало деревьев?» или «посади кусты
+                  пореже». Выделите посадку на карте — расскажу, почему она стоит именно там.
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {SUGGESTIONS.map((text) => (
+                    <button
+                      key={text}
+                      onClick={() => send(text)}
+                      disabled={!projectId || busy}
+                      className="rounded-full border border-stone-600 px-2 py-0.5 text-[11px] text-stone-300 hover:bg-stone-800 disabled:opacity-40"
+                    >
+                      {text}
+                    </button>
+                  ))}
+                </div>
+              </div>
             )}
             <div className="flex flex-col gap-2">
               {messages.map((m, i) => (
@@ -147,7 +174,7 @@ export function AssistantChat({ projectId, generating, settings, onApplyAction }
               className="flex-1 rounded border border-stone-600 bg-stone-900 px-2 py-1.5 text-sm disabled:opacity-50"
             />
             <button
-              onClick={send}
+              onClick={() => send()}
               disabled={!projectId || !draft.trim() || busy}
               className="flex-none rounded-md bg-greenery-600 p-1.5 text-white hover:bg-greenery-700 disabled:opacity-40"
               aria-label="Отправить"

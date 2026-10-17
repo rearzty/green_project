@@ -173,3 +173,71 @@ class TestAdversarialToolCallArguments:
         assert action.shrub_spacing_m == CURRENT.shrub_spacing_m
         assert action.planting_types == CURRENT.planting_types
         assert reply == "Хорошо."
+
+
+class TestNewSettings:
+    def test_tool_call_can_switch_rows_paving_and_mode(self, monkeypatch):
+        monkeypatch.setattr(settings, "groq_api_key", "test-key")
+        payload = _chat_completion(tool_call_args={"tree_rows": 2, "trees_in_paving": True, "scoring_mode": "ml"})
+        monkeypatch.setattr(assistant_service.httpx, "AsyncClient", lambda **kw: _FakeAsyncClient(payload, **kw))
+
+        _, action = asyncio.run(assistant_service.ask_yuna("две аллеи и деревья в тротуаре", [], CURRENT))
+
+        assert action.tree_rows == 2 and action.trees_in_paving is True and action.scoring_mode == "ml"
+        assert action.tree_spacing_m == 5.0
+
+    def test_garbage_rows_paving_and_mode_fall_back_to_current(self, monkeypatch):
+        monkeypatch.setattr(settings, "groq_api_key", "test-key")
+        payload = _chat_completion(tool_call_args={"tree_rows": 7, "trees_in_paving": "yes", "scoring_mode": "magic"})
+        monkeypatch.setattr(assistant_service.httpx, "AsyncClient", lambda **kw: _FakeAsyncClient(payload, **kw))
+
+        _, action = asyncio.run(assistant_service.ask_yuna("что-нибудь", [], CURRENT))
+
+        assert action.tree_rows == 1 and action.trees_in_paving is False and action.scoring_mode == "heuristic"
+
+    def test_plan_context_is_sent_and_history_is_trimmed(self, monkeypatch):
+        monkeypatch.setattr(settings, "groq_api_key", "test-key")
+        sent = {}
+
+        class _Recording(_FakeAsyncClient):
+            async def post(self, *args, **kwargs):
+                sent.update(kwargs["json"])
+                return await super().post(*args, **kwargs)
+
+        payload = _chat_completion(content="Под деревья остаётся 0,3 % участка.")
+        monkeypatch.setattr(assistant_service.httpx, "AsyncClient", lambda **kw: _Recording(payload, **kw))
+        from backend.app.schemas.assistant import AssistantChatMessage
+
+        history = [AssistantChatMessage(role="user", content=f"m{i}") for i in range(40)]
+        asyncio.run(assistant_service.ask_yuna("почему мало деревьев?", history, CURRENT, "Сводка текущего плана: X"))
+
+        contents = [m["content"] for m in sent["messages"]]
+        assert "Сводка текущего плана: X" in contents
+        assert len(sent["messages"]) <= 3 + assistant_service._MAX_HISTORY_MESSAGES + 1
+
+
+def test_plan_context_summarises_counts_schemes_and_area_budget():
+    from shapely.geometry import Point
+
+    from backend.app.db.models import Plan, PlantingItemRow, Project
+    from backend.app.services.assistant_context import plan_context
+    from geo_engine.planner import ROW_RATIONALE_PREFIX, TREE_GROUP_RATIONALE_PREFIX
+
+    project = Project(name="t")
+    plan = Plan(project_id=project.id, scoring_mode="heuristic", planting_types=["tree"])
+    plan.items = [
+        PlantingItemRow(plan_id=plan.id, geometry=Point(0, 0), planting_type="tree", species="Липа", rationale=f"{ROW_RATIONALE_PREFIX} x"),
+        PlantingItemRow(plan_id=plan.id, geometry=Point(9, 0), planting_type="tree", species="Клён", rationale=f"{TREE_GROUP_RATIONALE_PREFIX} y"),
+    ]
+    plan.area_budget = [{
+        "planting_type": "tree", "territory_m2": 60701.0, "usable_m2": 204.0, "usable_share": 0.0034,
+        "blockers": [{"object_type": "road", "label": "край проезжей части", "share": 0.92}],
+    }]
+    project.plans = [plan]
+
+    text = plan_context(project, plan.id)
+
+    assert "деревья 2" in text
+    assert "рядом вдоль улиц и границы участка 1" in text and "группами деревьев 1" in text
+    assert "204 м² из 60701" in text and "край проезжей части — 92 %" in text
+    assert plan_context(project, "нет-такого") is None
