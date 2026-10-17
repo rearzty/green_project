@@ -30,7 +30,7 @@ from geo_engine.compliance import explain_items, report_payload, write_trace_csv
 from geo_engine.io.dwg_convert import convert_dwg_to_dxf
 from geo_engine.io.dxf_reader import discover_bundle_members
 from geo_engine.io.dxf_writer import write_dxf
-from geo_engine.io.result_package import copy_references, xref_attachment_count
+from geo_engine.io.result_package import copy_references, missing_references, place_by_saved_paths, xref_paths
 from geo_engine.model import PlantingItem
 
 
@@ -92,10 +92,21 @@ def plan_to_package(plan: Plan, output_zip: str | Path) -> Path:
             write_dxf(items, plan_path, records=records)
 
         references = 0
+        missing: list[str] = []
         if base is not None and main is not None:
-            references = len(copy_references(main, members, package)) if xref_attachment_count(base) else 0
+            attached = xref_paths(base)
+            references = len(copy_references(main, members, package)) if attached else 0
+            if attached:
+                place_by_saved_paths(attached, members, package)
             if references:
                 note += f"; внешних ссылок рядом: {references}"
+            missing = missing_references(attached, package)
+            if missing:
+                note += (
+                    f"; в исходной поставке нет {len(missing)} файл(ов), на которые ссылается чертёж "
+                    f"(AutoCAD покажет их как ненайденные и у исходника): {', '.join(missing[:10])}"
+                    + (" …" if len(missing) > 10 else "")
+                )
 
         report = report_payload(
             records,

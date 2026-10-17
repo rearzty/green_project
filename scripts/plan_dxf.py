@@ -42,7 +42,7 @@ from geo_engine.planner import (
     plan_items,
 )
 from geo_engine.area_budget import area_budget
-from geo_engine.io.result_package import copy_references, xref_attachment_count
+from geo_engine.io.result_package import copy_references, missing_references, place_by_saved_paths, xref_paths
 from geo_engine.species import load_catalogue
 from geo_engine.territory import MissingTerritoryError, territory_polygon
 from ml_scoring.heuristic_scorer import HeuristicScorer
@@ -469,7 +469,8 @@ def main(argv: list[str] | None = None) -> int:
         base = pick_base_drawing(entity_counts, main_drawing)
         references = 0
         if main_drawing in entity_counts:
-            references = xref_attachment_count(main_drawing)
+            attached_paths = xref_paths(main_drawing)
+            references = len(attached_paths)
             if references:
                 # Главный чертёж — набор внешних ссылок: как холст он и есть
                 # проект целиком, если ссылки лежат рядом (копируются ниже).
@@ -501,6 +502,14 @@ def main(argv: list[str] | None = None) -> int:
                 f"     внешних ссылок в чертеже: {references}; файлы ссылок положены рядом с результатом "
                 f"({len(copied)} шт.) — AutoCAD подгрузит все листы проекта"
             )
+            place_by_saved_paths(attached_paths, original_members, args.output.parent)
+            missing = missing_references(attached_paths, args.output.parent)
+            if missing:
+                print(
+                    f"     ! в исходной поставке нет {len(missing)} файл(ов), на которые ссылается главный "
+                    f"чертёж — AutoCAD покажет их как ненайденные и у исходника: {', '.join(missing[:8])}"
+                    + (" …" if len(missing) > 8 else "")
+                )
 
     report_path = args.report or args.output.with_suffix(".report.json")
     unverified = unverified_sources(records)

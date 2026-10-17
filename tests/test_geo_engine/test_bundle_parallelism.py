@@ -315,7 +315,7 @@ def test_a_broken_read_pool_reads_the_rest_sequentially_instead_of_dropping_file
         doc.saveas(str(tmp_path / name))
         paths.append(tmp_path / name)
 
-    monkeypatch.setattr(dxf_reader, "ProcessPoolExecutor", _BrokenPool)
+    monkeypatch.setattr(dxf_reader, "process_pool", _BrokenPool)
     errors = []
     utilities, zones = dxf_reader.read_dxf_bundle(
         paths, layer_map=dxf_reader.COMBINED_LAYER_MAP, on_error=lambda p, e: errors.append(p)
@@ -343,7 +343,7 @@ def test_the_web_read_path_also_survives_a_broken_pool(tmp_path, monkeypatch):
     boundary.modelspace().add_lwpolyline([(0, 0), (60, 0), (60, 40), (0, 40)], close=True, dxfattribs={"layer": "!Граница работ"})
     boundary.saveas(str(site / "Xrefs" / "b.dxf"))
 
-    monkeypatch.setattr(dxf_reader, "ProcessPoolExecutor", _BrokenPool)
+    monkeypatch.setattr(dxf_reader, "process_pool", _BrokenPool)
     errors = []
     utilities, zones, _ = dxf_reader.resolve_and_read_bundle(
         site, tmp_path / "work", layer_map=dxf_reader.COMBINED_LAYER_MAP, on_error=lambda p, e: errors.append(p)

@@ -38,6 +38,7 @@ import os
 import threading
 from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor
+from geo_engine.parallel import process_pool
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -421,7 +422,7 @@ def _render_groups_parallel(
     win is that groups have no dependency on each other, so this is
     embarrassingly parallel; it just never used to be split up."""
     worker_count = max(1, min(len(by_group), _MAX_RENDER_WORKERS, os.cpu_count() or 1))
-    with ProcessPoolExecutor(max_workers=worker_count) as pool:
+    with process_pool(max_workers=worker_count) as pool:
         futures = [
             pool.submit(_render_group_worker, key, geoms, px_w, px_h, minx, maxy, scale, colors[key])
             for key, geoms in by_group.items()

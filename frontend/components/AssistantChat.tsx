@@ -28,6 +28,9 @@ export interface AssistantChatProps {
   /** План на экране и выделенная посадка — по ним Юна отвечает по фактам. */
   planId?: string;
   selectedItemId?: string;
+  /** Открытая боковая панель занимает левый край — кнопка чата встаёт правее
+   * неё, иначе на десктопе перекрывала переключатель «Эвристика / ML». */
+  sidebarOpen?: boolean;
 }
 
 /** Готовые вопросы — чтобы на показе не печатать вживую. */
@@ -45,7 +48,7 @@ const SUGGESTIONS = [
  * open, forgotten on reload" is exactly what useState already gives for
  * free -- no sessionStorage, no backend persistence, matching the backend
  * being a stateless proxy (assistant_service.py's own docstring explains why). */
-export function AssistantChat({ projectId, generating, settings, onApplyAction, planId, selectedItemId }: AssistantChatProps) {
+export function AssistantChat({ projectId, generating, settings, onApplyAction, planId, selectedItemId, sidebarOpen }: AssistantChatProps) {
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
   const [draft, setDraft] = useState("");
@@ -99,7 +102,7 @@ export function AssistantChat({ projectId, generating, settings, onApplyAction, 
   }
 
   return (
-    <div className="fixed bottom-4 left-4 z-[1100] flex flex-col items-start gap-2">
+    <div className={cn("fixed bottom-4 left-4 z-[1100] flex flex-col items-start gap-2", sidebarOpen && "md:left-[336px]")}>
       {open && (
         <div className="flex h-[28rem] w-80 max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-lg border border-stone-700 bg-stone-900 shadow-lg">
           <div className="flex items-center justify-between gap-2 border-b border-stone-700 bg-stone-800/60 px-3 py-2">

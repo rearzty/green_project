@@ -84,7 +84,7 @@ class TestParallelThresholdGate:
         """Default threshold, tiny synthetic scene -- ProcessPoolExecutor
         must not be constructed at all, only the sequential per-type loop."""
         territory, utilities, zones = synthetic_scene["territory"], synthetic_scene["utilities"], synthetic_scene["zones"]
-        with patch.object(planner, "ProcessPoolExecutor") as mock_pool:
+        with patch.object(planner, "process_pool") as mock_pool:
             items = plan_items("planner-test", utilities, zones, territory, ["tree", "shrub"], _constant_score_fn, NORMS)
         mock_pool.assert_not_called()
         assert items
@@ -95,7 +95,7 @@ class TestParallelThresholdGate:
         # сколько свободной памяти на машине, где он запущен.
         with patch.object(planner, "_PARALLEL_PLAN_THRESHOLD", 0), patch.object(
             planner, "_memory_capped_plan_workers", return_value=8
-        ), patch.object(planner, "ProcessPoolExecutor", wraps=planner.ProcessPoolExecutor) as mock_pool:
+        ), patch.object(planner, "process_pool", wraps=planner.process_pool) as mock_pool:
             items = plan_items("planner-test", utilities, zones, territory, ["tree", "shrub"], _constant_score_fn, NORMS)
         mock_pool.assert_called_once()
         assert items
@@ -104,7 +104,7 @@ class TestParallelThresholdGate:
         """Nothing to parallelize across with only one type -- the pool
         should stay unused even with the threshold forced to 0."""
         territory, utilities, zones = synthetic_scene["territory"], synthetic_scene["utilities"], synthetic_scene["zones"]
-        with patch.object(planner, "_PARALLEL_PLAN_THRESHOLD", 0), patch.object(planner, "ProcessPoolExecutor") as mock_pool:
+        with patch.object(planner, "_PARALLEL_PLAN_THRESHOLD", 0), patch.object(planner, "process_pool") as mock_pool:
             items = plan_items("planner-test", utilities, zones, territory, ["tree"], _constant_score_fn, NORMS)
         mock_pool.assert_not_called()
         assert items
@@ -386,7 +386,7 @@ class TestParallelPlanFallback:
             def submit(self, *a, **kw):
                 raise BrokenProcessPool("воркер убит")
 
-        monkeypatch.setattr(planner, "ProcessPoolExecutor", _ExplodingPool)
+        monkeypatch.setattr(planner, "process_pool", _ExplodingPool)
         # Порог параллелизма должен быть пройден, иначе ветка не та.
         monkeypatch.setattr(planner, "_PARALLEL_PLAN_THRESHOLD", 0)
 
@@ -449,3 +449,29 @@ class TestSpeciesDiversity:
     def test_an_explicit_species_choice_is_respected(self, synthetic_scene):
         items = self._plan(synthetic_scene, overrides={"shrub": "Спирея японская"})
         assert {i.species for i in items if i.planting_type == "shrub"} == {"Спирея японская"}
+
+
+def test_tree_species_is_chosen_by_the_site_not_by_the_plan_key():
+    """«6. Камчатская» давала 108 или 247 деревьев в зависимости от того,
+    какие три породы из пяти выпали по сиду плана. Порода ряда теперь
+    выбирается перебором всех нормативно разных вариантов."""
+    from shapely.geometry import LineString, box
+
+    from geo_engine import planner
+    from geo_engine.model import Zone
+    from geo_engine.norms import load_norms
+
+    territory = box(0, 0, 160, 60)
+    zones = [
+        Zone(geometry=territory, zone_type="territory"),
+        Zone(geometry=LineString([(0, 0), (160, 0)]), zone_type="road"),
+    ]
+    results = []
+    for key in ("a", "b", "c", "d", "e"):
+        items = planner.plan_items(
+            key, [], zones, territory, ["tree"], lambda c: [(1.0, "т") for _ in c], load_norms(),
+            pattern="row",
+        )
+        results.append(len(items))
+
+    assert len(set(results)) == 1
