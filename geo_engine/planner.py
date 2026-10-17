@@ -17,6 +17,7 @@ import random
 import zlib
 from collections.abc import Callable, Collection
 from concurrent.futures import ProcessPoolExecutor
+from geo_engine.parallel import process_pool
 from concurrent.futures.process import BrokenProcessPool
 
 from shapely.geometry.base import BaseGeometry
@@ -1066,7 +1067,7 @@ def plan_items(
     if worker_count > 1 and len(utilities) + len(zones) >= _PARALLEL_PLAN_THRESHOLD:
         items: list[PlantingItem] = []
         try:
-            with ProcessPoolExecutor(max_workers=worker_count) as pool:
+            with process_pool(max_workers=worker_count) as pool:
                 futures = [
                     pool.submit(
                         _plan_type_items,
