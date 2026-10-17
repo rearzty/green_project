@@ -467,6 +467,7 @@ export default function Home() {
         }}
         planId={plan?.plan_id}
         selectedItemId={singleSelectedId}
+        sidebarOpen={sidebarOpen}
         onApplyAction={handleAssistantAction}
       />
     </main>
