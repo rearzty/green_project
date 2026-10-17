@@ -40,6 +40,13 @@ CONTEXT_MARGIN_M = 30.0
 # туда незачем и везти.
 _SCENE_ZONE_TYPES = ("building", "road", "existing_greenery")
 
+# Здание уже этого (средняя ширина 2·S/P) — не дом, а обрывок контура: при
+# чтении незамкнутые линии слоя «Здания» раздуваются на 0,3 м, чтобы остаться
+# препятствием для посадки (geometry_cleanup.reconstruct_closed_footprints).
+# В расчёте отступов так и надо, а в 3D их выдавливание на 9-24 м даёт
+# частокол стен-пластин — живьём на «5. Багрицкого» 2667 из 2734 «зданий».
+_MIN_BUILDING_WIDTH_M = 1.5
+
 
 def _polygonal(geometry: BaseGeometry) -> BaseGeometry | None:
     if geometry is None or geometry.is_empty:
@@ -93,6 +100,8 @@ def scene_layers(project: Project) -> GeoJSONFeatureCollection:
                 geometry = _polygonal(geometry.intersection(region))
                 if geometry is None:
                     continue
+        if layer.object_type == "building" and 2 * geometry.area / max(geometry.length, 1e-9) < _MIN_BUILDING_WIDTH_M:
+            continue
         add(geometry, "zone", layer.object_type)
 
     return GeoJSONFeatureCollection(features=features)

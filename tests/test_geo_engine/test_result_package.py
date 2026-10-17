@@ -36,3 +36,32 @@ def test_a_reference_above_the_main_folder_lands_next_to_the_result(tmp_path):
     targets = reference_targets(main, [main, ref], tmp_path / "out")
 
     assert targets == {ref.resolve(): tmp_path / "out" / "Границы работ.dwg"}
+
+
+def test_missing_references_lists_only_files_absent_by_path_and_by_name(tmp_path):
+    from geo_engine.io.result_package import missing_references
+
+    (tmp_path / "xref").mkdir()
+    (tmp_path / "xref" / "a.dwg").write_bytes(b"")
+    (tmp_path / "b.dwg").write_bytes(b"")
+
+    missing = missing_references([r".\xref\a.dwg", r"..\other\b.dwg", "Штриховка.dwg", ""], tmp_path)
+
+    assert missing == ["Штриховка.dwg"]
+
+
+def test_a_reference_saved_under_another_folder_is_placed_where_the_drawing_looks(tmp_path):
+    """«6. Камчатская»: чертёж ищет ./игди/x.dwg, в поставке файл лежит в
+    ./Внешние ссылки/игди/x.dwg."""
+    from geo_engine.io.result_package import missing_references, place_by_saved_paths
+
+    source = tmp_path / "src" / "Внешние ссылки" / "игди"
+    source.mkdir(parents=True)
+    (source / "x.dwg").write_bytes(b"x")
+    dest = tmp_path / "out"
+    dest.mkdir()
+
+    placed = place_by_saved_paths([r".\игди\x.dwg", r"C:\abs\y.dwg"], [source / "x.dwg"], dest)
+
+    assert placed == 1 and (dest / "игди" / "x.dwg").exists()
+    assert missing_references([r".\игди\x.dwg"], dest) == []

@@ -62,7 +62,68 @@ def copy_references(main: Path, members: list[Path], dest_dir: Path) -> list[Pat
 
 
 def xref_attachment_count(dxf_path: Path) -> int:
-    """Сколько внешних ссылок прикреплено к чертежу. Главный чертёж проекта
+    """Сколько внешних ссылок прикреплено к чертежу."""
+    return len(xref_paths(dxf_path))
+
+
+def _saved_relative(raw: str) -> str:
+    return raw.replace("\\", "/").lstrip("./") if raw else ""
+
+
+def place_by_saved_paths(paths: list[str], members: list[Path], dest_dir: Path) -> int:
+    """Положить копию файла ссылки туда, где его ищет главный чертёж, если
+    по сохранённому пути его нет, а файл с тем же именем в поставке есть.
+
+    Живьём на «6. Камчатская»: главный чертёж ссылается на `./игди/...`, а
+    файлы лежат в `./Внешние ссылки/игди/...` — в исходной поставке AutoCAD не
+    нашёл бы ни одной из четырёх ссылок. В результате они находятся.
+    Абсолютные пути (`C:/...`) не трогаем — выходить за папку результата нельзя.
+    """
+    dest_dir = Path(dest_dir)
+    by_name: dict[str, Path] = {}
+    for member in members:
+        by_name.setdefault(Path(member).name.casefold(), Path(member))
+    placed = 0
+    for raw in paths:
+        relative = _saved_relative(raw)
+        if not relative or ":" in relative or relative.startswith("/") or ".." in Path(relative).parts:
+            continue
+        target = dest_dir / relative
+        if target.exists():
+            continue
+        source = by_name.get(Path(relative).name.casefold())
+        if source is None or not source.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        placed += 1
+    return placed
+
+
+def missing_references(paths: list[str], dest_dir: Path) -> list[str]:
+    """Ссылки, файлов которых рядом с результатом нет — ни по сохранённому
+    относительному пути, ни по имени (AutoCAD ищет в обоих местах).
+
+    На пилоте это пробел самой поставки: «5. Багрицкого» ссылается на 16
+    файлов, которых в архиве улицы нет (`Штриховка.dwg`, листы с другим
+    номером заказа). AutoCAD покажет их как ненайденные и у исходника, но в
+    нашем результате это легко принять за наш брак — поэтому список уходит
+    в отчёт.
+    """
+    dest_dir = Path(dest_dir)
+    missing = []
+    for raw in paths:
+        relative = _saved_relative(raw)
+        if not relative:
+            continue
+        name = Path(relative).name
+        if not ((dest_dir / relative).exists() or (dest_dir / name).exists()):
+            missing.append(name)
+    return missing
+
+
+def xref_paths(dxf_path: Path) -> list[str]:
+    """Сохранённые пути внешних ссылок чертежа. Главный чертёж проекта
     обычно маленький (ссылки и рамка), так что открыть его целиком дёшево."""
     import ezdxf
     import ezdxf.recover
@@ -76,4 +137,8 @@ def xref_attachment_count(dxf_path: Path) -> int:
             doc, _ = ezdxf.recover.readfile(str(dxf_path))
         except Exception:  # noqa: BLE001 — нечитаемый чертёж ссылок не несёт
             return 0
-    return sum(1 for block in doc.blocks if block.block_record.is_xref)
+    return [
+        block.block.dxf.get("xref_path") or ""
+        for block in doc.blocks
+        if block.block_record.is_xref
+    ]

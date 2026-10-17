@@ -84,7 +84,7 @@ class TestParallelThresholdGate:
         """Default threshold, tiny synthetic scene -- ProcessPoolExecutor
         must not be constructed at all, only the sequential per-type loop."""
         territory, utilities, zones = synthetic_scene["territory"], synthetic_scene["utilities"], synthetic_scene["zones"]
-        with patch.object(planner, "ProcessPoolExecutor") as mock_pool:
+        with patch.object(planner, "process_pool") as mock_pool:
             items = plan_items("planner-test", utilities, zones, territory, ["tree", "shrub"], _constant_score_fn, NORMS)
         mock_pool.assert_not_called()
         assert items
@@ -95,7 +95,7 @@ class TestParallelThresholdGate:
         # сколько свободной памяти на машине, где он запущен.
         with patch.object(planner, "_PARALLEL_PLAN_THRESHOLD", 0), patch.object(
             planner, "_memory_capped_plan_workers", return_value=8
-        ), patch.object(planner, "ProcessPoolExecutor", wraps=planner.ProcessPoolExecutor) as mock_pool:
+        ), patch.object(planner, "process_pool", wraps=planner.process_pool) as mock_pool:
             items = plan_items("planner-test", utilities, zones, territory, ["tree", "shrub"], _constant_score_fn, NORMS)
         mock_pool.assert_called_once()
         assert items
@@ -104,7 +104,7 @@ class TestParallelThresholdGate:
         """Nothing to parallelize across with only one type -- the pool
         should stay unused even with the threshold forced to 0."""
         territory, utilities, zones = synthetic_scene["territory"], synthetic_scene["utilities"], synthetic_scene["zones"]
-        with patch.object(planner, "_PARALLEL_PLAN_THRESHOLD", 0), patch.object(planner, "ProcessPoolExecutor") as mock_pool:
+        with patch.object(planner, "_PARALLEL_PLAN_THRESHOLD", 0), patch.object(planner, "process_pool") as mock_pool:
             items = plan_items("planner-test", utilities, zones, territory, ["tree"], _constant_score_fn, NORMS)
         mock_pool.assert_not_called()
         assert items
@@ -386,7 +386,7 @@ class TestParallelPlanFallback:
             def submit(self, *a, **kw):
                 raise BrokenProcessPool("воркер убит")
 
-        monkeypatch.setattr(planner, "ProcessPoolExecutor", _ExplodingPool)
+        monkeypatch.setattr(planner, "process_pool", _ExplodingPool)
         # Порог параллелизма должен быть пройден, иначе ветка не та.
         monkeypatch.setattr(planner, "_PARALLEL_PLAN_THRESHOLD", 0)
 

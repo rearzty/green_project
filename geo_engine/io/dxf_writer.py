@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
+from geo_engine.parallel import process_pool
 from pathlib import Path
 
 import ezdxf
@@ -173,7 +174,7 @@ def _write_items_by_type_parallel(doc, msp, by_type: dict[str, tuple[list[Planti
     worker_count = min(len(by_type), os.cpu_count() or 1)
     tmp_paths: list[str] = []
     try:
-        with ProcessPoolExecutor(max_workers=worker_count) as pool:
+        with process_pool(max_workers=worker_count) as pool:
             chunks = list(by_type.values())
             futures = [pool.submit(_build_type_chunk_document, chunk_items, chunk_records, prefix) for chunk_items, chunk_records in chunks]
             for future, (_chunk_items, chunk_records) in zip(futures, chunks):

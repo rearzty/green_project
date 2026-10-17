@@ -27,6 +27,7 @@ import math
 import os
 import sys
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from geo_engine.parallel import process_pool
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from collections.abc import Callable
@@ -1314,7 +1315,7 @@ def read_dxf_bundle(
         # how submission was scheduled.
         ordered = sorted(paths, key=lambda p: p.stat().st_size, reverse=True)
         pool_broken: list[bool] = []
-        with ProcessPoolExecutor(max_workers=worker_count) as pool:
+        with process_pool(max_workers=worker_count) as pool:
             future_by_path = {
                 path: pool.submit(
                     _read_one_bundle_file,
@@ -1626,7 +1627,7 @@ def resolve_and_read_bundle(
     utilities: list[Utility] = []
     zones: list[Zone] = []
 
-    with ProcessPoolExecutor(max_workers=_read_pool_worker_count(all_members)) as read_pool:
+    with process_pool(max_workers=_read_pool_worker_count(all_members)) as read_pool:
         # The main file needs no waiting -- already converted above -- so its
         # read starts immediately, overlapped with every other file below
         # instead of just being "first in line" the way the old sequential
