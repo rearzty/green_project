@@ -529,6 +529,9 @@ export interface AssistantGenerationSettings {
   planting_types: PlantingType[];
   tree_spacing_m?: number;
   shrub_spacing_m?: number;
+  scoring_mode: ScoringMode;
+  tree_rows: number;
+  trees_in_paving: boolean;
 }
 
 /** Present only when Юна decided the message asked for a settings change --
@@ -538,6 +541,9 @@ export interface AssistantAction {
   planting_types: PlantingType[];
   tree_spacing_m?: number;
   shrub_spacing_m?: number;
+  scoring_mode: ScoringMode;
+  tree_rows: number;
+  trees_in_paving: boolean;
 }
 
 export interface AssistantMessageResult {
@@ -549,7 +555,16 @@ export async function askAssistant(
   projectId: string,
   message: string,
   history: AssistantChatMessage[],
-  currentSettings: AssistantGenerationSettings
+  currentSettings: AssistantGenerationSettings,
+  // Какой план на экране и какая посадка выделена: по ним бэкенд собирает
+  // для Юны сводку плана и обоснование посадки (assistant_context.py).
+  context?: { planId?: string; selectedItemId?: string }
 ): Promise<AssistantMessageResult> {
-  return postJson(`/api/projects/${projectId}/assistant/message`, { message, history, settings: currentSettings });
+  return postJson(`/api/projects/${projectId}/assistant/message`, {
+    message,
+    history,
+    settings: currentSettings,
+    plan_id: context?.planId,
+    selected_item_id: context?.selectedItemId,
+  });
 }
