@@ -105,6 +105,11 @@ export interface ControlPanelProps {
   onTreeSpacingMChange: (value: number | undefined) => void;
   shrubSpacingM?: number;
   onShrubSpacingMChange: (value: number | undefined) => void;
+  /** Тоже подняты в app/page.tsx — их может включить Юна. */
+  treeRows: number;
+  onTreeRowsChange: (rows: number) => void;
+  treesInPaving: boolean;
+  onTreesInPavingChange: (value: boolean) => void;
   /** Current planting-norms defaults (GET /api/config/planting-norms),
    * fetched once in app/page.tsx -- shown as the interval inputs'
    * placeholder so the panel never hardcodes a number that could drift from
@@ -208,6 +213,10 @@ export function ControlPanel({
   onTreeSpacingMChange,
   shrubSpacingM,
   onShrubSpacingMChange,
+  treeRows,
+  onTreeRowsChange,
+  treesInPaving,
+  onTreesInPavingChange,
   plantingNorms,
   onExportDxf,
   onClearAll,
@@ -244,8 +253,6 @@ export function ControlPanel({
   onDownloadComplianceReport,
 }: ControlPanelProps) {
   const [file, setFile] = useState<File | null>(null);
-  const [doubleRow, setDoubleRow] = useState(false);
-  const [treesInPaving, setTreesInPaving] = useState(false);
   const [name, setName] = useState("Тестовая территория");
   // Defaults to the CRS scripts/generate_synthetic_data.py writes test data
   // in (UTM 37N, covers Moscow) so synthetic uploads land on the real map
@@ -459,8 +466,8 @@ export function ControlPanel({
             >
               <input
                 type="checkbox"
-                checked={doubleRow}
-                onChange={(e) => setDoubleRow(e.target.checked)}
+                checked={treeRows === 2}
+                onChange={(e) => onTreeRowsChange(e.target.checked ? 2 : 1)}
                 disabled={!plantingTypes.includes("tree")}
                 className="h-4 w-4 accent-greenery-600 disabled:opacity-50"
               />
@@ -473,7 +480,7 @@ export function ControlPanel({
               <input
                 type="checkbox"
                 checked={treesInPaving}
-                onChange={(e) => setTreesInPaving(e.target.checked)}
+                onChange={(e) => onTreesInPavingChange(e.target.checked)}
                 disabled={!plantingTypes.includes("tree")}
                 className="h-4 w-4 accent-greenery-600 disabled:opacity-50"
               />
@@ -492,7 +499,7 @@ export function ControlPanel({
           </div>
           <Button
             disabled={!hasProject || plantingTypes.length === 0 || busy || editBusy || generating}
-            onClick={() => guarded(() => onGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM, treeRows: doubleRow ? 2 : 1, treesInPaving }))}
+            onClick={() => guarded(() => onGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM, treeRows, treesInPaving }))}
           >
             Сгенерировать план
           </Button>

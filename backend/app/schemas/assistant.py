@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from backend.app.schemas.plan import PlantingType
+from backend.app.schemas.plan import PlantingType, ScoringMode
 
 
 class AssistantChatMessage(BaseModel):
@@ -26,12 +26,21 @@ class AssistantGenerationSettings(BaseModel):
     planting_types: list[PlantingType]
     tree_spacing_m: float | None = None
     shrub_spacing_m: float | None = None
+    scoring_mode: ScoringMode = "heuristic"
+    tree_rows: int = 1
+    trees_in_paving: bool = False
 
 
 class AssistantMessageRequest(BaseModel):
     message: str
     history: list[AssistantChatMessage] = []
     settings: AssistantGenerationSettings
+    # Какой план сейчас на экране и какая посадка выделена — чтобы Юна
+    # отвечала по фактам плана («почему мало деревьев», «почему здесь»), а
+    # не общими словами. Оба необязательны: без плана она просто настраивает
+    # генерацию, как раньше.
+    plan_id: str | None = None
+    selected_item_id: str | None = None
 
 
 class AssistantAction(BaseModel):
@@ -44,6 +53,9 @@ class AssistantAction(BaseModel):
     planting_types: list[PlantingType]
     tree_spacing_m: float | None = None
     shrub_spacing_m: float | None = None
+    scoring_mode: ScoringMode = "heuristic"
+    tree_rows: int = 1
+    trees_in_paving: bool = False
 
 
 class AssistantMessageResponse(BaseModel):
