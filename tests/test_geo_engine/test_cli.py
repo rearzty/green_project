@@ -169,19 +169,11 @@ def test_the_same_plan_key_reproduces_the_same_plan(tmp_path):
     assert positions[0] == positions[1]
 
 
-def test_a_different_plan_key_gives_a_different_layout(tmp_path):
-    """--density tree=0 disables the default density cap on purpose: the row
-    phase picks its species by which one fits the most rows, not by plan_key
-    (see planner._fit_row_species), so it's identical across plan_keys on
-    this drawing (103 "Рябина обыкновенная" either way) -- what actually
-    varies with plan_key is the scatter phase's second species/count. With
-    the default cap (25 trees/ha on this drawing's 1.08 ha -> 27 allowed)
-    the row alone already exceeds that, so capping keeps only row candidates
-    and the two plan_keys converge on byte-identical output -- a real,
-    correct interaction with DEFAULT_DENSITY_PER_HA (see planner.py), not
-    what this test means to exercise. Reproducibility-under-a-fixed-key is
-    covered separately above and isn't affected by this.
-    """
+def test_tree_layout_does_not_depend_on_the_plan_key(tmp_path):
+    """Деревья расставляются по площадке, а не по жребию: порода и схема
+    выбираются перебором (planner._tree_cascade), поэтому разные ключи плана
+    дают одну и ту же раскладку. Раньше тут проверялось обратное — и именно
+    это давало «6. Камчатская» то 108, то 247 деревьев."""
     source = _drawing(tmp_path)
 
     layouts = []
@@ -189,9 +181,9 @@ def test_a_different_plan_key_gives_a_different_layout(tmp_path):
         out = tmp_path / f"{key}.dxf"
         main(["--input", str(source), "--output", str(out), "--types", "tree", "--plan-key", key, "--density", "tree=0"])
         report = json.loads(out.with_suffix(".report.json").read_text(encoding="utf-8"))
-        layouts.append([(i["x"], i["y"]) for i in report["items"]])
+        layouts.append(sorted((i["x"], i["y"]) for i in report["items"]))
 
-    assert layouts[0] != layouts[1]
+    assert layouts[0] == layouts[1]
 
 
 def test_bundle_directory_input_picks_up_the_xrefs(tmp_path):
