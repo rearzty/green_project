@@ -11,6 +11,8 @@ export interface PlanItemInfo {
   type: PlantingType;
   /** tree/shrub are points, lawn is an area -- see the planting_type <-> geometry contract in CLAUDE.md. */
   isPoint: boolean;
+  /** Класс кроны дерева (wide/medium/narrow) — размер точки на карте. */
+  crown?: string;
   score: number;
   minLat: number;
   minLng: number;
@@ -53,6 +55,7 @@ function planItemInfo(feature: GeoJSONFeature): PlanItemInfo | undefined {
     id,
     type: feature.properties.planting_type as PlantingType,
     isPoint: feature.geometry.type === "Point",
+    crown: feature.properties.crown ? String(feature.properties.crown) : undefined,
     score: Number(feature.properties.score),
     ...box,
   };

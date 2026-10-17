@@ -70,16 +70,33 @@ const iconCache = new Map<string, L.DivIcon>();
  * (see git history). One shared icon per planting type: selection/violation
  * state is a CSS class toggled on each marker's own element, not a
  * different icon, so changing it never re-creates marker DOM. */
-function planItemIcon(type: string): L.DivIcon {
-  let icon = iconCache.get(type);
+/** Размер точки, px: у дерева — по классу кроны (широкая крона крупнее,
+ * как на дендроплане), кустарник мельче любого дерева. */
+function dotSize(type: string, crown?: string): number {
+  if (type === "shrub") return 7;
+  if (type !== "tree") return 10;
+  if (crown === "wide") return 16;
+  if (crown === "narrow") return 8;
+  return 12;
+}
+
+function iconKey(type: string, crown?: string): string {
+  return `${type}:${type === "tree" ? crown ?? "" : ""}`;
+}
+
+function planItemIcon(type: string, crown?: string): L.DivIcon {
+  const key = iconKey(type, crown);
+  let icon = iconCache.get(key);
   if (!icon) {
+    const size = dotSize(type, crown);
+    const box = size + 6;
     icon = L.divIcon({
       className: "gp-plan-marker",
-      html: `<span class="gp-plan-dot" style="background:${plantingColor(type)}"></span>`,
-      iconSize: [16, 16],
-      iconAnchor: [8, 8],
+      html: `<span class="gp-plan-dot" style="background:${plantingColor(type)};width:${size}px;height:${size}px"></span>`,
+      iconSize: [box, box],
+      iconAnchor: [box / 2, box / 2],
     });
-    iconCache.set(type, icon);
+    iconCache.set(key, icon);
   }
   return icon;
 }
@@ -759,10 +776,10 @@ function ClusteredMarkers({
         // and otherwise never revisited once mounted.
         const target = L.latLng(item.minLat, item.minLng);
         if (!existing.getLatLng().equals(target)) existing.setLatLng(target);
-        if (existing.options.icon !== iconCache.get(item.type)) existing.setIcon(planItemIcon(item.type));
+        if (existing.options.icon !== iconCache.get(iconKey(item.type, item.crown))) existing.setIcon(planItemIcon(item.type, item.crown));
         return;
       }
-      const marker = L.marker([item.minLat, item.minLng], { icon: planItemIcon(item.type), keyboard: false });
+      const marker = L.marker([item.minLat, item.minLng], { icon: planItemIcon(item.type, item.crown), keyboard: false });
       registerLayer(id, item.type, marker);
       marker.addTo(group);
       markers.set(id, marker);

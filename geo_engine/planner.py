@@ -185,6 +185,7 @@ def _fit_row_species(
     row_pitch_override_m: float | None = None,
     tree_rows: int = 1,
     area_cache: dict | None = None,
+    evaluated_out: list | None = None,
 ):
     """Выбрать из палитры породу, которой на этой площадке реально есть место.
 
@@ -298,6 +299,8 @@ def _fit_row_species(
             evaluated = list(pool.map(evaluate, candidates, copies))
     else:
         evaluated = [evaluate(candidates[0])]
+    if evaluated_out is not None:
+        evaluated_out.extend(result for result, _score in evaluated)
     best = None
     best_score: tuple = ()
     for result, score in evaluated:
@@ -434,6 +437,9 @@ def _accent_items(
     score_fn: Callable,
     seed: int,
     density_per_ha: float | None,
+    max_trees: int | None = None,
+    exclusion_index: ExclusionIndex | None = None,
+    zoning_index: ZoningIndex | None = None,
 ) -> list[PlantingItem]:
     """Группы деревьев и солитеры на площади, оставшейся после ряда.
 
@@ -444,14 +450,17 @@ def _accent_items(
     if area is None or area.is_empty:
         return []
     interval = type_norms.spacing_for(planting_type).min_distance_m
-    max_trees = None
-    if density_per_ha is not None and density_per_ha > 0:
+    # `max_trees` задаёт вызывающий, когда бюджет делится между несколькими
+    # проходами (каскад крон) — иначе бюджет считается от этой площади.
+    if max_trees is None and density_per_ha is not None and density_per_ha > 0:
         max_trees = max(1, int(round(density_per_ha * area.area / 10_000)))
+    if max_trees is not None and max_trees <= 0:
+        return []
     layout = accent_layout(area, interval, seed, max_trees=max_trees)
     if not layout:
         return []
-    exclusion_index = ExclusionIndex(exclusion)
-    zoning_index = ZoningIndex(zones)
+    exclusion_index = exclusion_index or ExclusionIndex(exclusion)
+    zoning_index = zoning_index or ZoningIndex(zones)
     items: list[PlantingItem] = []
     for kind, points in layout:
         clearances = exclusion_index.distances(points)
@@ -582,6 +591,184 @@ def norms_for_species(
     return norms.with_spacing_override(planting_type, spacing)
 
 
+CROWN_CASCADE_NOTE = "Крупнейшая крона, которой здесь хватает места по нормам."
+
+# Допуск при сравнении расстояний между поставленными деревьями — тот же
+# порядок, что _TOLERANCE_M в compliance.py.
+_CASCADE_EPS_M = 1e-3
+
+
+def _far_enough(candidates, placed, interval):
+    """Кандидаты, стоящие от каждого уже поставленного дерева не ближе
+    большего из двух интервалов (для смешанной пары акт числа не даёт —
+    берётся большее, как и в проверке compliance._neighbour_checks)."""
+    if not placed or not candidates:
+        return list(candidates)
+    from shapely.strtree import STRtree
+
+    tree = STRtree([g for g, _ in placed])
+    widest = max(max(i for _, i in placed), interval)
+    kept = []
+    for candidate in candidates:
+        ok = True
+        for index in tree.query(candidate.geometry, predicate="dwithin", distance=widest + _CASCADE_EPS_M):
+            other, other_interval = placed[int(index)]
+            if candidate.geometry.distance(other) < max(interval, other_interval) + _CASCADE_EPS_M:
+                ok = False
+                break
+        if ok:
+            kept.append(candidate)
+    return kept
+
+
+def _subtract_placed(area, placed, interval):
+    if not placed or area.is_empty:
+        return area
+    return area.difference(
+        unary_union(
+            [
+                geometry.buffer(max(interval, other) * _CLEARANCE_INFLATION, quad_segs=_CLEARANCE_QUAD_SEGS)
+                for geometry, other in placed
+            ]
+        )
+    )
+
+
+def _tree_cascade(
+    plan_key: str,
+    utilities: list[Utility],
+    zones: list[Zone],
+    territory: BaseGeometry,
+    score_fn: Callable,
+    norms: PlantingNorms,
+    keep_spacing_for: Collection[str],
+    pattern: str,
+    density_per_ha: float | None,
+    catalogue: SpeciesCatalogue,
+    tree_rows: int,
+) -> list[PlantingItem]:
+    """Деревья каскадом от крупной кроны к мелкой — так рисует проектировщик.
+
+    Одна порода на весь участок проигрывала в обе стороны: широкая крона
+    оставляла пустыми тесные полосы у бордюра, куда помещается рябина, а
+    узкая ставила рябины и там, где было место для липы. Теперь в каждом
+    месте стоит самая крупная крона, которой там хватает места по нормам
+    (отступы по породе — 743-ПП табл. 3.6.1 прим. 1 и 3, интервал по классу
+    кроны — МГСН 1.02-02 п. 4.2.9.2): сначала ряды широких крон, в оставшихся
+    местах — средних, в самых тесных — узких; затем так же группы и солитеры.
+    Между деревьями разных классов — больший из двух интервалов.
+
+    Классы — по одному представителю на нормативно разный вариант
+    (`_tree_species_candidates`), конкретная порода внутри класса потом
+    разнообразится `_diversify_species`. Зоны отступов всех классов строятся
+    в двух потоках (`_fit_row_species`) — те же, что и при выборе одной
+    породы, так что по времени каскад почти бесплатный.
+    """
+    planting_type = "tree"
+    classes = _tree_species_candidates(norms, catalogue)
+    seed = zlib.crc32(f"{plan_key}:{planting_type}".encode())
+    evaluated: list = []
+    _fit_row_species(
+        classes, planting_type, zones, territory, utilities, norms, keep_spacing_for, catalogue,
+        tree_rows=tree_rows, evaluated_out=evaluated,
+    )
+    def class_norms(species: Species) -> PlantingNorms:
+        if planting_type in keep_spacing_for:
+            return norms
+        return norms_for_species(norms, planting_type, species, catalogue)
+
+    if not evaluated:
+        return []
+
+    budget = None
+    if density_per_ha is not None and density_per_ha > 0:
+        budget = max(1, int(round(density_per_ha * evaluated[0][5].area / 10_000)))
+
+    # Индексы строятся один раз на класс и переиспользуются во всех вариантах.
+    zoning_index = ZoningIndex(zones)
+    exclusion_indexes: dict[str, ExclusionIndex] = {}
+
+    def index_for(species: Species, exclusion: BaseGeometry) -> ExclusionIndex:
+        if species.name not in exclusion_indexes:
+            exclusion_indexes[species.name] = ExclusionIndex(exclusion)
+        return exclusion_indexes[species.name]
+
+    def variant(start: int) -> tuple[list[PlantingItem], float]:
+        """Ряды и акценты каскадом, начиная с класса `start`."""
+        items: list[PlantingItem] = []
+        placed: list = []
+        canopy = 0.0
+        chain = evaluated[start:]
+        if pattern in ("auto", "row"):
+            for species, type_norms, rows, _guides, _exclusion, _buildable in chain:
+                interval = type_norms.spacing_for(planting_type).min_distance_m
+                for item in greedy_select(_far_enough(rows, placed, interval), score_fn, type_norms):
+                    item.species = species.name
+                    item.rationale = f"{ROW_RATIONALE_PREFIX} {CROWN_CASCADE_NOTE} {item.rationale}"
+                    items.append(item)
+                    placed.append((item.geometry, interval))
+                    canopy += (species.crown_diameter_m or 0.0) ** 2
+        if pattern in ("auto", "accent"):
+            accents = 0
+            for species, _type_norms, _rows, _guides, exclusion, buildable in chain:
+                if budget is not None and accents >= budget:
+                    break
+                accent_norms = class_norms(species)
+                interval = accent_norms.spacing_for(planting_type).min_distance_m
+                area = _subtract_placed(buildable, placed, interval)
+                if area.is_empty:
+                    continue
+                for item in _accent_items(
+                    area, exclusion, accent_norms, planting_type, zones, score_fn, seed, None,
+                    max_trees=None if budget is None else budget - accents,
+                    exclusion_index=index_for(species, exclusion), zoning_index=zoning_index,
+                ):
+                    item.species = species.name
+                    item.rationale = f"{item.rationale} {CROWN_CASCADE_NOTE}"
+                    items.append(item)
+                    placed.append((item.geometry, interval))
+                    canopy += (species.crown_diameter_m or 0.0) ** 2
+                    accents += 1
+        return items, canopy
+
+    # «Сначала самое крупное» не всегда лучше: широкая крона с её большими
+    # отступами занимает места, где встали бы несколько средних, — на
+    # «4. Харьковской» каскад с широкой кроны дал 82 дерева против 166 берёз и
+    # меньше зелени в сумме. Поэтому каскад пробуется с каждого стартового
+    # класса и берётся вариант с наибольшей суммарной площадью крон (при
+    # равенстве — с большим числом деревьев). Каждый вариант не хуже одной
+    # породы своего стартового класса: следующие классы только досаживают в
+    # оставшиеся места. Зоны отступов и индексы уже посчитаны — повторяется
+    # только отбор точек.
+    best: list[PlantingItem] = []
+    best_key: tuple = ()
+    for start in range(len(evaluated)):
+        trial, canopy = variant(start)
+        key = (round(canopy, 6), len(trial))
+        if not best_key or key > best_key:
+            best, best_key = trial, key
+    items = best
+
+    if not items and pattern == "auto":
+        # Ни ряда, ни места под группу или солитер — последний запасной путь,
+        # тем же каскадом: россыпь, крупная крона по-прежнему первой.
+        placed: list = []
+        scattered: list[PlantingItem] = []
+        for species, _type_norms, _rows, _guides, exclusion, buildable in evaluated:
+            loose_norms = class_norms(species)
+            interval = loose_norms.spacing_for(planting_type).min_distance_m
+            area = _subtract_placed(buildable, placed, interval)
+            if area.is_empty:
+                continue
+            candidates = generate_candidates(area, exclusion, planting_type, loose_norms, zoning_zones=zones, seed=seed)
+            for item in greedy_select(candidates, score_fn, loose_norms):
+                item.species = species.name
+                scattered.append(item)
+                placed.append((item.geometry, interval))
+        items = _limit_by_density(scattered, evaluated[-1][5].area, density_per_ha)
+    return items
+
+
 def _plan_type_items(
     plan_key: str,
     planting_type: str,
@@ -613,6 +800,11 @@ def _plan_type_items(
     `PlantingCandidate` — оба уже пиклятся тем же путём, что `Utility`/`Zone`.
     """
     override = species_override
+    if planting_type in CROWN_SPACING_TYPES and not override and pattern in ("auto", "row", "accent"):
+        return _tree_cascade(
+            plan_key, utilities, zones, territory, score_fn, norms, keep_spacing_for, pattern,
+            density_per_ha, catalogue, tree_rows,
+        )
     if planting_type in CROWN_SPACING_TYPES:
         # Порода дерева решает число и размер посадок — её выбирает площадка
         # по объективному критерию, а не жребий (см. _tree_species_candidates).

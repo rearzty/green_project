@@ -126,6 +126,18 @@ def layers_to_feature_collection(layers: list[Layer], source_crs: str | None = N
     return GeoJSONFeatureCollection(features=[layer_to_geojson_feature(l, source_crs) for l in layers])
 
 
+def _crown_of(item: PlantingItemRow) -> str | None:
+    """Класс кроны дерева (wide/medium/narrow) — карта рисует точку по нему:
+    широкая крона крупной точкой, узкая мелкой. От класса зависят и интервал,
+    и отступы, так что на карте это не косметика, а смысл раскладки."""
+    if item.planting_type != "tree":
+        return None
+    from geo_engine.species import load_catalogue
+
+    species = load_catalogue().get(item.species)
+    return species.crown if species is not None else None
+
+
 def planting_item_to_geojson_feature(item: PlantingItemRow, source_crs: str | None = None) -> GeoJSONFeature:
     geometry = _to_wgs84(db_to_shape(item.geometry), source_crs)
     return GeoJSONFeature(
@@ -134,6 +146,7 @@ def planting_item_to_geojson_feature(item: PlantingItemRow, source_crs: str | No
             "id": item.id,
             "planting_type": item.planting_type,
             "species": item.species,
+            "crown": _crown_of(item),
             "score": item.score,
             "rationale": item.rationale,
             "is_manual_edit": item.is_manual_edit,
@@ -166,6 +179,7 @@ def _item_properties(item: PlantingItemRow) -> dict:
         "id": item.id,
         "planting_type": item.planting_type,
         "species": item.species,
+        "crown": _crown_of(item),
         "score": item.score,
         "rationale": item.rationale,
         "is_manual_edit": item.is_manual_edit,
