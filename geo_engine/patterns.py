@@ -33,6 +33,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass
 
@@ -412,6 +413,118 @@ def row_candidates(
             second = guide.geometry.buffer(offset + pitch_m * DOUBLE_ROW_GAP_FACTOR).boundary
             add_along(second, 0.5)
     return candidates
+
+
+# Акценты: группы деревьев и солитеры вместо россыпи. Источник — 743-ПП:
+# табл. 3.6.2 даёт интервал групповой посадки деревьев 5-7 м, а п. 10.8.1
+# приложения описывает сами композиции: группа — «компактно расположенные»
+# деревья на открытых участках газона, малая 2-3 растения, средняя 4-7, с
+# ядром из главного дерева и внешним контуром; солитер — одиночный экземпляр
+# на хорошо обозреваемом участке газона. П. 10.8.1 написан для парковой
+# растительности, на улице он применяется по аналогии — так и сказано в
+# обосновании посадки.
+#
+# Где ставить, решает геометрия, а не жребий: берётся точка, максимально
+# удалённая от краёв допустимой площади (`shapely.maximum_inscribed_circle`).
+# Там, где свободного радиуса хватает на кольцо вокруг ядра, — группа; где
+# только на одно дерево с полным интервалом во все стороны — солитер; где и
+# на это нет, акцента нет (дерево, прижатое к краю, читается не замыслом, а
+# промахом — так и выглядели одиночные дубы россыпи).
+ACCENT_PLANTING_TYPES = ("tree",)
+
+# 743-ПП табл. 3.6.2, групповая посадка деревьев — 5-7 м. Берётся нижняя
+# граница (тот же принцип выбора числа из диапазона, что во всём проекте), но
+# не меньше интервала по классу кроны породы (МГСН 1.02-02 п. 4.2.9.2) — его
+# проверяет отчёт обоснований между любыми двумя деревьями.
+TREE_GROUP_PITCH_M = 5.0
+
+# Кольцо вокруг ядра. Шесть мест — предел, при котором соседние деревья кольца
+# стоят друг от друга не ближе шага (хорда 2·r·sin(π/6) = r): ядро плюс шесть
+# дают «среднюю группу» п. 10.8.1 (4-7 растений).
+TREE_GROUP_RING = 6
+
+# Группа считается группой с двух деревьев (п. 10.8.1: «малые — 2-3»), меньше —
+# это уже солитер.
+TREE_GROUP_MIN = 2
+
+# Между акцентами — воздух. Не норматив, а композиционный приём: два солитера
+# или две группы почти вплотную читаются как одна масса. Три интервала —
+# расстояние, на котором они на глаз воспринимаются как отдельные события.
+ACCENT_GAP_INTERVALS = 3.0
+
+# Предохранители поиска: maximum_inscribed_circle стоит денег на сложном
+# многоугольнике, а допустимая площадь реальной улицы — сотни кусков.
+_ACCENT_MAX_PER_PART = 12
+_ACCENT_MAX_PARTS = 400
+_ACCENT_TOLERANCE_M = 0.2
+
+
+def _ring_points(center: Point, radius: float, count: int, phase: float) -> list[Point]:
+    return [
+        Point(
+            center.x + radius * math.cos(phase + 2 * math.pi * k / count),
+            center.y + radius * math.sin(phase + 2 * math.pi * k / count),
+        )
+        for k in range(count)
+    ]
+
+
+def accent_layout(
+    area: BaseGeometry,
+    interval_m: float,
+    seed: int,
+    max_trees: int | None = None,
+) -> list[tuple[str, list[Point]]]:
+    """Раскладка акцентов на допустимой площади: список ("group" | "solitaire",
+    точки). Точки уже лежат внутри `area` и стоят друг от друга не ближе шага;
+    окончательный отбор (интервал, скоринг) делает greedy_select вызывающего.
+
+    Порядок — от самого просторного места к самому тесному: если бюджет
+    плотности кончится, первыми останутся самые читаемые акценты.
+    """
+    if area is None or area.is_empty or interval_m <= 0:
+        return []
+    pitch = max(TREE_GROUP_PITCH_M, interval_m)
+    solitaire_radius = interval_m / 2
+    gap = interval_m * ACCENT_GAP_INTERVALS
+    min_part_area = math.pi * solitaire_radius ** 2
+
+    parts = list(shapely.get_parts(area)) if area.geom_type.startswith("Multi") else [area]
+    parts = [p for p in parts if p.geom_type == "Polygon" and p.area >= min_part_area]
+    parts.sort(key=lambda p: -p.area)
+    parts = parts[:_ACCENT_MAX_PARTS]
+
+    rng = random.Random(seed)
+    found: list[tuple[float, str, list[Point]]] = []
+    for part in parts:
+        remainder = part
+        for _ in range(_ACCENT_MAX_PER_PART):
+            if remainder.is_empty or remainder.area < min_part_area:
+                break
+            spoke = shapely.maximum_inscribed_circle(remainder, tolerance=_ACCENT_TOLERANCE_M)
+            radius = spoke.length
+            if radius < solitaire_radius:
+                break
+            center = Point(spoke.coords[0])
+            points = [center]
+            if radius >= pitch:
+                shapely.prepare(remainder)
+                ring = _ring_points(center, pitch, TREE_GROUP_RING, rng.uniform(0, 2 * math.pi))
+                points += [p for p in ring if remainder.contains(p)]
+            kind = "group" if len(points) >= TREE_GROUP_MIN else "solitaire"
+            found.append((radius, kind, points))
+            footprint = shapely.union_all([p.buffer(gap if kind == "solitaire" else pitch + gap / 2) for p in points])
+            remainder = remainder.difference(footprint)
+
+    found.sort(key=lambda entry: -entry[0])
+    layout: list[tuple[str, list[Point]]] = []
+    total = 0
+    for _radius, kind, points in found:
+        if max_trees is not None and total >= max_trees:
+            break
+        layout.append((kind, points))
+        total += len(points)
+    return layout
 
 
 def group_positions(
