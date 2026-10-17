@@ -268,6 +268,16 @@ def explain_items(
             per_item[int(item_index)] = float(measured[position])
         distances[object_type] = per_item
 
+    # Дерево в покрытии (743-ПП п. 9.8): отступ «край тротуара» мерится до
+    # КРАЯ, а не до полигона — иначе любое такое дерево было бы на нуле.
+    edge_distances: list[float] | None = None
+    if norms.paving_plantable("tree") and "sidewalk" in groups:
+        edges = [g.boundary if g.geom_type in ("Polygon", "MultiPolygon") else g for g in groups["sidewalk"]]
+        pairs, measured = STRtree(edges).query_nearest(geometries, all_matches=False, return_distance=True)
+        edge_distances = [float("inf")] * len(geometries)
+        for position, item_index in enumerate(pairs[0]):
+            edge_distances[int(item_index)] = float(measured[position])
+
     records: list[ComplianceRecord] = []
     for index, item in enumerate(items):
         checks: list[ConstraintCheck] = []
@@ -284,6 +294,8 @@ def explain_items(
                 catalogue.crown_reference_diameter_m,
             )
             actual = distances[object_type][index]
+            if object_type == "sidewalk" and edge_distances is not None and norms.paving_plantable(item.planting_type):
+                actual = edge_distances[index]
             source = norms.sources.get(resolution.source_id)
             if source is None:
                 # setback_for fell back to its fail-large default: say so instead

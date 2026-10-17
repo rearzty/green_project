@@ -35,10 +35,21 @@ export interface ProjectOut {
   warnings?: string[];
 }
 
+/** How much of the territory is left for one planting type and what took
+ * the rest -- see backend geo_engine/area_budget.py. */
+export interface AreaBudget {
+  planting_type: PlantingType;
+  territory_m2: number;
+  usable_m2: number;
+  usable_share: number;
+  blockers: { object_type: string; label: string; share: number }[];
+}
+
 export interface PlanOut {
   plan_id: string;
   scoring_mode: ScoringMode;
   features: GeoJSONFeatureCollection;
+  area_budget?: AreaBudget[];
 }
 
 export interface PlanSummary {
@@ -236,7 +247,8 @@ function startGenerate(
   scoringMode: ScoringMode,
   treeSpacingM?: number,
   shrubSpacingM?: number,
-  treeRows?: number
+  treeRows?: number,
+  treesInPaving?: boolean
 ): Promise<{ job_id: string }> {
   // tree_spacing_m/shrub_spacing_m left undefined when not overridden --
   // JSON.stringify drops undefined object properties, so the field is simply
@@ -248,6 +260,7 @@ function startGenerate(
     tree_spacing_m: treeSpacingM,
     shrub_spacing_m: shrubSpacingM,
     tree_rows: treeRows,
+    trees_in_paving: treesInPaving,
   });
 }
 
@@ -276,6 +289,7 @@ export async function generatePlan(
     treeSpacingM?: number;
     shrubSpacingM?: number;
     treeRows?: number;
+    treesInPaving?: boolean;
   }
 ): Promise<PlanOut> {
   const { job_id } = await startGenerate(
@@ -284,7 +298,8 @@ export async function generatePlan(
     scoringMode,
     options?.treeSpacingM,
     options?.shrubSpacingM,
-    options?.treeRows
+    options?.treeRows,
+    options?.treesInPaving
   );
   for (;;) {
     if (options?.signal?.aborted) throw new ApiError("Генерация отменена.", 0);

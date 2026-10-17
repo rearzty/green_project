@@ -101,19 +101,18 @@ class TestSetbackCitations:
         assert source.verified is True
         assert "газопровод" in row.lower()
 
-    def test_an_unchecked_citation_is_still_flagged(self):
-        """The verified flag must keep meaning something. Power lines are the
-        remaining honest gap: СП 42.13330.2016's table 9.1 note 2 defers to
-        ПУЭ, and ПУЭ itself has not been read.
-        """
+    def test_the_power_line_setback_is_read_from_pue_and_verified(self):
+        """СП 42.13330.2016 табл. 9.1 прим. 2 отсылает к ПУЭ; табл. 2.5.21
+        сверена — 3 м от провода ВЛ до кроны дерева (до 20 кВ)."""
         from geo_engine.norms import load_norms
 
         norms = load_norms()
-        source, _ = norms.source_for("power_line_corridor", "tree")
+        source, row = norms.source_for("power_line_corridor", "tree")
 
         assert "ПУЭ" in source.act
-        assert source.verified is False
-        assert "не сверено" in source.citation()
+        assert "2.5.21" in source.clause
+        assert source.verified is True
+        assert "кроны" in row
 
     def test_the_moscow_table_adds_classes_the_federal_one_lacks(self):
         """743-ПП's table 3.6.1 is wider than СП's 9.1 — it separates schools

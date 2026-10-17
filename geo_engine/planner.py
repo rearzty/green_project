@@ -244,7 +244,8 @@ def _fit_row_species(
             clip_to=territory,
         )
         buildable = buildable_area(
-            territory, exclusion, zones, territory_margin_m=type_norms.territory_margin_for(planting_type)
+            territory, exclusion, zones, territory_margin_m=type_norms.territory_margin_for(planting_type),
+            plantable_types=_plantable_types(type_norms, planting_type),
         )
         guides = collect_row_guides(
             zones, planting_type, type_norms, candidate_species, catalogue.crown_reference_diameter_m
@@ -575,7 +576,10 @@ def _plan_type_items(
             clip_to=territory,
         )
         margin = type_norms.territory_margin_for(planting_type)
-        buildable = buildable_area(territory, exclusion, zones, territory_margin_m=margin)
+        buildable = buildable_area(
+            territory, exclusion, zones, territory_margin_m=margin,
+            plantable_types=_plantable_types(type_norms, planting_type),
+        )
         spacing = type_norms.spacing_for(planting_type)
         remaining = buildable
 
@@ -684,6 +688,7 @@ def _plan_type_items(
             loose_buildable = buildable_area(
                 territory, loose_exclusion, zones,
                 territory_margin_m=loose_norms.territory_margin_for(planting_type),
+                plantable_types=_plantable_types(loose_norms, planting_type),
             )
             # Пересечение, а не замена: из `remaining` уже вычтены кроны
             # поставленного ряда, и терять это нельзя.
@@ -749,6 +754,147 @@ def _plan_type_items(
     # относительно настоящего холста, а не только относительно нормативного
     # смысла числа.
     return row_items + _limit_by_density(selected, loose_area.area, density_per_ha)
+
+
+# Сколько памяти держит воркер генерации, в разах от памяти основного процесса
+# на момент запуска пула (воркер получает свою копию сетей и зон и строит из
+# них зону отступов, ряды, куртины). Замер: «4. Харьковская» 436 МБ ->
+# воркер 728 МБ (×1,7), «1. Олимпийская деревня» 607 -> 1537 МБ (×2,5). Взято
+# с запасом над худшим.
+_PLAN_WORKER_MEMORY_FACTOR = 2.6
+
+
+def _current_rss_bytes() -> int | None:
+    try:
+        with open("/proc/self/status", encoding="utf-8") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        return None
+    return None
+
+
+def _memory_capped_plan_workers() -> int:
+    """Сколько типов посадки считать параллельно, чтобы не упереться в память.
+
+    Живой случай, «3. 3-я Парковая»: основной процесс после чтения держит
+    2,5 ГБ, воркер — около 6 ГБ, а у контейнера 7,4. Пул падал каждый раз
+    (`BrokenProcessPool`), и только после этого шёл последовательный пересчёт
+    — то есть время на заведомо проваленную попытку и риск, что ядро убьёт
+    уже основной процесс. Теперь, если два воркера не помещаются, считается
+    последовательно сразу. Где память не узнать (не Linux), ограничения нет —
+    как раньше; запасной путь на `BrokenProcessPool` остаётся в любом случае.
+    """
+    from geo_engine.io.dxf_reader import _available_memory_bytes
+
+    available = _available_memory_bytes()
+    rss = _current_rss_bytes()
+    if not available or not rss:
+        return os.cpu_count() or 1
+    return max(1, int(available // (rss * _PLAN_WORKER_MEMORY_FACTOR)))
+
+
+# Размер квартала, внутри которого посадки одного типа — одной породы. Участок
+# аллеи или группа куртин одной породы, а не пёстрая россыпь: так выглядят
+# реальные проекты пилота, а смена породы каждые несколько метров читалась
+# бы как шум.
+SPECIES_BLOCK_M = 60.0
+
+IN_PAVING_RATIONALE_PREFIX = (
+    "Посадка в покрытии тротуара: околоствольное пространство Ø 2 м с приствольной решёткой "
+    "(743-ПП п. 9.8)."
+)
+
+
+def _plantable_types(norms: PlantingNorms, planting_type: str) -> tuple[str, ...]:
+    """Типы твёрдых препятствий, в которых этому типу посадки можно стоять."""
+    return ("sidewalk",) if norms.paving_plantable(planting_type) else ()
+
+
+def _mark_in_paving(items: list[PlantingItem], zones: list[Zone], norms: PlantingNorms) -> list[PlantingItem]:
+    """Пометить деревья, вставшие в покрытие тротуара, — в обосновании должно
+    быть сказано, что это посадка с приствольной решёткой по 743-ПП п. 9.8, а
+    не дерево в газоне."""
+    if not norms.paving_plantable("tree"):
+        return items
+    paving = [
+        z.geometry for z in zones
+        if z.zone_type == "sidewalk" and z.geometry.geom_type in ("Polygon", "MultiPolygon")
+    ]
+    trees = [i for i in items if i.planting_type == "tree"]
+    if not paving or not trees:
+        return items
+    from shapely.strtree import STRtree
+
+    hits = STRtree(paving).query([i.geometry for i in trees], predicate="within")
+    for index in set(int(k) for k in hits[0]):
+        item = trees[index]
+        if not item.rationale.startswith(IN_PAVING_RATIONALE_PREFIX):
+            item.rationale = f"{IN_PAVING_RATIONALE_PREFIX} {item.rationale}"
+    return items
+
+
+def _equivalence_key(species: Species, planting_type: str, norms: PlantingNorms, catalogue: SpeciesCatalogue) -> tuple:
+    """Всё, что порода меняет в нормах для этого типа посадки: отступы от
+    каждого типа объекта и — для деревьев — интервал по классу кроны. Породы с
+    одинаковым ключом нормативно взаимозаменяемы."""
+    setbacks = tuple(
+        round(norms.resolve_setback(object_type, planting_type, species, catalogue.crown_reference_diameter_m).required_m, 3)
+        for object_type in sorted(norms.setbacks_m)
+    )
+    interval = catalogue.spacing_for_crown(species.crown) if planting_type in CROWN_SPACING_TYPES else None
+    return setbacks + (interval,)
+
+
+def _diversify_species(
+    items: list[PlantingItem],
+    plan_key: str,
+    norms: PlantingNorms,
+    catalogue: SpeciesCatalogue,
+    species_overrides: dict[str, str] | None,
+) -> list[PlantingItem]:
+    """Разнообразить породы, не трогая нормы.
+
+    Финальный аудит пилота: «Сирень обыкновенная» — 23 тыс. из 26 тыс. кустов
+    на «13. Харьковском проезде», и так почти везде, а в реальных проектах
+    пород восемь и больше. Порода меняется только на НОРМАТИВНО РАВНОЗНАЧНУЮ
+    (`_equivalence_key`: те же отступы и тот же интервал), поэтому ни одна
+    посадка не может стать нарушением — проверка обоснований даёт ровно тот же
+    вердикт. Порода выбирается на квартал `SPECIES_BLOCK_M` детерминированно
+    от `plan_key`: тот же план — те же породы. Тип, для которого пользователь
+    сам задал породу, не трогается.
+    """
+    overridden = set((species_overrides or {}).keys())
+    classes: dict[tuple, dict[tuple, list[str]]] = {}
+    cache: dict[tuple[str, str], tuple | None] = {}
+
+    def key_of(planting_type: str, name: str) -> tuple | None:
+        if (planting_type, name) not in cache:
+            species = catalogue.get(name)
+            cache[(planting_type, name)] = (
+                _equivalence_key(species, planting_type, norms, catalogue) if species is not None else None
+            )
+        return cache[(planting_type, name)]
+
+    for item in items:
+        if item.planting_type in overridden or item.planting_type not in CROWN_SPACING_TYPES + ("shrub",):
+            continue
+        key = key_of(item.planting_type, item.species)
+        if key is None:
+            continue
+        if (item.planting_type, key) not in classes:
+            classes[(item.planting_type, key)] = sorted(
+                s.name for s in catalogue.for_type(item.planting_type)
+                if key_of(item.planting_type, s.name) == key
+            )
+        members = classes[(item.planting_type, key)]
+        if len(members) < 2:
+            continue
+        block = (int(item.geometry.centroid.x // SPECIES_BLOCK_M), int(item.geometry.centroid.y // SPECIES_BLOCK_M))
+        index = zlib.crc32(f"{plan_key}:{item.planting_type}:{key}:{block}".encode()) % len(members)
+        item.species = members[index]
+    return items
 
 
 def plan_items(
@@ -836,6 +982,13 @@ def plan_items(
     density_per_ha = {**DEFAULT_DENSITY_PER_HA, **(density_per_ha or {})}
 
     worker_count = min(len(planting_types), os.cpu_count() or 1)
+    memory_cap = _memory_capped_plan_workers()
+    if memory_cap < worker_count and len(utilities) + len(zones) >= _PARALLEL_PLAN_THRESHOLD:
+        print(
+            "  ! памяти на параллельный расчёт типов посадки не хватает — считаю последовательно",
+            file=sys.stderr,
+        )
+    worker_count = min(worker_count, memory_cap)
     if worker_count > 1 and len(utilities) + len(zones) >= _PARALLEL_PLAN_THRESHOLD:
         items: list[PlantingItem] = []
         try:
@@ -864,7 +1017,7 @@ def plan_items(
                     items.extend(future.result())
                     if on_progress is not None:
                         on_progress(planting_type, index, total)
-            return items
+            return _mark_in_paving(_diversify_species(items, plan_key, norms, catalogue, species_overrides), zones, norms)
         except BrokenProcessPool:
             # Рабочий процесс убит извне — на реальных данных это нехватка
             # памяти: типы посадки считаются параллельно, и на самой крупной
@@ -907,4 +1060,4 @@ def plan_items(
         )
         if on_progress is not None:
             on_progress(planting_type, index, total)
-    return items
+    return _mark_in_paving(_diversify_species(items, plan_key, norms, catalogue, species_overrides), zones, norms)

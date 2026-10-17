@@ -447,3 +447,68 @@ class TestDoubleRow:
         territory, zones = self._scene()
         records = explain_items(self._plan(norms, catalogue, 2), [], zones, norms, catalogue)
         assert records and all(r.compliant for r in records)
+
+
+def test_row_path_survives_a_geos_failure_in_the_local_clip(monkeypatch):
+    """«5. Багрицкого»: clip_by_rect упал на вырожденной площади и унёс улицу.
+    Вырезка — только ускорение; при её отказе ряд строится по всей площади."""
+    import shapely
+
+    from geo_engine import patterns
+
+    def broken_clip(*args, **kwargs):
+        raise shapely.errors.GEOSException("IllegalArgumentException: Invalid number of points in LinearRing found 3")
+
+    buildable = Polygon([(0, 0), (200, 0), (200, 60), (0, 60)])
+    guide = patterns.RowGuide(geometry=LineString([(0, -3), (200, -3)]), object_type="road", setback_m=2.0)
+    expected = patterns._row_path(guide, buildable, 6.0, 0.05, 8.0)
+    monkeypatch.setattr(patterns.shapely, "clip_by_rect", broken_clip)
+    survived = patterns._row_path(guide, buildable, 6.0, 0.05, 8.0)
+
+    assert survived[1] == expected[1]
+    assert survived[0].equals(expected[0])
+
+
+class TestTreesInPaving:
+    """743-ПП п. 9.8: дерево в покрытии тротуара — околоствольное
+    пространство Ø 2 м с решёткой. Опция; остальные отступы не меняются."""
+
+    def _scene(self):
+        territory = Polygon([(0, 0), (200, 0), (200, 60), (0, 60)])
+        sidewalk = Polygon([(0, 31), (200, 31), (200, 39), (0, 39)])  # тротуар 8 м вдоль проезжей части
+        zones = [
+            Zone(geometry=territory, zone_type="territory"),
+            Zone(geometry=sidewalk, zone_type="sidewalk"),
+            Zone(geometry=LineString([(-50, 30), (250, 30)]), zone_type="road"),  # бордюр проезжей части
+        ]
+        return territory, zones
+
+    def _plan(self, norms, catalogue, in_paving):
+        from geo_engine.planner import plan_items
+
+        territory, zones = self._scene()
+        n = norms.with_trees_in_paving() if in_paving else norms
+        return territory, zones, n, plan_items(
+            "paving", [], zones, territory, ["tree"], lambda cs: [(1.0, "т") for _ in cs], n,
+            species_overrides={"tree": "Берёза повислая"}, catalogue=catalogue, density_per_ha={"tree": 0},
+        )
+
+    def test_without_the_option_no_tree_stands_in_the_sidewalk(self, norms, catalogue):
+        _, zones, _, items = self._plan(norms, catalogue, False)
+        sidewalk = zones[1].geometry
+        assert not [i for i in items if sidewalk.contains(i.geometry)]
+
+    def test_with_the_option_trees_stand_in_the_sidewalk_with_a_pit_and_are_compliant(self, norms, catalogue):
+        from geo_engine.compliance import explain_items
+        from geo_engine.planner import IN_PAVING_RATIONALE_PREFIX
+
+        territory, zones, n, items = self._plan(norms, catalogue, True)
+        sidewalk = zones[1].geometry
+        in_paving = [i for i in items if sidewalk.contains(i.geometry)]
+
+        assert in_paving
+        assert all(sidewalk.exterior.distance(i.geometry) >= 1.0 - 1e-3 for i in in_paving)  # решётка Ø 2 м в покрытии
+        assert all(zones[2].geometry.distance(i.geometry) >= 2.0 - 1e-3 for i in items)  # 2 м от проезжей части
+        assert all(i.rationale.startswith(IN_PAVING_RATIONALE_PREFIX) for i in in_paving)
+        records = explain_items(items, [], zones, n, catalogue)
+        assert all(r.compliant for r in records)
