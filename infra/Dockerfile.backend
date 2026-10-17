@@ -78,22 +78,47 @@ FROM python:3.11-slim
 # уже предусматривает как запасной. Цена известна и описана выше: пустые
 # ACIS-payload'ы у REGION/3DSOLID, то есть теряются поверхностные заливки.
 # Это деградация, а не поломка, и она видна в логе сборки.
+# Имя файла берётся со страницы загрузки ODA, а не зашито: производитель
+# убирает старые версии. Живой случай перед финалом — зашитая
+# `..._8.3dll_27.1.deb` стала отдавать 404, а `|| true` в конце цепочки
+# проглатывал это вместе со всем остальным: свежая сборка (ровно то, что
+# делают эксперты по README) молча получала стек БЕЗ ODA, то есть LibreDWG с
+# пустыми заливками и нечитаемыми чертежами на части улиц. Теперь: имя со
+# страницы, запасной список известных имён, а итог — громкая строка в логе
+# сборки в любую сторону. Сборку провал загрузки по-прежнему не роняет —
+# LibreDWG остаётся рабочим, хоть и худшим путём.
 RUN set -eu; \
     if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
-        apt-get update \
-        && apt-get install -y --no-install-recommends \
+        apt-get update; \
+        apt-get install -y --no-install-recommends \
             wget xvfb xauth libgl1 libxkbcommon0 libxkbcommon-x11-0 libxcb-icccm4 \
             libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 \
             libxcb-xkb1 libfontconfig1 libxrender1 libsm6 libice6 libxrandr2 \
             libxi6 libxcursor1 libxcomposite1 libxdamage1 libxtst6 libnss3 \
-            libasound2t64 libdbus-1-3 \
-        && rm -rf /var/lib/apt/lists/* \
-        && wget -q "https://www.opendesign.com/guestfiles/get?filename=ODAFileConverter_QT6_lnxX64_8.3dll_27.1.deb" \
-            -O /tmp/oda_converter.deb \
-        && apt-get update \
-        && apt-get install -y --no-install-recommends /tmp/oda_converter.deb \
-        && rm -rf /tmp/oda_converter.deb /var/lib/apt/lists/* \
-        && ODAFileConverter --version >/dev/null 2>&1 || true; \
+            libasound2t64 libdbus-1-3 libopengl0 libegl1 libglx0 libglib2.0-0t64; \
+        current="$(wget -qO- https://www.opendesign.com/guestfiles/oda_file_converter 2>/dev/null \
+            | grep -o 'ODAFileConverter_QT6_lnxX64_[^"&<> ]*\.deb' | head -n1 || true)"; \
+        for name in $current ODAFileConverter_QT6_lnxX64_11dll.deb ODAFileConverter_QT6_lnxX64_8.3dll_27.1.deb; do \
+            if wget -q "https://www.opendesign.com/guestfiles/get?filename=$name" -O /tmp/oda_converter.deb; then \
+                echo "ODA File Converter: скачан $name"; break; \
+            fi; \
+            rm -f /tmp/oda_converter.deb; \
+        done; \
+        if [ -s /tmp/oda_converter.deb ]; then \
+            apt-get install -y --no-install-recommends /tmp/oda_converter.deb \
+                || echo "!!! ODA File Converter: установка не удалась"; \
+        fi; \
+        rm -rf /tmp/oda_converter.deb /var/lib/apt/lists/*; \
+        oda_bin="$(ls /usr/bin/ODAFileConverter_*/ODAFileConverter 2>/dev/null | head -n1 || true)"; \
+        oda_missing="$( [ -n "$oda_bin" ] && ldd "$oda_bin" | grep "not found" || true)"; \
+        if [ -n "$oda_missing" ]; then \
+            echo "!!! ODA File Converter: не хватает библиотек: $oda_missing"; \
+        fi; \
+        if command -v ODAFileConverter >/dev/null 2>&1 && [ -z "$oda_missing" ]; then \
+            echo "ODA File Converter: установлен — основной конвертер DWG"; \
+        else \
+            echo "!!! ODA File Converter НЕ установлен — DWG пойдёт через LibreDWG (хуже: теряются заливки, часть чертежей не читается)"; \
+        fi; \
     else \
         echo "ODA File Converter: сборки под $(dpkg --print-architecture) не существует (только lnxX64) — остаётся LibreDWG, см. комментарий выше"; \
     fi

@@ -26,6 +26,7 @@ from geo_engine.compliance import explain_items, report_payload, unverified_sour
 from geo_engine.io.dxf_reader import (
     COMBINED_LAYER_MAP,
     BundleResolutionError,
+    discover_bundle_members,
     read_dxf_bundle,
     resolve_bundle_inputs,
 )
@@ -38,6 +39,8 @@ from geo_engine.planner import (
     ROW_RATIONALE_PREFIX,
     plan_items,
 )
+from geo_engine.area_budget import area_budget
+from geo_engine.io.result_package import copy_references, xref_attachment_count
 from geo_engine.species import load_catalogue
 from geo_engine.territory import MissingTerritoryError, territory_polygon
 from ml_scoring.heuristic_scorer import HeuristicScorer
@@ -153,6 +156,9 @@ def pick_base_drawing(entity_counts: dict[Path, int], main_drawing: Path | None 
     return max(entity_counts, key=entity_counts.get)
 
 
+PLANTING_TYPE_LABELS_RU = {"tree": "деревья", "shrub": "кустарник", "lawn": "газон"}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m scripts.plan_dxf",
@@ -206,6 +212,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Схема расстановки: auto — ряд вдоль проездов/тротуаров/границы участка плюс россыпь "
         "в остатке (по умолчанию); scatter — только россыпь; row — только ряды",
+    )
+    parser.add_argument(
+        "--trees-in-paving",
+        action="store_true",
+        help="Разрешить деревья в покрытии тротуара с приствольной решёткой: околоствольное "
+        "пространство Ø 2 м (743-ПП п. 9.8). Остальные отступы не меняются",
     )
     parser.add_argument(
         "--tree-rows",
@@ -301,6 +313,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.shrub_spacing:
         norms = norms.with_spacing_override("shrub", args.shrub_spacing)
         keep_spacing_for.append("shrub")
+    if args.trees_in_paving:
+        norms = norms.with_trees_in_paving()
 
     clock = _StageClock()
     with tempfile.TemporaryDirectory(prefix="greenplan-") as tmp:
@@ -423,6 +437,20 @@ def main(argv: list[str] | None = None) -> int:
                     note = f"интервал {norms.spacing_for(planting_type).min_distance_m} м из planting_norms.yaml"
                 print(f"        «{species_name}» — {count}, крона {picked.crown}, {note}")
 
+        # Сколько площади осталось под каждый тип и что съело остальное — см.
+        # geo_engine/area_budget.py: без этого «одни кусты» на плотной улице
+        # выглядят сбоем генератора, а не выводом из норм.
+        budgets = []
+        for planting_type in planting_types:
+            dominant = used.get(planting_type, Counter()).most_common(1)
+            species = catalogue.get(dominant[0][0]) if dominant else None
+            budget = area_budget(
+                territory, utilities, zones, planting_type, norms, species, catalogue.crown_reference_diameter_m
+            )
+            if budget is not None:
+                budgets.append(budget)
+                print(f"     {PLANTING_TYPE_LABELS_RU.get(planting_type, planting_type)}: {budget.summary_ru()}")
+
         clock.begin("4/5 Проверка нормативных отступов и сборка обоснований...")
         records = explain_items(items, utilities, zones, norms)
         violations = [r for r in records if not r.compliant]
@@ -433,6 +461,15 @@ def main(argv: list[str] | None = None) -> int:
         clock.begin(f"5/5 Запись результата на слои {args.prefix}$*")
         args.output.parent.mkdir(parents=True, exist_ok=True)
         base = pick_base_drawing(entity_counts, main_drawing)
+        references = 0
+        if main_drawing in entity_counts:
+            references = xref_attachment_count(main_drawing)
+            if references:
+                # Главный чертёж — набор внешних ссылок: как холст он и есть
+                # проект целиком, если ссылки лежат рядом (копируются ниже).
+                # Раньше такой «почти пустой» главный проигрывал листу съёмки
+                # — см. geo_engine/io/result_package.py.
+                base = main_drawing
         if base is None:
             raise SystemExit(
                 "\nОШИБКА: ни один чертёж бандла не открывается — не в копию чего писать результат."
@@ -451,6 +488,13 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"     основа: {base.name} (главный чертёж не читается)")
         write_dxf(items, args.output, base_dxf=base, records=records, prefix=args.prefix)
+        if base == main_drawing and references:
+            original_main, original_members = discover_bundle_members(Path(args.input))
+            copied = copy_references(original_main, original_members, args.output.parent)
+            print(
+                f"     внешних ссылок в чертеже: {references}; файлы ссылок положены рядом с результатом "
+                f"({len(copied)} шт.) — AutoCAD подгрузит все листы проекта"
+            )
 
     report_path = args.report or args.output.with_suffix(".report.json")
     unverified = unverified_sources(records)
@@ -463,6 +507,7 @@ def main(argv: list[str] | None = None) -> int:
         scoring_mode=args.scoring,
         planting_types=planting_types,
         territory_area_m2=round(float(territory.area), 2),
+        area_budget=[budget.to_dict() for budget in budgets],
     )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

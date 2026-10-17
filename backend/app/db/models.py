@@ -86,6 +86,12 @@ class Plan:
     # 1 — однорядная аллея вдоль улиц, 2 — двухрядная (743-ПП табл. 3.6.2).
     # Часть рецепта, как и интервалы: ensure_materialized пересчитывает с ним.
     tree_rows: int = 1
+    # Деревья в покрытии тротуара с решёткой (743-ПП п. 9.8) — часть рецепта.
+    trees_in_paving: bool = False
+    # geo_engine.area_budget.AreaBudget.to_dict() по каждому типу посадки —
+    # считается при генерации, не пересчитывается при рематериализации (от
+    # рецепта не зависит ничего, кроме породы, а она та же).
+    area_budget: list[dict] = field(default_factory=list)
     created_at: datetime = field(default_factory=_utcnow)
     is_current: bool = True
     item_count: int = 0
@@ -116,6 +122,10 @@ class Project:
     # файлы бандла, ненайденная граница участка. Готовый русский текст для
     # пользователя — см. project_service.create_project_from_file.
     warnings: list[str] = field(default_factory=list)
+    # Загруженный файл как есть (.zip/.dwg/.dxf) — нужен экспорту, чтобы
+    # положить план поверх ИСХОДНОГО чертежа со ссылками, как делает CLI
+    # (см. export_service.py). None для проектов из GeoJSON.
+    source_file: str | None = None
 
     layers: list[Layer] = field(default_factory=list)
     plans: list[Plan] = field(default_factory=list)

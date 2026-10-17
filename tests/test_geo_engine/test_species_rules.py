@@ -132,7 +132,9 @@ class TestSpeciesAwareSetbacks:
         )
 
         assert resolution.crown_multiplier == 1.0
-        assert resolution.required_m == resolution.table_m
+        # ПУЭ нормирует расстояние до кроны: прибавляется радиус кроны породы,
+        # а не пропорция примечания 1.
+        assert resolution.required_m == resolution.table_m + linden.crown_diameter_m / 2
 
 
 class TestCrownDrivenSpacing:

@@ -212,13 +212,44 @@ def _parse_zip_bundle(
     if on_progress:
         on_progress("Распаковка архива", 1, 1)
 
-    # A folder zipped on macOS/Windows often lands one level down (the zip
-    # root holds a single directory named after the folder) or wrapped in a
-    # __MACOSX/ sibling -- look past both rather than require the archive be
-    # built just so.
+    return _parse_dxf_bundle(_archive_root(extract_dir), workdir, on_progress, warnings_out)
+
+
+def _archive_root(extract_dir: Path) -> Path:
+    """A folder zipped on macOS/Windows often lands one level down (the zip
+    root holds a single directory named after the folder) or wrapped in a
+    __MACOSX/ sibling -- look past both rather than require the archive be
+    built just so."""
     entries = [p for p in extract_dir.iterdir() if p.name != "__MACOSX"]
-    root = entries[0] if len(entries) == 1 and entries[0].is_dir() else extract_dir
-    return _parse_dxf_bundle(root, workdir, on_progress, warnings_out)
+    return entries[0] if len(entries) == 1 and entries[0].is_dir() else extract_dir
+
+
+def materialize_source(source_file: Path, workdir: Path) -> Path:
+    """Исходник проекта в виде, который понимает `discover_bundle_members`:
+    архив распаковывается (тем же путём, что при загрузке), чертёж — как есть."""
+    if source_file.suffix.lower() != ".zip":
+        return source_file
+    extract_dir = workdir / "source"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(source_file) as archive:
+        _extract_archive(archive, extract_dir)
+    return _archive_root(extract_dir)
+
+
+# Где живут загруженные исходники проектов. В памяти процесса, как и сами
+# проекты, держать их нельзя (сотни мегабайт), а терять нельзя: без них экспорт
+# не может положить план поверх исходного чертежа.
+SOURCE_STORE_DIR = Path(tempfile.gettempdir()) / "greenproject-sources"
+
+
+def _keep_source(project_id: str, upload_path: Path) -> str | None:
+    if upload_path.suffix.lower() not in (".zip", ".dwg", ".dxf"):
+        return None
+    target_dir = SOURCE_STORE_DIR / project_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"source{upload_path.suffix.lower()}"
+    shutil.copy2(upload_path, target)
+    return str(target)
 
 
 def parse_territory_file(
@@ -335,6 +366,7 @@ async def create_project_from_file(
         crs_verified=source_crs is None and detected_crs is not None,
         warnings=warnings,
     )
+    project.source_file = await run_in_threadpool(_keep_source, project.id, upload_path)
     project.layers = [
         Layer(
             project_id=project.id,

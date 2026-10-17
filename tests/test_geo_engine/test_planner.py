@@ -46,7 +46,9 @@ def _constant_score_fn(candidates):
 
 def _generate(synthetic_scene, threshold):
     territory, utilities, zones = synthetic_scene["territory"], synthetic_scene["utilities"], synthetic_scene["zones"]
-    with patch.object(planner, "_PARALLEL_PLAN_THRESHOLD", threshold):
+    with patch.object(planner, "_PARALLEL_PLAN_THRESHOLD", threshold), patch.object(
+        planner, "_memory_capped_plan_workers", return_value=8
+    ):
         return plan_items("planner-test", utilities, zones, territory, ["tree", "shrub"], _constant_score_fn, NORMS)
 
 
@@ -89,9 +91,11 @@ class TestParallelThresholdGate:
 
     def test_forced_threshold_does_spin_up_a_process_pool(self, synthetic_scene):
         territory, utilities, zones = synthetic_scene["territory"], synthetic_scene["utilities"], synthetic_scene["zones"]
+        # Память подменяется: тест о пороге параллельности, а не о том,
+        # сколько свободной памяти на машине, где он запущен.
         with patch.object(planner, "_PARALLEL_PLAN_THRESHOLD", 0), patch.object(
-            planner, "ProcessPoolExecutor", wraps=planner.ProcessPoolExecutor
-        ) as mock_pool:
+            planner, "_memory_capped_plan_workers", return_value=8
+        ), patch.object(planner, "ProcessPoolExecutor", wraps=planner.ProcessPoolExecutor) as mock_pool:
             items = plan_items("planner-test", utilities, zones, territory, ["tree", "shrub"], _constant_score_fn, NORMS)
         mock_pool.assert_called_once()
         assert items
@@ -392,3 +396,56 @@ class TestParallelPlanFallback:
         )
 
         assert items, "последовательный пересчёт обязан дать результат"
+
+
+class TestPlanWorkersMemoryCap:
+    """«3. 3-я Парковая»: воркер генерации ~2,5× памяти основного процесса,
+    и два таких не помещались — пул падал каждый раз."""
+
+    def test_too_little_memory_means_one_worker(self, monkeypatch):
+        from geo_engine.io import dxf_reader
+
+        monkeypatch.setattr(dxf_reader, "_available_memory_bytes", lambda: 4 * 1024**3)
+        monkeypatch.setattr(planner, "_current_rss_bytes", lambda: 2.5 * 1024**3)
+        assert planner._memory_capped_plan_workers() == 1
+
+    def test_plenty_of_memory_allows_parallel_types(self, monkeypatch):
+        from geo_engine.io import dxf_reader
+
+        monkeypatch.setattr(dxf_reader, "_available_memory_bytes", lambda: 6 * 1024**3)
+        monkeypatch.setattr(planner, "_current_rss_bytes", lambda: 0.6 * 1024**3)
+        assert planner._memory_capped_plan_workers() >= 3
+
+    def test_unknown_memory_does_not_limit(self, monkeypatch):
+        from geo_engine.io import dxf_reader
+
+        monkeypatch.setattr(dxf_reader, "_available_memory_bytes", lambda: None)
+        assert planner._memory_capped_plan_workers() >= 1
+
+
+class TestSpeciesDiversity:
+    """Финальный аудит: почти весь кустарник — одна «Сирень обыкновенная».
+    Смешение меняет породу только на нормативно равнозначную."""
+
+    def _plan(self, synthetic_scene, plan_key="div", overrides=None):
+        territory, utilities, zones = synthetic_scene["territory"], synthetic_scene["utilities"], synthetic_scene["zones"]
+        return plan_items(plan_key, utilities, zones, territory, ["tree", "shrub"], _constant_score_fn, NORMS,
+                          species_overrides=overrides)
+
+    def test_shrubs_are_no_longer_a_single_species(self, synthetic_scene):
+        items = self._plan(synthetic_scene)
+        shrubs = {i.species for i in items if i.planting_type == "shrub"}
+        assert len(shrubs) >= 2
+
+    def test_the_plan_stays_compliant_and_deterministic(self, synthetic_scene):
+        from geo_engine.compliance import explain_items
+
+        utilities, zones = synthetic_scene["utilities"], synthetic_scene["zones"]
+        first = self._plan(synthetic_scene)
+        second = self._plan(synthetic_scene)
+        assert [i.species for i in first] == [i.species for i in second]
+        assert all(r.compliant for r in explain_items(first, utilities, zones, NORMS))
+
+    def test_an_explicit_species_choice_is_respected(self, synthetic_scene):
+        items = self._plan(synthetic_scene, overrides={"shrub": "Спирея японская"})
+        assert {i.species for i in items if i.planting_type == "shrub"} == {"Спирея японская"}

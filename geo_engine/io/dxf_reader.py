@@ -1023,6 +1023,12 @@ def _nested_project_main(source: Path) -> Path | None:
     return max(drawings, key=lambda p: p.stat().st_size) if drawings else None
 
 
+def discover_bundle_members(source: str | Path) -> tuple[Path, list[Path]]:
+    """Публичное имя `_discover_bundle_members`: исходные (не сконвертированные)
+    файлы бандла — нужны, чтобы положить ссылки рядом с результатом."""
+    return _discover_bundle_members(Path(source))
+
+
 def _discover_bundle_members(source: Path) -> tuple[Path, list[Path]]:
     """(main file, every file belonging to the bundle including main), before
     any DWG->DXF conversion.

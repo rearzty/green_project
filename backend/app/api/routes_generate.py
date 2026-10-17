@@ -29,6 +29,7 @@ def _to_plan_out(plan: Plan) -> PlanOut:
         plan_id=plan.id,
         scoring_mode=plan.scoring_mode,
         features=planting_items_to_feature_collection(plan.items, display_crs(plan.project)),
+        area_budget=plan.area_budget,
     )
 
 
@@ -40,6 +41,7 @@ async def _run_generate_job(
     tree_spacing_m: float | None,
     shrub_spacing_m: float | None,
     tree_rows: int = 1,
+    trees_in_paving: bool = False,
 ) -> None:
     """Runs on the event loop after POST /generate has already returned."""
     try:
@@ -51,6 +53,7 @@ async def _run_generate_job(
             tree_spacing_m=tree_spacing_m,
             shrub_spacing_m=shrub_spacing_m,
             tree_rows=tree_rows,
+            trees_in_paving=trees_in_paving,
             on_progress=lambda ptype, done, total: generation_jobs.update_progress(job_id, ptype, done, total),
         )
         generation_jobs.mark_done(job_id, plan.id)
@@ -80,6 +83,7 @@ async def generate(request: GenerateRequest, project: ProjectDep) -> GenerateJob
             request.tree_spacing_m,
             request.shrub_spacing_m,
             request.tree_rows,
+            request.trees_in_paving,
         )
     )
     _background_tasks.add(task)

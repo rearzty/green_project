@@ -184,6 +184,11 @@ def build_exclusion_zone(
         # rounds every corner, which for e.g. a building turns a rectangular
         # setback strip into a blob-cornered shape (visibly wrong on the map)
         # and bloats the corner into ~30 extra vertices for no reason.
+        if zone.zone_type == "sidewalk" and norms.paving_plantable(planting_type):
+            # Дерево в покрытии (743-ПП п. 9.8): запрещена не площадь тротуара,
+            # а полоса у его края — см. norms.resolve_setback.
+            pending.append((zone_geometry.boundary, required(zone.zone_type), "round"))
+            continue
         pending.append((zone_geometry, required(zone.zone_type), "mitre"))
 
     if clip_to is not None and pending and not clip_to.is_empty:
@@ -226,7 +231,11 @@ HARD_OBSTACLE_ZONE_TYPES = ("building", "road", "existing_greenery", "sidewalk")
 
 
 def buildable_area(
-    territory: BaseGeometry, exclusion_zone: BaseGeometry, other_zones: list[Zone], territory_margin_m: float = 0.0
+    territory: BaseGeometry,
+    exclusion_zone: BaseGeometry,
+    other_zones: list[Zone],
+    territory_margin_m: float = 0.0,
+    plantable_types: tuple[str, ...] = (),
 ) -> BaseGeometry:
     """Territory minus the exclusion zone minus any hard obstacles (buildings,
     existing pavement/roads, already-planted greenery) that are never
@@ -262,7 +271,9 @@ def buildable_area(
     hard_obstacles = [
         z.geometry
         for z in other_zones
-        if z.zone_type in HARD_OBSTACLE_ZONE_TYPES and z.geometry.geom_type in ("Polygon", "MultiPolygon")
+        if z.zone_type in HARD_OBSTACLE_ZONE_TYPES
+        and z.zone_type not in plantable_types
+        and z.geometry.geom_type in ("Polygon", "MultiPolygon")
     ]
     if exclusion_zone is not None and not exclusion_zone.is_empty:
         result = territory.difference(exclusion_zone)

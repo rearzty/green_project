@@ -5,7 +5,7 @@ import { AlertTriangle, Box, Loader2, Redo2, Shrub, SquareDashedMousePointer, Tr
 
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
-import type { ItemCompliance, PlanSummary, PlantingNorms, PlantingType, ScoringMode, ValidationViolation } from "@/lib/api";
+import type { AreaBudget, ItemCompliance, PlanSummary, PlantingNorms, PlantingType, ScoringMode, ValidationViolation } from "@/lib/api";
 import { countLabel, OBJECT_FORMS, PLANTING_TYPE_FORMS, PLANTING_TYPE_LABELS } from "@/lib/format";
 import type { JobProgress } from "@/lib/hooks/useProjectSession";
 import type { SelectionSummary } from "@/lib/hooks/useSelection";
@@ -65,6 +65,8 @@ export interface ControlPanelProps {
   hasProject: boolean;
   /** Upload warnings of the current project (ProjectOut.warnings). */
   projectWarnings?: string[];
+  /** PlanOut.area_budget of the shown plan -- why a type got few plantings. */
+  areaBudget?: AreaBudget[];
   hasPlan: boolean;
   /** True only during the brief client-side restore-from-localStorage pass
    * right after the page loads (see app/page.tsx). */
@@ -89,7 +91,7 @@ export interface ControlPanelProps {
   onGenerate: (
     plantingTypes: PlantingType[],
     scoringMode: ScoringMode,
-    spacing?: { treeSpacingM?: number; shrubSpacingM?: number; treeRows?: number }
+    spacing?: { treeSpacingM?: number; shrubSpacingM?: number; treeRows?: number; treesInPaving?: boolean }
   ) => Promise<void>;
   /** Lifted to app/page.tsx (not local state here anymore) so AssistantChat.tsx
    * can read/change the same recipe Юна talks about -- both this panel and
@@ -189,6 +191,7 @@ function describeSelection(selection: SelectionSummary): string {
 export function ControlPanel({
   hasProject,
   projectWarnings = [],
+  areaBudget = [],
   hasPlan,
   restoring = false,
   generating = false,
@@ -242,6 +245,7 @@ export function ControlPanel({
 }: ControlPanelProps) {
   const [file, setFile] = useState<File | null>(null);
   const [doubleRow, setDoubleRow] = useState(false);
+  const [treesInPaving, setTreesInPaving] = useState(false);
   const [name, setName] = useState("Тестовая территория");
   // Defaults to the CRS scripts/generate_synthetic_data.py writes test data
   // in (UTM 37N, covers Moscow) so synthetic uploads land on the real map
@@ -462,6 +466,19 @@ export function ControlPanel({
               />
               Двухрядная аллея вдоль улиц
             </label>
+            <label
+              className="flex items-center gap-2"
+              title="743-ПП п. 9.8: дерево в покрытии тротуара — околоствольное пространство Ø 2 м с приствольной решёткой; остальные отступы не меняются"
+            >
+              <input
+                type="checkbox"
+                checked={treesInPaving}
+                onChange={(e) => setTreesInPaving(e.target.checked)}
+                disabled={!plantingTypes.includes("tree")}
+                className="h-4 w-4 accent-greenery-600 disabled:opacity-50"
+              />
+              Деревья в покрытии тротуара (решётка Ø 2 м)
+            </label>
           </div>
           <div className="flex gap-3 text-sm">
             <label className="flex items-center gap-1">
@@ -475,11 +492,12 @@ export function ControlPanel({
           </div>
           <Button
             disabled={!hasProject || plantingTypes.length === 0 || busy || editBusy || generating}
-            onClick={() => guarded(() => onGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM, treeRows: doubleRow ? 2 : 1 }))}
+            onClick={() => guarded(() => onGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM, treeRows: doubleRow ? 2 : 1, treesInPaving }))}
           >
             Сгенерировать план
           </Button>
           {generateProgress && <ProgressBar label={generateProgress.stage} progress={generateProgress.progress} />}
+          {hasPlan && areaBudget.length > 0 && <AreaBudgetList budgets={areaBudget} />}
         </section>
       )}
       {!hasProject && (
@@ -758,7 +776,7 @@ export function ControlPanel({
             onClick={() => guarded(() => onExportDxf())}
           >
             {exporting && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" aria-hidden />}
-            {exporting ? "Экспортируем…" : "Экспорт в DXF"}
+            {exporting ? "Экспортируем…" : "Экспорт в DXF (архив с подосновой)"}
           </Button>
           {/* Полное обоснование по НПА для всего плана -- то же, что CLI пишет
               в report.json/--csv (geo_engine/compliance.py), но по HTTP.
@@ -795,5 +813,40 @@ export function ControlPanel({
         </p>
       )}
     </aside>
+  );
+}
+
+const BUDGET_TYPE_LABELS: Record<string, string> = { tree: "Деревья", shrub: "Кустарник", lawn: "Газон" };
+
+/** Why a planting type got few (or no) plantings: the share of the
+ * territory still open to it and the constraints that closed the rest. On a
+ * dense street the strict setback tables leave trees almost nowhere to go --
+ * without this, "only shrubs" reads as a generator bug instead of what the
+ * norms actually say. */
+function AreaBudgetList({ budgets }: { budgets: AreaBudget[] }) {
+  const format = (m2: number) => Math.round(m2).toLocaleString("ru-RU");
+  return (
+    <div className="flex flex-col gap-1 rounded border border-stone-700 bg-stone-900/60 p-2 text-xs text-stone-300">
+      <span className="text-stone-400">Под посадку осталось:</span>
+      {budgets.map((budget) => {
+        const scarce = budget.usable_share < 0.05;
+        return (
+          <div key={budget.planting_type} className={scarce ? "text-amber-200" : undefined}>
+            <span className="font-medium">{BUDGET_TYPE_LABELS[budget.planting_type] ?? budget.planting_type}</span>
+            {": "}
+            {format(budget.usable_m2)} м² из {format(budget.territory_m2)} ({(100 * budget.usable_share).toFixed(1)}%)
+            {scarce && budget.blockers.length > 0 && (
+              <span className="text-stone-400">
+                {" — больше всего закрывают: "}
+                {budget.blockers
+                  .slice(0, 3)
+                  .map((b) => `${b.label} ${Math.round(100 * b.share)}%`)
+                  .join(", ")}
+              </span>
+            )}
+          </div>
+        );
+      })}
+    </div>
   );
 }

@@ -307,7 +307,7 @@ def violation_mask(geometries: list[BaseGeometry], exclusion: BaseGeometry | Non
     return mask
 
 
-def _check_violations(project: Project, items: list[PlantingItemRow]) -> list[dict]:
+def _check_violations(project: Project, items: list[PlantingItemRow], trees_in_paving: bool = False) -> list[dict]:
     # По (тип, порода), а не только по типу: у деревьев отступ зависит от
     # породы (см. exclusion_cache._species_key) — и в одном плане их бывает
     # несколько (ряд одной породой, россыпь другой).
@@ -319,7 +319,8 @@ def _check_violations(project: Project, items: list[PlantingItemRow]) -> list[di
     for (planting_type, species), type_items in by_type.items():
         geometries = [db_to_shape(item.geometry) for item in type_items]
         mask = exclusion_cache.with_exclusion_zone(
-            project, planting_type, lambda zone: violation_mask(geometries, zone), species=species
+            project, planting_type, lambda zone: violation_mask(geometries, zone), species=species,
+            trees_in_paving=trees_in_paving,
         )
         label = _PLANTING_TYPE_LABELS.get(planting_type, planting_type)
         violations.extend(
@@ -410,7 +411,7 @@ def validate_plan(project: Project, plan: Plan) -> list[dict]:
     them.
     """
     spacing, _ = _spacing_violations(plan, None)
-    return _check_violations(project, plan.items) + spacing
+    return _check_violations(project, plan.items, plan.trees_in_paving) + spacing
 
 
 def validate_items_scoped(project: Project, plan: Plan, ids: list[str]) -> tuple[list[dict], list[str]]:
@@ -418,7 +419,7 @@ def validate_items_scoped(project: Project, plan: Plan, ids: list[str]) -> tuple
     их соседи по интервалу) — фронт заменяет подсветку именно у них, см.
     `_spacing_violations`."""
     wanted = set(ids)
-    setback = _check_violations(project, [item for item in plan.items if item.id in wanted])
+    setback = _check_violations(project, [item for item in plan.items if item.id in wanted], plan.trees_in_paving)
     spacing, checked = _spacing_violations(plan, ids)
     return setback + spacing, sorted(checked)
 
