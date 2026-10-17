@@ -512,3 +512,68 @@ class TestTreesInPaving:
         assert all(i.rationale.startswith(IN_PAVING_RATIONALE_PREFIX) for i in in_paving)
         records = explain_items(items, [], zones, n, catalogue)
         assert all(r.compliant for r in records)
+
+class TestAccents:
+    """Группы деревьев и солитеры вместо россыпи (743-ПП табл. 3.6.2 — 5-7 м,
+    прил. п. 10.8.1 — композиция)."""
+
+    def test_open_square_gets_a_group_with_core_and_ring(self):
+        from geo_engine.patterns import TREE_GROUP_PITCH_M, accent_layout
+
+        layout = accent_layout(Polygon([(0, 0), (40, 0), (40, 40), (0, 40)]), 5.0, seed=1)
+
+        kind, points = layout[0]
+        assert kind == "group"
+        assert 4 <= len(points) <= 7
+        for i, a in enumerate(points):
+            for b in points[i + 1:]:
+                assert a.distance(b) >= TREE_GROUP_PITCH_M - 1e-6
+
+    def test_narrow_strip_gets_a_solitaire_and_a_sliver_gets_nothing(self):
+        from geo_engine.patterns import accent_layout
+
+        strip = accent_layout(Polygon([(0, 0), (30, 0), (30, 7), (0, 7)]), 5.0, seed=1)
+        assert strip and all(kind == "solitaire" for kind, _ in strip)
+        assert accent_layout(Polygon([(0, 0), (30, 0), (30, 3), (0, 3)]), 5.0, seed=1) == []
+
+    def test_budget_keeps_whole_groups(self):
+        from geo_engine.patterns import accent_layout
+
+        area = Polygon([(0, 0), (200, 0), (200, 200), (0, 200)])
+        layout = accent_layout(area, 5.0, seed=1, max_trees=10)
+        assert sum(len(points) for _, points in layout) < 10 + 7
+        assert all(kind != "group" or len(points) >= 2 for kind, points in layout)
+
+    def test_planner_puts_groups_after_the_row_and_the_plan_is_compliant(self, norms, catalogue):
+        from geo_engine.compliance import explain_items
+        from geo_engine.planner import ROW_RATIONALE_PREFIX, TREE_GROUP_RATIONALE_PREFIX, plan_items
+
+        territory = Polygon([(0, 0), (200, 0), (200, 120), (0, 120)])
+        zones = [
+            Zone(geometry=territory, zone_type="territory"),
+            Zone(geometry=LineString([(0, 0), (200, 0)]), zone_type="road"),
+        ]
+        items = plan_items(
+            "acc", [], zones, territory, ["tree"], lambda cs: [(1.0, "т") for _ in cs], norms,
+            species_overrides={"tree": "Липа мелколистная"}, pattern="auto", catalogue=catalogue,
+            density_per_ha={"tree": 0},
+        )
+
+        assert any(ROW_RATIONALE_PREFIX in i.rationale for i in items)
+        assert any(TREE_GROUP_RATIONALE_PREFIX in i.rationale for i in items)
+        assert all(r.compliant for r in explain_items(items, [], zones, norms, catalogue))
+
+    def test_accent_pattern_has_no_rows_and_no_scatter(self, norms, catalogue):
+        from geo_engine.planner import SOLITAIRE_RATIONALE_PREFIX, TREE_GROUP_RATIONALE_PREFIX, plan_items
+
+        territory = Polygon([(0, 0), (120, 0), (120, 80), (0, 80)])
+        items = plan_items(
+            "acc", [], [Zone(geometry=territory, zone_type="territory")], territory, ["tree"],
+            lambda cs: [(1.0, "т") for _ in cs], norms, pattern="accent", catalogue=catalogue,
+            density_per_ha={"tree": 0},
+        )
+
+        assert items
+        assert all(
+            TREE_GROUP_RATIONALE_PREFIX in i.rationale or SOLITAIRE_RATIONALE_PREFIX in i.rationale for i in items
+        )
