@@ -284,3 +284,58 @@ class TestGeneratorAndCheckerAgree:
             )
 
         assert count("Липа мелколистная") < count("Рябина обыкновенная")
+
+
+class TestUserIntervalIsAFloorNotAReplacement:
+    """Интервал деревьев, заданный пользователем (панель, Юна), раздвигает
+    посадки, но не сдвигает их ближе нормы класса кроны (МГСН 1.02-02
+    п. 4.2.9.2). Раньше он подменял норму целиком, и план не проходил
+    собственную проверку: «деревья почаще» (3,5 м) дали 46 нарушений из 47."""
+
+    @staticmethod
+    def _scene():
+        from shapely.geometry import LineString, Polygon
+
+        from geo_engine.model import Utility, Zone
+
+        territory = Polygon([(0, 0), (200, 0), (200, 160), (0, 160)])
+        utilities = [Utility(geometry=LineString([(0, 40), (200, 40)]), object_type="heat_network")]
+        zones = [
+            Zone(geometry=territory, zone_type="territory"),
+            Zone(geometry=Polygon([(10, 130), (60, 130), (60, 155), (10, 155)]), zone_type="building"),
+        ]
+        return territory, utilities, zones
+
+    def _plan(self, norms, catalogue, interval, **kwargs):
+        from geo_engine.planner import plan_items
+
+        territory, utilities, zones = self._scene()
+        items = plan_items(
+            "floor", utilities, zones, territory, ["tree"], lambda cs: [(1.0, "test") for _ in cs],
+            norms.with_spacing_override("tree", interval), keep_spacing_for=("tree",), catalogue=catalogue, **kwargs,
+        )
+        return items, utilities, zones
+
+    def test_the_larger_of_the_users_interval_and_the_crown_norm_wins(self, norms, catalogue):
+        oak = catalogue.get("Дуб черешчатый")
+        assert norms_for_species(norms, "tree", oak, catalogue, user_interval_m=3.5).spacing_for("tree").min_distance_m == 8.0
+        assert norms_for_species(norms, "tree", oak, catalogue, user_interval_m=11.0).spacing_for("tree").min_distance_m == 11.0
+
+    @pytest.mark.parametrize("interval, rows", [(3.5, 1), (0.5, 1), (5.0, 2)])
+    def test_an_interval_below_the_norm_still_passes_the_services_own_check(self, norms, catalogue, interval, rows):
+        from geo_engine.compliance import explain_items
+
+        items, utilities, zones = self._plan(norms, catalogue, interval, tree_rows=rows)
+
+        assert len(items) > 1, "фикстура должна давать посадки, иначе тест ничего не проверяет"
+        bad = [r for r in explain_items(items, utilities, zones, norms, catalogue) if not r.compliant]
+        assert bad == [], f"{len(bad)} из {len(items)} деревьев не проходят проверку при интервале {interval} м"
+
+    def test_a_wider_interval_still_spreads_the_trees_apart(self, norms, catalogue):
+        from shapely.strtree import STRtree
+
+        items, _, _ = self._plan(norms, catalogue, 12.0)
+        points = [i.geometry for i in items]
+        assert len(points) > 1
+        _, distances = STRtree(points).query_nearest(points, exclusive=True, return_distance=True)
+        assert distances.min() >= 12.0 - 1e-3
