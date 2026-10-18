@@ -21,7 +21,7 @@ import {
 
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
-import type { AreaBudget, PlanSummary, PlantingNorms, PlantingType, ScoringMode, ValidationViolation } from "@/lib/api";
+import type { AreaBudget, PlanSummary, PlantingType, ScoringMode, ValidationViolation } from "@/lib/api";
 import type { JobProgress } from "@/lib/hooks/useProjectSession";
 import type { SelectionSummary } from "@/lib/hooks/useSelection";
 import { PLANTING_COLORS, SEASON_LABELS, type LayerLegendEntry, type Season } from "@/lib/mapStyle";
@@ -130,6 +130,10 @@ export interface ControlPanelProps {
   /** The delivery has no work-area boundary, only the survey order boundary,
    * and the user hasn't agreed to plan by it yet -- ask before generating. */
   needsOrderBoundaryConsent?: boolean;
+  /** Показать тот же вопрос о границе заказа, что по кнопке генерации, —
+   * когда план попросили построить не кнопкой, а Юне (app/page.tsx).
+   * Каждое новое значение — новый вопрос; 0 — не спрашивали. */
+  consentRequest?: number;
   /** PlanOut.area_budget of the shown plan -- why a type got few plantings. */
   areaBudget?: AreaBudget[];
   hasPlan: boolean;
@@ -159,8 +163,6 @@ export interface ControlPanelProps {
   onTreeRowsChange: (rows: number) => void;
   treesInPaving: boolean;
   onTreesInPavingChange: (value: boolean) => void;
-  /** Current planting-norms defaults -- the interval inputs' placeholders. */
-  plantingNorms?: PlantingNorms;
   onExportDxf: () => Promise<void>;
   /** Forgets the locally-remembered project/plan; deletes nothing server-side. */
   onClearAll: () => void;
@@ -206,6 +208,7 @@ export function ControlPanel({
   projectName,
   projectWarnings = [],
   needsOrderBoundaryConsent = false,
+  consentRequest = 0,
   areaBudget = [],
   hasPlan,
   restoring = false,
@@ -227,7 +230,6 @@ export function ControlPanel({
   onTreeRowsChange,
   treesInPaving,
   onTreesInPavingChange,
-  plantingNorms,
   onExportDxf,
   onClearAll,
   layerLegend,
@@ -292,6 +294,15 @@ export function ControlPanel({
   };
   const isOpen = (key: SectionKey) => openOverrides[key] ?? defaultOpen[key];
   const toggle = (key: SectionKey) => setOpenOverrides((o) => ({ ...o, [key]: !isOpen(key) }));
+
+  // Согласие — только здесь, одним и тем же вопросом: Юна план по границе
+  // заказа сама не строит, а открывает этот вопрос с её настройками в полях.
+  useEffect(() => {
+    if (consentRequest === 0 || !needsOrderBoundaryConsent) return;
+    setAskOrderBoundary(true);
+    setOpenOverrides((o) => ({ ...o, generate: true }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [consentRequest]);
 
   async function guarded(action: () => Promise<void>) {
     setBusy(true);
@@ -504,7 +515,10 @@ export function ControlPanel({
                 value={treeSpacingM ?? ""}
                 onChange={(e) => onTreeSpacingMChange(e.target.value === "" ? undefined : Number(e.target.value))}
                 disabled={!plantingTypes.includes("tree")}
-                placeholder={`${plantingNorms?.species_spacing.tree_default?.min_distance_m ?? 5} (по норме)`}
+                // По норме интервал задаёт класс кроны породы, а не одно число;
+                // своё значение только раздвигает деревья (geo_engine/planner.py).
+                placeholder="3–8 (по кроне)"
+                title="По норме — по классу кроны: 8 м широкая, 5 м средняя, 3 м узкая (МГСН 1.02-02 п. 4.2.9.2). Своё значение может только раздвинуть деревья, ближе нормы их не поставить."
                 className="rounded-md border border-stone-700 bg-stone-950 px-2 py-1 text-sm text-stone-100 placeholder:text-stone-600 disabled:opacity-50"
               />
             </label>
@@ -512,13 +526,17 @@ export function ControlPanel({
               Интервал кустарника, м
               <input
                 type="number"
-                step={0.5}
+                step={0.1}
                 min={0.3}
                 max={10}
                 value={shrubSpacingM ?? ""}
                 onChange={(e) => onShrubSpacingMChange(e.target.value === "" ? undefined : Number(e.target.value))}
                 disabled={!plantingTypes.includes("shrub")}
-                placeholder={`${plantingNorms?.species_spacing.shrub_default?.min_distance_m ?? 3} (по норме)`}
+                // Почти весь кустарник — живая изгородь, и интервал пользователя
+                // заменяет именно её шаг (planner.IN_ROW_PITCH_M), а не 3 м
+                // из planting_norms.yaml.
+                placeholder="0,5 (изгородь)"
+                title="Шаг кустарника в живой изгороди: по норме 0,5 м (743-ПП табл. 3.6.2). Куртины сажаются по плотности породы (515-ПП табл. 5)."
                 className="rounded-md border border-stone-700 bg-stone-950 px-2 py-1 text-sm text-stone-100 placeholder:text-stone-600 disabled:opacity-50"
               />
             </label>

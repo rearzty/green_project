@@ -92,6 +92,15 @@ class PlanOut(BaseModel):
     scoring_mode: ScoringMode
     features: GeoJSONFeatureCollection
     area_budget: list[AreaBudgetOut] = []
+    # Остальной рецепт плана — чтобы панель и Юна после перезагрузки страницы
+    # или переключения версии показывали и меняли настройки ИМЕННО этого плана,
+    # а не то, что осталось в полях от прошлого (иначе следующая правка
+    # интервала молча теряла двухрядную аллею).
+    planting_types: list[PlantingType] = []
+    tree_spacing_m: float | None = None
+    shrub_spacing_m: float | None = None
+    tree_rows: int = 1
+    trees_in_paving: bool = False
 
 
 class PlanSummary(BaseModel):

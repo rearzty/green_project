@@ -23,29 +23,32 @@ import type { MapFitRequest } from "@/components/MapView";
 import { PlanSummaryCard } from "@/components/PlanSummaryCard";
 import { Toaster } from "@/components/Toaster";
 import {
-  complianceReportUrl,
+  fetchComplianceReport,
   getItemsCompliance,
-  getPlantingNorms,
   getProjectLayers3d,
+  PROJECT_GONE_MESSAGE,
   type AssistantAction,
   type AssistantCommand,
   type AssistantGenerationSettings,
   type AssistantSelection,
   type GeoJSONFeatureCollection,
   type ItemCompliance,
-  type PlantingNorms,
   type PlantingType,
   type ScoringMode,
 } from "@/lib/api";
 import {
   countText,
   describeSettingsChange,
+  doneText,
   idsForTarget,
   missingText,
   planCountsText,
-  PLANTING_FORMS,
+  PLANTING,
+  PLANTING_ACC,
+  PLANTING_GEN,
   selectedText,
   settingsFromAction,
+  violationsSelectedText,
   type CommandResult,
   type SelectTarget,
   type UiAction,
@@ -57,6 +60,7 @@ import { useProjectSession } from "@/lib/hooks/useProjectSession";
 import { useSelection } from "@/lib/hooks/useSelection";
 import type { Season } from "@/lib/mapStyle";
 import { boundsOfItems } from "@/lib/planIndex";
+import { recipeForPlan } from "@/lib/planRecipes";
 import { computePlanStats } from "@/lib/planStats";
 import { errorMessage, toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
@@ -72,11 +76,29 @@ const NOTHING_SELECTED = "Ничего не выделено — выделит�
 const EDIT_BUSY = "Ещё сохраняется предыдущая правка — попробуйте через пару секунд.";
 const OTHER_OPERATION = "Сейчас идёт другая операция — попробуйте через пару секунд.";
 const UNKNOWN_COMMAND = "Эту команду я пока не умею выполнять.";
+const SELECTION_CHANGED = "Выделение изменилось, пока Юна отвечала, — правка не выполнена. Повторите просьбу.";
+const NEEDS_ORDER_BOUNDARY_CONSENT =
+  "План не построен: границы работ в поставке нет, строить по границе заказа на съёмку можно только с вашего согласия. Настройки — в панели слева, подтвердите там «Да, по границе заказа».";
 /** Правка стартует в ближайшем рендере; не видно её и через это время —
  * runEdit отказался начинать (уже шла другая), ждать нечего. */
 const EDIT_START_TIMEOUT_MS = 3000;
 /** Батч-правка по id — секунды даже на большом выделении; дольше — уже не ждём. */
 const EDIT_FINISH_TIMEOUT_MS = 120_000;
+/** Полная проверка нового плана на нормативы — секунды; дольше итог Юны не
+ * держим, нарушения всё равно покажет сводка плана. */
+const VALIDATION_TIMEOUT_MS = 20_000;
+const NO_IDS: ReadonlySet<string> = new Set();
+
+/** Карточки над картой справа (сводка плана, выделение): right-4 + w-72 и
+ * зазор до чата — столько чат Юны оставляет им у правого края окна. */
+const CARDS_RESERVED_PX = 16 + 288 + 8;
+
+function sameIds(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a === b) return true;
+  if (a.size !== b.size) return false;
+  for (const id of a) if (!b.has(id)) return false;
+  return true;
+}
 
 export default function Home() {
   const session = useProjectSession();
@@ -124,6 +146,9 @@ export default function Home() {
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   // «Покажи эти объекты» для карты — Юна выделила группу (selectByAssistant).
   const [fitRequest, setFitRequest] = useState<MapFitRequest | null>(null);
+  // Юну попросили построить план, а нужен ответ на вопрос панели о границе
+  // заказа (ControlPanel.tsx::consentRequest) — счётчик, каждый — новый вопрос.
+  const [consentRequest, setConsentRequest] = useState(0);
   // Defaults open (matches the always-visible panel this replaces) and is
   // corrected once on mount for phones -- SSR has no window to check, so a
   // static default that's occasionally wrong for one frame beats guessing.
@@ -132,24 +157,6 @@ export default function Home() {
   useEffect(() => {
     if (!window.matchMedia("(min-width: 768px)").matches) setSidebarOpen(false);
   }, []);
-  // Global config, not per-project -- fetched once so ControlPanel can show
-  // the interval inputs' real current default instead of a hardcoded guess.
-  const [plantingNorms, setPlantingNorms] = useState<PlantingNorms | undefined>(undefined);
-
-  useEffect(() => {
-    let cancelled = false;
-    getPlantingNorms()
-      .then((norms) => {
-        if (!cancelled) setPlantingNorms(norms);
-      })
-      .catch(() => {
-        // Placeholder just falls back to a hardcoded number in ControlPanel -- not worth a toast.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   // Sourced from the raster endpoint's own grouping now, not recomputed from
   // project.layers on the client -- layer_raster.py already walks every
   // layer once to build the same key/label/color/count, and project.layers
@@ -213,38 +220,29 @@ export default function Home() {
   }, [project, plan, singleSelectedId]);
 
   /** Отчёт обоснований по плану на экране — и для кнопок панели, и для Юны.
-   * CSV сервер отдаёт вложением: ссылки хватает, файл льётся прямо на диск.
-   * JSON приходит без Content-Disposition, и по ссылке браузер открывал его
-   * вместо приложения — уходил со страницы. Его скачиваем сами: это
-   * обоснования посадок, а не многосотмегабайтный чертёж, как DXF. */
+   * Оба формата — сначала в память (api.ts::fetchComplianceReport), потом
+   * ссылкой на blob: при ошибке сервера прямая ссылка уводила браузер со
+   * страницы вместе с разговором Юны, а чат при этом писал «скачивается».
+   * Промис завершается, когда файл уже отдан браузеру, — либо ошибкой с
+   * готовым текстом. */
   async function downloadComplianceReport(format: "json" | "csv") {
     const { project: currentProject, plan: currentPlan } = runtimeRef.current.session;
     if (!currentProject || !currentPlan) return;
-    const url = complianceReportUrl(currentProject.id, currentPlan.plan_id, format);
-    const link = document.createElement("a");
-    let objectUrl: string | null = null;
-    if (format === "json") {
-      let response: Response;
-      try {
-        response = await fetch(url);
-      } catch {
-        throw new Error("Нет связи с сервером — отчёт не скачан.");
-      }
-      if (!response.ok) throw new Error(`Отчёт не получен: ошибка сервера (${response.status}).`);
-      objectUrl = URL.createObjectURL(await response.blob());
-      link.href = objectUrl;
-      link.download = `compliance_${currentPlan.plan_id}.json`;
-    } else {
-      link.href = url;
+    let blob: Blob;
+    try {
+      blob = await fetchComplianceReport(currentProject.id, currentPlan.plan_id, format);
+    } catch (e) {
+      throw new Error(`Отчёт не скачан: ${errorMessage(e)}`);
     }
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = `compliance_${currentPlan.plan_id}.${format}`;
     document.body.appendChild(link);
     link.click();
     link.remove();
     // Не сразу: часть браузеров начинает читать blob уже после click().
-    if (objectUrl) {
-      const revoke = objectUrl;
-      setTimeout(() => URL.revokeObjectURL(revoke), 60_000);
-    }
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
   }
 
   function toggleView3d() {
@@ -412,6 +410,26 @@ export default function Home() {
     setTreesInPaving(next.trees_in_paving);
   }
 
+  // Поля панели — рецепт плана на экране, как только на экране другой план:
+  // восстановлен после обновления страницы, выбран в «Версиях плана», только
+  // что построен. Иначе после обновления двухрядный план показывался с
+  // выключенной аллеей, и следующая просьба к Юне («кусты пореже») молча
+  // строила однорядный — она меняет то, что видит в полях. Правка того же
+  // плана рецепт не меняет — эффект только на смену plan_id.
+  useEffect(() => {
+    if (plan) applyGenerationSettings(recipeForPlan(plan, runtimeRef.current.settings));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [plan?.plan_id]);
+
+  /** Число посадок с нарушениями у плана на экране — когда закончится его
+   * полная проверка (её сам запускает usePlanEdits при смене плана); null —
+   * не дождались или проверка не удалась (о ней тогда скажет уведомление). */
+  async function violatingItemsOf(planId: string): Promise<number | null> {
+    await waitForRender(() => runtimeRef.current.editing.checkedPlanId === planId, VALIDATION_TIMEOUT_MS);
+    const edits = runtimeRef.current.editing;
+    return edits.checkedPlanId === planId && edits.violations !== null ? edits.violationIds.size : null;
+  }
+
   /** Новый рецепт генерации — тем же путём, что кнопка панели (история
    * планов, сессия, общий индикатор `generating`), а поля панели сразу
    * показывают то, что поставила Юна. Отмена — обратно к плану, который был
@@ -423,6 +441,16 @@ export default function Home() {
     if (edits.editBusy) return { ok: false, text: EDIT_BUSY };
     const next = settingsFromAction(action, prev);
     if (next.planting_types.length === 0) return { ok: false, text: "Нечего сажать: оставьте хотя бы один тип посадки." };
+    // Границы работ в поставке нет: строить по границе заказа можно только с
+    // согласия, и давать его за пользователя Юна не вправе. Тот же вопрос,
+    // что задаёт кнопка панели, — с настройками Юны уже в полях: «Да» там
+    // построит именно то, о чём просили в чате.
+    if (current.project.territory_source === "order_boundary" && !current.project.use_order_boundary) {
+      applyGenerationSettings(next);
+      setSidebarOpen(true);
+      setConsentRequest((n) => n + 1);
+      return { ok: false, text: NEEDS_ORDER_BOUNDARY_CONSENT };
+    }
     const changes = describeSettingsChange(prev, next);
     const prevPlanId = current.plan?.plan_id;
     applyGenerationSettings(next);
@@ -447,10 +475,15 @@ export default function Home() {
       return { ok: false, text: `План не построен: ${errorMessage(failure)}` };
     }
     const counts = after.planStats ? planCountsText(after.planStats) : "";
+    // Генератор ставит посадки только по нормам, но нарушения бывают и у
+    // нового плана (интервал между фазами посадки, см. CLAUDE.md), — тогда
+    // об этом говорит и итог, а не одна сводка в углу карты.
+    const violating = newPlanId ? await violatingItemsOf(newPlanId) : null;
+    const violationsNote = violating ? `. Посадок с нарушениями норм: ${violating.toLocaleString("ru-RU")} — отмечены красным` : "";
     // Тот же рецепт и никаких ручных правок — бэкенд отдаёт текущий план
     // заново (pipeline_service._find_reusable_plan), отменять тут нечего.
     if (prevPlanId && newPlanId === prevPlanId) {
-      return { ok: true, text: `План с такими настройками уже на экране${counts ? `: ${counts}` : ""}` };
+      return { ok: true, text: `План с такими настройками уже на экране${counts ? `: ${counts}` : ""}${violationsNote}` };
     }
     const head = changes.length > 0 ? changes.join("; ") : prevPlanId ? "План построен заново с теми же настройками" : "План построен";
     const undo =
@@ -465,7 +498,15 @@ export default function Home() {
             applyGenerationSettings(prev);
           }
         : undefined;
-    return { ok: true, text: counts ? `${head}. В плане: ${counts}` : head, undo };
+    return { ok: true, text: `${counts ? `${head}. В плане: ${counts}` : head}${violationsNote}`, undo };
+  }
+
+  /** Правку выделенного пользователь должен видеть: в 3D нет ни выделения,
+   * ни карточки (ThreeDView — только просмотр), а правка оттуда меняла бы
+   * то, чего на экране нет. Так же, как выделение (selectByAssistant). */
+  function showEditedOnMap() {
+    setShowPlan(true);
+    setView3d(false);
   }
 
   async function deleteByAssistant(ids: ReadonlySet<string>): Promise<CommandResult> {
@@ -475,15 +516,16 @@ export default function Home() {
     const targets = [...ids].filter((id) => index.has(id));
     if (targets.length === 0) return { ok: false, text: NOTHING_SELECTED };
     if (edits.editBusy) return { ok: false, text: EDIT_BUSY };
+    showEditedOnMap();
     const revision = current.planRevision;
     edits.handleDeleteSelection(new Set(targets));
     const outcome = await waitForEdit(revision);
     if (outcome === "not_started") return { ok: false, text: "Удаление не началось — попробуйте ещё раз." };
-    if (outcome === "timeout") return { ok: true, text: `Удаляю ${countText(targets.length, PLANTING_FORMS)} — итог появится на карте.` };
+    if (outcome === "timeout") return { ok: true, text: `Удаляю ${countText(targets.length, PLANTING_ACC)} — итог появится на карте.` };
     const stillThere = () => targets.filter((id) => runtimeRef.current.session.planIndex?.has(id)).length;
     const removed = targets.length - stillThere();
     if (removed === 0) return { ok: false, text: "Не удалось удалить — причина в уведомлении." };
-    return { ok: true, text: `Удалено ${countText(removed, PLANTING_FORMS)}`, undo: editUndo(() => stillThere() === targets.length) };
+    return { ok: true, text: doneText("Удален", removed, PLANTING), undo: editUndo(() => stillThere() === targets.length) };
   }
 
   async function retypeByAssistant(ids: ReadonlySet<string>, type: "tree" | "shrub"): Promise<CommandResult> {
@@ -504,50 +546,58 @@ export default function Home() {
       else if (item.type !== type) previous.set(id, item.type);
     });
     if (previous.size === 0) {
-      return { ok: false, text: lawns === targets.length ? "Газон — площадной объект: деревом или кустом его не сделать." : `Выделенные посадки уже ${noun}.` };
+      if (lawns === targets.length) return { ok: false, text: "Газон — площадной объект: деревом или кустом его не сделать." };
+      return { ok: false, text: targets.length === 1 ? `Выделенная посадка уже ${type === "tree" ? "дерево" : "куст"}.` : `Выделенные посадки уже ${noun}.` };
     }
     if (edits.editBusy) return { ok: false, text: EDIT_BUSY };
+    showEditedOnMap();
     const revision = current.planRevision;
     edits.handleRetypeSelection(new Set(targets), index, type);
     const outcome = await waitForEdit(revision);
     if (outcome === "not_started") return { ok: false, text: "Смена типа не началась — попробуйте ещё раз." };
-    if (outcome === "timeout") return { ok: true, text: `Меняю тип у ${countText(previous.size, PLANTING_FORMS)} — итог появится на карте.` };
+    if (outcome === "timeout") return { ok: true, text: `Меняю тип у ${countText(previous.size, PLANTING_GEN)} — итог появится на карте.` };
     const countTyped = (expected: (id: string) => PlantingType | undefined) =>
       [...previous.keys()].filter((id) => runtimeRef.current.session.planIndex?.get(id)?.type === expected(id)).length;
     const changed = countTyped(() => type);
     if (changed === 0) return { ok: false, text: "Не удалось сменить тип — причина в уведомлении." };
+    // «1 посадка → куст», но «3 посадки → кусты».
+    const target = changed === 1 ? (type === "tree" ? "дерево" : "куст") : noun;
     return {
       ok: true,
-      text: `${countText(changed, PLANTING_FORMS)} → ${noun}${lawns > 0 ? " (газон остался газоном)" : ""}`,
+      text: `${countText(changed, PLANTING.forms)} → ${target}${lawns > 0 ? " (газон остался газоном)" : ""}`,
       undo: editUndo(() => countTyped((id) => previous.get(id)) === previous.size),
     };
   }
 
   /** Выделение группы и рамка карты под неё. Синхронно: возвращает и то, что
-   * выделено, — следующая команда того же ответа увидит его раньше рендера. */
+   * выделено, — следующая команда того же ответа увидит его раньше рендера.
+   * Не вышло (плана нет, нормативы не проверены, выделять нечего) — для
+   * следующих команд ответа выделение пустое, а не прежнее: «выдели липы и
+   * удали их» без единой липы иначе удалило бы то, что пользователь выделял
+   * раньше. Само выделение на карте при этом не трогаем — команда ничего не
+   * сделала. */
   function selectByAssistant(target: SelectTarget, species?: string | null): { result: CommandResult; selected: ReadonlySet<string> } {
     const { session: current, editing: edits, selection: sel } = runtimeRef.current;
-    const keep = sel.selectedIds;
     if (target === "none") {
       sel.clear();
-      return { result: { ok: true, text: "Выделение снято" }, selected: new Set() };
+      return { result: { ok: true, text: "Выделение снято" }, selected: NO_IDS };
     }
     const index = current.planIndex;
-    if (!current.plan || !index) return { result: { ok: false, text: NO_PLAN }, selected: keep };
+    if (!current.plan || !index) return { result: { ok: false, text: NO_PLAN }, selected: NO_IDS };
     let ids: string[];
-    let what: string;
+    let text: string;
     if (target === "violations") {
       if (edits.violations === null) {
-        const text = edits.validating ? "Нормативы ещё проверяются — спросите через пару секунд." : "Нормативы ещё не проверены.";
-        return { result: { ok: false, text }, selected: keep };
+        const notYet = edits.validating ? "Нормативы ещё проверяются — спросите через пару секунд." : "Нормативы ещё не проверены.";
+        return { result: { ok: false, text: notYet }, selected: NO_IDS };
       }
       ids = [...edits.violationIds].filter((id) => index.has(id));
-      if (ids.length === 0) return { result: { ok: true, text: "Нарушений нет — все нормативные отступы соблюдены" }, selected: keep };
-      what = `${countText(ids.length, PLANTING_FORMS)} с нарушениями — они отмечены красным`;
+      if (ids.length === 0) return { result: { ok: true, text: "Нарушений нет — все нормативные отступы соблюдены" }, selected: NO_IDS };
+      text = violationsSelectedText(ids.length);
     } else {
       ids = idsForTarget(index, current.plan.features, target, species);
-      if (ids.length === 0) return { result: { ok: false, text: missingText(target, species) }, selected: keep };
-      what = selectedText(target, ids.length, species);
+      if (ids.length === 0) return { result: { ok: false, text: missingText(target, species) }, selected: NO_IDS };
+      text = selectedText(target, ids.length, species);
     }
     // Выделение видно только на 2D-карте с включённым планом. Без проверки
     // текущего вида: «открой 3D и выдели …» — один ответ, и runtimeRef ещё
@@ -556,8 +606,8 @@ export default function Home() {
     setView3d(false);
     sel.setSelection(ids);
     const box = boundsOfItems(index, ids);
-    if (box) setFitRequest({ box });
-    return { result: { ok: true, text: `Выделено ${what}` }, selected: new Set(ids) };
+    if (box) setFitRequest({ box, ids });
+    return { result: { ok: true, text }, selected: new Set(ids) };
   }
 
   async function uiByAssistant(command: UiAction): Promise<CommandResult> {
@@ -572,8 +622,10 @@ export default function Home() {
       case "report_csv": {
         if (!current.plan) return { ok: false, text: NO_PLAN };
         const format = command === "report_json" ? "json" : "csv";
+        // Ждёт, пока файл придёт целиком: «скачан» — только когда он уже у
+        // браузера, ошибка сервера — строкой с ⚠, а не уходом со страницы.
         await downloadComplianceReport(format);
-        return { ok: true, text: `Отчёт обоснований (${format.toUpperCase()}) скачивается` };
+        return { ok: true, text: `Отчёт обоснований (${format.toUpperCase()}) скачан` };
       }
       case "show_3d":
         // Та же проверка, что у toggleView3d: 3D без плана показывать нечего.
@@ -589,26 +641,46 @@ export default function Home() {
   }
 
   /** Команды из ответа Юны — по порядку, теми же путями, что кнопки панели
-   * и карточки. Ошибка одной команды — её строка с ⚠ в чате, не исключение. */
-  async function handleAssistantCommands(commands: AssistantCommand[]): Promise<CommandResult[]> {
+   * и карточки. Ошибка одной команды — её строка с ⚠ в чате, не исключение.
+   * `sentSelection` — выделение в момент, когда просьбу отправили
+   * (AssistantChat.tsx::send): именно о нём Юна и слышала. */
+  async function handleAssistantCommands(
+    commands: AssistantCommand[],
+    { selectedIds: sentSelection }: { selectedIds: ReadonlySet<string> }
+  ): Promise<CommandResult[]> {
     const results: CommandResult[] = [];
     // Выделение между командами ведём сами: setSelection дойдёт до
     // runtimeRef только к следующему рендеру, а «выдели деревья и сделай их
-    // кустами» — один ответ.
-    let selected = runtimeRef.current.selection.selectedIds;
+    // кустами» — один ответ. Пока его не заменила команда «выдели …» этого
+    // же ответа, это снимок с момента отправки — и править его можно, только
+    // если на карте выделено то же самое: карта не заблокирована, пока Юна
+    // отвечает, и Ctrl+A перед ответом на «удали выделенные» иначе удалил бы
+    // всё.
+    let selected = sentSelection;
+    let fromSnapshot = true;
     for (const command of commands) {
       let result: CommandResult;
       try {
         switch (command.type) {
-          case "settings":
+          case "settings": {
+            const planBefore = runtimeRef.current.session.plan?.plan_id;
             result = await applySettingsByAssistant(command.settings);
-            // Новый план — новые id: что осталось выделенным, решил useSelection.
-            if (result.ok) selected = runtimeRef.current.selection.selectedIds;
+            // Новый план — новые id: из прежнего выделения в нём нет ничего.
+            if (runtimeRef.current.session.plan?.plan_id !== planBefore) {
+              selected = NO_IDS;
+              fromSnapshot = false;
+            }
             break;
+          }
           case "edit_selection":
-            if (command.operation === "delete") {
+            if (fromSnapshot && !sameIds(selected, runtimeRef.current.selection.selectedIds)) {
+              result = { ok: false, text: SELECTION_CHANGED };
+            } else if (command.operation === "delete") {
               result = await deleteByAssistant(selected);
-              if (result.ok) selected = new Set();
+              if (result.ok) {
+                selected = NO_IDS;
+                fromSnapshot = false;
+              }
             } else if (command.operation === "to_tree" || command.operation === "to_shrub") {
               result = await retypeByAssistant(selected, command.operation === "to_tree" ? "tree" : "shrub");
             } else {
@@ -619,6 +691,7 @@ export default function Home() {
             const picked = selectByAssistant(command.target, command.species);
             result = picked.result;
             selected = picked.selected;
+            fromSnapshot = false;
             break;
           }
           case "ui":
@@ -684,20 +757,31 @@ export default function Home() {
     },
   ];
 
+  // Карточки над картой справа — сводка плана (и в 3D) и выделение (только 2D).
+  const cardsShown = planStats !== null || (!view3d && selection.summary !== null);
+
   return (
     <main className="flex h-full w-full">
       <div
         className={cn(
           "h-full flex-none overflow-hidden transition-all duration-200 ease-in-out",
-          "fixed inset-y-0 left-0 z-40 md:static md:z-auto",
-          sidebarOpen ? "w-96 translate-x-0" : "-translate-x-full md:w-0 md:translate-x-0"
+          // Телефон: выезжающая шторка поверх карты — выше всего, что лежит
+          // на карте (контролы Leaflet 1000, карточки 1050, чат Юны 1100), но
+          // ниже уведомлений (1150), чтобы ошибка из панели была видна.
+          "fixed inset-y-0 left-0 z-[1120] md:static md:z-auto",
+          // Ширина обёртки на телефоне — ровно ширина самой панели
+          // (ControlPanel: w-[88vw] max-w-96): прозрачный остаток w-96 на
+          // 390 px экрана закрывал затемнённый фон, и закрыть шторку тапом
+          // было можно только по последним 6 px.
+          sidebarOpen ? "w-[88vw] max-w-96 translate-x-0 md:w-96" : "-translate-x-full md:w-0 md:translate-x-0"
         )}
       >
         <ControlPanel
           hasProject={project !== null}
           projectName={project?.name}
-          projectWarnings={project?.warnings}
+          projectWarnings={session.projectLost ? [PROJECT_GONE_MESSAGE, ...(project?.warnings ?? [])] : project?.warnings}
           needsOrderBoundaryConsent={project?.territory_source === "order_boundary" && !project?.use_order_boundary}
+          consentRequest={consentRequest}
           areaBudget={plan?.area_budget}
           hasPlan={plan !== null}
           restoring={session.restoring}
@@ -719,7 +803,6 @@ export default function Home() {
           onTreeRowsChange={setTreeRows}
           treesInPaving={treesInPaving}
           onTreesInPavingChange={setTreesInPaving}
-          plantingNorms={plantingNorms}
           onExportDxf={session.handleExportDxf}
           onDownloadComplianceReport={(format) => {
             downloadComplianceReport(format).catch((e) => toast.error(errorMessage(e)));
@@ -753,7 +836,7 @@ export default function Home() {
         />
       </div>
       {sidebarOpen && (
-        <div className="fixed inset-0 z-30 bg-black/40 md:hidden" onClick={() => setSidebarOpen(false)} aria-hidden />
+        <div className="fixed inset-0 z-[1110] bg-black/40 md:hidden" onClick={() => setSidebarOpen(false)} aria-hidden />
       )}
       <button
         onClick={() => setSidebarOpen((v) => !v)}
@@ -764,8 +847,11 @@ export default function Home() {
           // map's top-left corner (~10-74px from the top, confirmed live)
           // and renders above this button (leaflet's z-index 1000 > our
           // 500), silently eating clicks at a naive top-4 position.
-          "fixed top-24 z-[500] rounded-md border border-stone-700 bg-stone-900 p-1.5 text-stone-300 shadow transition-[left] duration-200 ease-in-out hover:bg-stone-800",
-          sidebarOpen ? "left-[400px]" : "left-4"
+          "fixed top-24 rounded-md border border-stone-700 bg-stone-900 p-1.5 text-stone-300 shadow transition-[left] duration-200 ease-in-out hover:bg-stone-800",
+          // Открытая шторка телефона: кнопка — у её правого края (ширина та
+          // же, что у панели) и над затемнением; left-[400px] уводил её за
+          // край 390 px экрана.
+          sidebarOpen ? "left-[calc(min(88vw,24rem)+0.5rem)] z-[1130] md:left-[400px] md:z-[500]" : "left-4 z-[500]"
         )}
       >
         {sidebarOpen ? <PanelLeftClose className="h-4 w-4" aria-hidden /> : <PanelLeftOpen className="h-4 w-4" aria-hidden />}
@@ -804,10 +890,13 @@ export default function Home() {
           />
         )}
         <div className="pointer-events-none absolute bottom-24 right-4 top-4 z-[1050] flex flex-col items-end gap-3">
+          {/* Обе карточки помечены data-map-overlay сами (а не эта колонка во
+              всю высоту): рамка «выдели …» (MapView.tsx::freeMapRects) может
+              лечь и под ними, если там свободно. */}
           {planStats && (
             <PlanSummaryCard
               stats={planStats}
-              violations={editing.violations?.length ?? null}
+              violations={editing.violations ? editing.violationIds.size : null}
               validating={editing.validating}
               territoryM2={plan?.area_budget?.[0]?.territory_m2}
               scoringMode={plan?.scoring_mode}
@@ -845,10 +934,15 @@ export default function Home() {
         planId={plan?.plan_id}
         selectedItemId={singleSelectedId}
         selection={assistantSelection}
-        violationsCount={editing.violations ? editing.violations.length : null}
+        selectedIds={selection.selectedIds}
+        // Посадок с нарушениями, а не записей о нарушениях: у одной посадки
+        // их бывает две (отступ и интервал), а Юна говорит о посадках.
+        violationsCount={editing.violations ? editing.violationIds.size : null}
         view={view3d ? "3d" : "2d"}
         planTrees={planStats?.trees ?? 0}
         sidebarOpen={sidebarOpen}
+        reservedRight={cardsShown ? CARDS_RESERVED_PX : 0}
+        projectLost={session.projectLost}
         onCommands={handleAssistantCommands}
       />
     </main>

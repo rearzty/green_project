@@ -4,8 +4,11 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, Eraser, Loader2, Send, X } from "lucide-react";
 
 import {
+  ApiError,
   askAssistant,
   getAssistantStatus,
+  isProjectLost,
+  PROJECT_GONE_MESSAGE,
   type AssistantChatMessage,
   type AssistantCommand,
   type AssistantGenerationSettings,
@@ -56,6 +59,10 @@ export interface AssistantChatProps {
   selectedItemId?: string;
   /** Состав выделения; undefined — плана нет. */
   selection?: AssistantSelection;
+  /** Сами выделенные id — снимок уходит исполнителю вместе с командами
+   * ответа (см. send): «удали выделенные» — про то, что было выделено, когда
+   * просьбу отправили, а не про то, что выделено секунды спустя. */
+  selectedIds: ReadonlySet<string>;
   /** null — план ещё не проверен на нормативы. */
   violationsCount: number | null;
   view: "2d" | "3d";
@@ -64,9 +71,16 @@ export interface AssistantChatProps {
   /** Открытая боковая панель занимает левый край — кнопка чата встаёт правее
    * неё, иначе на десктопе перекрывала переключатель «Эвристика / ML». */
   sidebarOpen?: boolean;
+  /** Сколько px у правого края окна занято карточками над картой (сводка
+   * плана, выделение), включая зазор, — 0, когда их нет. Чат сужается, чтобы
+   * не наползать на них (1024 px с открытой панелью). */
+  reservedRight?: number;
+  /** Сервер ответил, что этого проекта у него больше нет (перезапуск). */
+  projectLost?: boolean;
   /** Выполнить команды ответа по порядку (app/page.tsx); не бросает —
-   * ошибка команды приходит её строкой с ok: false. */
-  onCommands: (commands: AssistantCommand[]) => Promise<CommandResult[]>;
+   * ошибка команды приходит её строкой с ok: false. `selectedIds` —
+   * выделение на момент отправки просьбы. */
+  onCommands: (commands: AssistantCommand[], context: { selectedIds: ReadonlySet<string> }) => Promise<CommandResult[]>;
 }
 
 /** Сколько последних реплик уходит Юне историей: запрос не растёт вместе с
@@ -74,6 +88,36 @@ export interface AssistantChatProps {
 const HISTORY_LIMIT = 20;
 const NO_ENTRIES: ChatEntry[] = [];
 const CHIPS_FADE = "linear-gradient(to right, black calc(100% - 2rem), transparent)";
+
+/** Ширина окна чата: 22rem, если есть место, но не уже 18rem (уже — не
+ * читается) и не шире экрана телефона. Отступы — как у самого виджета:
+ * left-4 или правее открытой панели (md:left-[400px]). */
+const PANEL_WIDTH_PX = 352;
+const PANEL_MIN_WIDTH_PX = 288;
+const MD_BREAKPOINT_PX = 768;
+const SIDEBAR_OFFSET_PX = 400;
+const EDGE_PX = 16;
+
+function useViewportWidth(): number | null {
+  const [width, setWidth] = useState<number | null>(null);
+  useEffect(() => {
+    const update = () => setWidth(window.innerWidth);
+    update();
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+  return width;
+}
+
+function panelWidth(viewport: number | null, sidebarOpen: boolean, reservedRight: number): number | undefined {
+  if (viewport === null) return undefined; // до маунта — классы w-[22rem]/max-w по умолчанию
+  if (viewport < MD_BREAKPOINT_PX) return Math.min(PANEL_WIDTH_PX, viewport - 2 * EDGE_PX);
+  const left = sidebarOpen ? SIDEBAR_OFFSET_PX : EDGE_PX;
+  const room = viewport - left - Math.max(EDGE_PX, reservedRight);
+  // Совсем узкое окно с открытой панелью: рядом с карточками чату места нет —
+  // тогда он ложится поверх них (z-index выше), а не сжимается до нечитаемого.
+  return Math.max(Math.min(PANEL_WIDTH_PX, room), Math.min(PANEL_MIN_WIDTH_PX, viewport - left - EDGE_PX));
+}
 
 let entrySeq = 0;
 // Не crypto.randomUUID: его нет вне secure context, а фронт открывают и по
@@ -171,10 +215,13 @@ export function AssistantChat({
   planId,
   selectedItemId,
   selection,
+  selectedIds,
   violationsCount,
   view,
   planTrees,
   sidebarOpen,
+  reservedRight = 0,
+  projectLost = false,
   onCommands,
 }: AssistantChatProps) {
   const [open, setOpen] = useState(false);
@@ -206,9 +253,12 @@ export function AssistantChat({
   // Поле ввода не блокируется, пока Юна думает, и два быстрых Enter прошли
   // бы проверку `busy` одного и того же рендера — отсюда отдельный флаг.
   const sendingRef = useRef(false);
+  const viewportWidth = useViewportWidth();
 
   const entries = chat.projectId === projectId ? chat.entries : NO_ENTRIES;
   const busy = phase !== "idle" || generating || undoing;
+  // Проекта на сервере больше нет: любая просьба ответила бы тем же 404.
+  const canTalk = Boolean(projectId) && !projectLost;
 
   useEffect(() => {
     // Отмены — замыкания над планом прошлого проекта, к этому не относятся.
@@ -265,10 +315,15 @@ export function AssistantChat({
 
   async function send(preset?: string) {
     const text = (preset ?? draft).trim();
-    if (!text || !projectId || busy || sendingRef.current) return;
+    if (!text || !projectId || !canTalk || busy || sendingRef.current) return;
     sendingRef.current = true;
     if (preset === undefined) setDraft("");
     const forProject = projectId;
+    // Выделение, о котором Юна сейчас услышит (`selection` — его состав).
+    // Пока она отвечает, карта не заблокирована: Ctrl+A до ответа на «удали
+    // выделенные» не должен превратить его в «удали всё». useSelection
+    // каждый раз создаёт новый Set, так что ссылка — уже снимок.
+    const sentSelection = selectedIds;
     // The backend holds no conversation state of its own (see
     // assistant_service.py) -- the transcript rides along on every message,
     // built from what's already on screen rather than a second copy.
@@ -280,7 +335,16 @@ export function AssistantChat({
       try {
         result = await askAssistant(forProject, text, history, settings, { planId, selectedItemId, selection, violationsCount, view });
       } catch (e) {
-        appendEntry(forProject, { id: newEntryId(), role: "assistant", content: errorMessage(e), isError: true, retryText: text });
+        // Единственный 404 этого маршрута — «проекта нет» (ProjectDep):
+        // сервер перезапускался, и «Повторить» не поможет никогда.
+        const gone = e instanceof ApiError && (e.projectGone || e.status === 404);
+        appendEntry(forProject, {
+          id: newEntryId(),
+          role: "assistant",
+          content: gone ? PROJECT_GONE_MESSAGE : errorMessage(e),
+          isError: true,
+          retryText: gone ? undefined : text,
+        });
         return;
       }
       // Пока Юна думала, открыли другой проект — её ответ и команды не про него.
@@ -292,7 +356,7 @@ export function AssistantChat({
       setPhase("acting");
       let results: CommandResult[];
       try {
-        results = await onCommands(commands);
+        results = await onCommands(commands, { selectedIds: sentSelection });
       } catch (e) {
         results = [{ ok: false, text: errorMessage(e) }];
       }
@@ -313,7 +377,7 @@ export function AssistantChat({
 
   function retry(entry: ChatEntry) {
     const text = entry.retryText;
-    if (!text || !projectId || busy) return;
+    if (!text || !projectId || !canTalk || busy) return;
     const forProject = projectId;
     // Убираем и ошибку, и вопрос перед ней — send() задаст его заново.
     setChat((prev) => {
@@ -337,6 +401,11 @@ export function AssistantChat({
         ...entry,
         results: entry.results?.map((line, i) => (i === index ? { ...line, ...patch } : line)),
       }));
+    // Отмена — такой же запрос к серверу, а проекта там уже нет.
+    if (projectLost) {
+      setLine({ undoError: PROJECT_GONE_MESSAGE });
+      return;
+    }
     setLine({ undo: "running", undoError: undefined });
     setUndoing(true);
     try {
@@ -344,7 +413,9 @@ export function AssistantChat({
       undoFns.current.delete(key);
       setLine({ undo: "done" });
     } catch (e) {
-      setLine({ undo: "available", undoError: errorMessage(e) });
+      // Отмена правки сообщает лишь «причина в уведомлении» (сам запрос
+      // идёт через usePlanEdits) — потерю проекта называем здесь же.
+      setLine({ undo: "available", undoError: isProjectLost(forProject) ? PROJECT_GONE_MESSAGE : errorMessage(e) });
     } finally {
       setUndoing(false);
     }
@@ -371,7 +442,7 @@ export function AssistantChat({
   }
 
   const chips = suggestionChips({
-    hasProject: Boolean(projectId),
+    hasProject: canTalk,
     hasPlan: Boolean(planId),
     settings,
     planTrees,
@@ -418,7 +489,13 @@ export function AssistantChat({
   return (
     <div className={cn("fixed bottom-4 left-4 z-[1100] flex flex-col items-start gap-2", sidebarOpen && "md:left-[400px]")}>
       {open && (
-        <div className="flex h-[32rem] max-h-[calc(100vh-6rem)] w-[22rem] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-stone-700/80 bg-stone-900/95 text-stone-100 shadow-lg backdrop-blur">
+        <div
+          // data-map-overlay: MapView.tsx::freeMapRects не кладёт рамку
+          // «выдели …» под открытый чат.
+          data-map-overlay
+          style={{ width: panelWidth(viewportWidth, Boolean(sidebarOpen), reservedRight) }}
+          className="flex h-[32rem] max-h-[calc(100vh-6rem)] w-[22rem] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-stone-700/80 bg-stone-900/95 text-stone-100 shadow-lg backdrop-blur"
+        >
           <div className="flex items-center justify-between gap-2 border-b border-stone-800 bg-stone-800/40 px-3 py-2">
             <div className="flex min-w-0 items-center gap-2">
               {avatar("h-8 w-8 flex-none text-sm")}
@@ -460,9 +537,11 @@ export function AssistantChat({
                 <p className="text-xs leading-relaxed text-stone-500">
                   {!projectId
                     ? "Сначала загрузите чертёж в панели слева."
-                    : status && !status.llm_configured
-                      ? "Сейчас я в базовом режиме, без ИИ: понимаю команды вроде подсказок ниже."
-                      : "Выделите посадку на карте — расскажу, почему она стоит именно там."}
+                    : projectLost
+                      ? PROJECT_GONE_MESSAGE
+                      : status && !status.llm_configured
+                        ? "Сейчас я в базовом режиме, без ИИ: понимаю команды вроде подсказок ниже."
+                        : "Выделите посадку на карте — расскажу, почему она стоит именно там."}
                 </p>
                 {chips.length > 0 && (
                   <div className="flex flex-wrap gap-1.5">
@@ -572,13 +651,13 @@ export function AssistantChat({
                   setOpen(false);
                 }
               }}
-              disabled={!projectId}
-              placeholder={projectId ? "Напишите Юне…" : "Сначала загрузите проект"}
+              disabled={!canTalk}
+              placeholder={projectLost ? "Загрузите чертёж заново" : projectId ? "Напишите Юне…" : "Сначала загрузите проект"}
               className="min-w-0 flex-1 rounded-md border border-stone-700 bg-stone-950 px-2.5 py-1.5 text-sm text-stone-100 placeholder:text-stone-600 focus:border-greenery-600 focus:outline-none disabled:opacity-50"
             />
             <button
               onClick={() => void send()}
-              disabled={!projectId || !draft.trim() || busy}
+              disabled={!canTalk || !draft.trim() || busy}
               className="flex-none rounded-md bg-greenery-600 p-1.5 text-white hover:bg-greenery-700 disabled:opacity-40"
               aria-label="Отправить"
             >
