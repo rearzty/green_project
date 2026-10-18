@@ -202,7 +202,7 @@ async def ensure_materialized(plan: Plan) -> Plan:
 
     norms = plan_norms(plan)
     utilities, zones = layers_to_domain(plan.project.layers)
-    territory = territory_polygon(zones, utilities)
+    territory = territory_polygon(zones, utilities, allow_order_boundary=plan.project.use_order_boundary)
     scorer = build_scorer(plan.scoring_mode, norms, utilities, zones, territory)
 
     items = await run_in_threadpool(
@@ -272,7 +272,7 @@ async def generate_plan(
     if trees_in_paving:
         norms = norms.with_trees_in_paving()
     utilities, zones = layers_to_domain(project.layers)
-    territory = territory_polygon(zones, utilities)
+    territory = territory_polygon(zones, utilities, allow_order_boundary=project.use_order_boundary)
     scorer = build_scorer(scoring_mode, norms, utilities, zones, territory)
 
     for existing_plan in project.plans:

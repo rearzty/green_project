@@ -49,7 +49,7 @@ from PIL import Image, ImageDraw
 from shapely.geometry.base import BaseGeometry
 
 from backend.app.services.geo_io import _transformer_to_wgs84, db_to_shape, display_crs, layers_to_domain
-from geo_engine.territory import MissingTerritoryError, territory_polygon
+from geo_engine.territory import MissingTerritoryError, territory_polygon, territory_source
 
 
 class _LayerLike(Protocol):
@@ -71,6 +71,7 @@ _ZONE_COLORS = {
     "building": "#78716c",
     "road": "#57534e",
     "territory": "#0ea5e9",
+    "order_boundary": "#7dd3fc",
     # Deliberately teal, not the same green family as PLANTING_COLORS.tree
     # (#15803d) / .shrub (#65a30d) in mapStyle.ts. Was #16a34a -- close enough
     # to tree's #15803d that on a real street where existing_greenery is
@@ -111,6 +112,7 @@ _ZONING_CATEGORY_COLORS = {
 # трудно — она всплывает только на той улице, где такой слой есть.
 _LAYER_TYPE_LABELS = {
     "territory": "Территория",
+    "order_boundary": "Граница заказа на съёмку",
     "building": "Здания",
     "road": "Дороги",
     "sidewalk": "Тротуары",
@@ -454,8 +456,14 @@ def render_layer_raster(layers: list[_LayerLike], source_crs: str | None) -> Lay
     utilities, zones = layers_to_domain(layers)
     territory_geom = None
     try:
-        territory_geom = territory_polygon(zones, utilities)
-        entries.append(("territory", territory_geom))
+        # Для рамки холста граница заказа годится и без согласия
+        # пользователя: это только вид карты, не участок для расчёта.
+        territory_geom = territory_polygon(zones, utilities, allow_order_boundary=True)
+        # По границе заказа (запасная граница, нет границы работ) участок
+        # рисуется своей группой легенды, а не «Территорией» — иначе карта
+        # выдавала бы съёмку за участок работ.
+        if territory_source(zones) == "territory":
+            entries.append(("territory", territory_geom))
     except MissingTerritoryError:
         pass  # nothing to show; other groups still render on their own bounds
 

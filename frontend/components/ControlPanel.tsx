@@ -127,6 +127,9 @@ export interface ControlPanelProps {
   projectName?: string;
   /** Upload warnings of the current project (ProjectOut.warnings). */
   projectWarnings?: string[];
+  /** The delivery has no work-area boundary, only the survey order boundary,
+   * and the user hasn't agreed to plan by it yet -- ask before generating. */
+  needsOrderBoundaryConsent?: boolean;
   /** PlanOut.area_budget of the shown plan -- why a type got few plantings. */
   areaBudget?: AreaBudget[];
   hasPlan: boolean;
@@ -140,7 +143,7 @@ export interface ControlPanelProps {
   onGenerate: (
     plantingTypes: PlantingType[],
     scoringMode: ScoringMode,
-    spacing?: { treeSpacingM?: number; shrubSpacingM?: number; treeRows?: number; treesInPaving?: boolean }
+    spacing?: { treeSpacingM?: number; shrubSpacingM?: number; treeRows?: number; treesInPaving?: boolean; useOrderBoundary?: boolean }
   ) => Promise<void>;
   /** Lifted to app/page.tsx so AssistantChat.tsx reads/changes the same
    * recipe Юна talks about. */
@@ -202,6 +205,7 @@ export function ControlPanel({
   hasProject,
   projectName,
   projectWarnings = [],
+  needsOrderBoundaryConsent = false,
   areaBudget = [],
   hasPlan,
   restoring = false,
@@ -255,6 +259,7 @@ export function ControlPanel({
 }: ControlPanelProps) {
   const [file, setFile] = useState<File | null>(null);
   const [name, setName] = useState("");
+  const [askOrderBoundary, setAskOrderBoundary] = useState(false);
   // Defaults to the CRS scripts/generate_synthetic_data.py writes test data
   // in; real DXF/DWG carries no CRS, and the backend ignores this for them
   // unless the user sets it explicitly (see project_service.py).
@@ -560,12 +565,46 @@ export function ControlPanel({
           </div>
 
           <Button
-            disabled={plantingTypes.length === 0 || busy || editBusy || generating}
-            onClick={() => guarded(() => onGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM, treeRows, treesInPaving }))}
+            disabled={!hasProject || plantingTypes.length === 0 || busy || editBusy || generating}
+            onClick={() =>
+              needsOrderBoundaryConsent
+                ? setAskOrderBoundary(true)
+                : guarded(() => onGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM, treeRows, treesInPaving }))
+            }
           >
             {generating && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" aria-hidden />}
             {generating ? "Генерация…" : hasPlan ? "Сгенерировать заново" : "Сгенерировать план"}
           </Button>
+          {askOrderBoundary && needsOrderBoundaryConsent && (
+            <div className="flex flex-col gap-2 rounded border border-amber-600/60 bg-amber-950/40 p-2 text-xs text-amber-100">
+              <p className="font-medium">Границы работ не найдены — генерировать по границе заказа на съёмку?</p>
+              <p className="text-amber-200/80">
+                Граница заказа шире фактического участка работ: отступы от сетей и зданий соблюдаются, но посадки
+                могут оказаться за участком. Результат предварительный.
+              </p>
+              <div className="flex gap-2">
+                <Button
+                  onClick={() => {
+                    setAskOrderBoundary(false);
+                    guarded(() =>
+                      onGenerate(plantingTypes, scoringMode, {
+                        treeSpacingM,
+                        shrubSpacingM,
+                        treeRows,
+                        treesInPaving,
+                        useOrderBoundary: true,
+                      })
+                    );
+                  }}
+                >
+                  Да, по границе заказа
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => setAskOrderBoundary(false)}>
+                  Отмена
+                </Button>
+              </div>
+            </div>
+          )}
           {generateProgress && <ProgressBar label={generateProgress.stage} progress={generateProgress.progress} />}
           {hasPlan && areaBudget.length > 0 && <AreaBudgetList budgets={areaBudget} />}
         </Section>
