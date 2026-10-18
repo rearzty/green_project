@@ -16,6 +16,19 @@ from shapely.strtree import STRtree
 from geo_engine.model import Utility, Zone
 
 TERRITORY_ZONE_TYPE = "territory"
+# Граница заказа на съёмку — запасная граница участка, только когда границы
+# работ в поставке нет вовсе (живой случай: «7. Нижние Поля ул», на слое
+# границы работ лишь обрывок в 9,4 м, а «Граница Заказа» замкнута, 110 657 м²).
+# Съёмка шире участка работ (на эталонной улице 119 011 м² против 45 870), так
+# что результат по ней предварительный, и об этом предупреждают все выходы —
+# см. ORDER_BOUNDARY_NOTE и territory_source().
+ORDER_BOUNDARY_ZONE_TYPE = "order_boundary"
+ORDER_BOUNDARY_NOTE = (
+    "Граница работ в поставке отсутствует — участок взят по границе заказа на съёмку. "
+    "Она шире фактического участка работ, поэтому результат предварительный: "
+    "посадки соответствуют нормам отступов, но могут выходить за участок работ."
+)
+ORDER_BOUNDARY_QUESTION = "Границы работ не найдены — генерировать по границе заказа на съёмку?"
 _AREAL = ("Polygon", "MultiPolygon")
 
 # Во сколько раз дальше собственного размера может отстоять кусок участка,
@@ -46,8 +59,44 @@ class MissingTerritoryError(ValueError):
     Message is shown to the user as-is."""
 
 
-def territory_polygon(zones: list[Zone], utilities: list[Utility] | None = None) -> BaseGeometry:
+class OrderBoundaryOnlyError(MissingTerritoryError):
+    """Границы работ нет, но есть граница заказа на съёмку — план по ней
+    возможен, но только с явного согласия пользователя (allow_order_boundary):
+    съёмка шире участка работ, и молча подменять одно другим нельзя."""
+
+
+def _areal_of(zones: list[Zone], zone_type: str) -> list[BaseGeometry]:
+    return [
+        zone.geometry
+        for zone in zones
+        if zone.zone_type == zone_type
+        and zone.geometry is not None
+        and not zone.geometry.is_empty
+        and zone.geometry.geom_type in _AREAL
+    ]
+
+
+def territory_source(zones: list[Zone]) -> str | None:
+    """Откуда берётся граница участка: "territory" (граница работ),
+    "order_boundary" (запасная — граница заказа на съёмку) или None (нет ни той,
+    ни другой). Тот же выбор, что делает territory_polygon(), без геометрии —
+    чтобы вызывающий мог предупредить пользователя."""
+    if _areal_of(zones, TERRITORY_ZONE_TYPE):
+        return TERRITORY_ZONE_TYPE
+    if _areal_of(zones, ORDER_BOUNDARY_ZONE_TYPE):
+        return ORDER_BOUNDARY_ZONE_TYPE
+    return None
+
+
+def territory_polygon(
+    zones: list[Zone], utilities: list[Utility] | None = None, allow_order_boundary: bool = False
+) -> BaseGeometry:
     """The site outline: every areal territory zone, unioned.
+
+    Без единой площадной границы работ — граница заказа на съёмку
+    (ORDER_BOUNDARY_ZONE_TYPE, см. territory_source()), но только при
+    `allow_order_boundary=True`; иначе OrderBoundaryOnlyError с вопросом к
+    пользователю. Дальше она идёт тем же путём, что и граница работ.
 
     Unions rather than returning the first match, and ignores zones that are not
     areal at all. Both matter on real drawings: the pilot street's work area is
@@ -61,25 +110,25 @@ def territory_polygon(zones: list[Zone], utilities: list[Utility] | None = None)
     working unchanged) but should be passed wherever available — it feeds
     `_dominant_cluster`'s nearby-context check, see there for why that matters.
     """
-    areas = [
-        zone.geometry
-        for zone in zones
-        if zone.zone_type == TERRITORY_ZONE_TYPE
-        and zone.geometry is not None
-        and not zone.geometry.is_empty
-        and zone.geometry.geom_type in _AREAL
-    ]
-    if not areas:
+    source = territory_source(zones)
+    if source is None:
         raise MissingTerritoryError(
-            "В загруженном файле нет границы участка (слой territory / BOUNDARY) — план построить нельзя."
+            "В загруженном файле нет границы участка — ни границы работ, ни границы заказа на съёмку. План построить нельзя."
         )
+    if source == ORDER_BOUNDARY_ZONE_TYPE and not allow_order_boundary:
+        raise OrderBoundaryOnlyError(
+            f"{ORDER_BOUNDARY_QUESTION} Граница заказа шире участка работ, результат будет предварительным."
+        )
+    areas = _areal_of(zones, source)
     if len(areas) == 1:
         return areas[0]
 
     context = [
         zone.geometry
         for zone in zones
-        if zone.zone_type != TERRITORY_ZONE_TYPE and zone.geometry is not None and not zone.geometry.is_empty
+        if zone.zone_type not in (TERRITORY_ZONE_TYPE, ORDER_BOUNDARY_ZONE_TYPE)
+        and zone.geometry is not None
+        and not zone.geometry.is_empty
     ]
     context.extend(
         utility.geometry for utility in (utilities or []) if utility.geometry is not None and not utility.geometry.is_empty
