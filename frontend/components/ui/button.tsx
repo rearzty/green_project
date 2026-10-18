@@ -4,19 +4,24 @@ import { cva, type VariantProps } from "class-variance-authority";
 import { cn } from "@/lib/utils";
 
 const buttonVariants = cva(
-  "inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium transition-colors disabled:pointer-events-none disabled:opacity-50",
+  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-lg text-sm font-medium transition-colors disabled:pointer-events-none disabled:opacity-40",
   {
     variants: {
       variant: {
-        default: "bg-greenery-600 text-white hover:bg-greenery-700",
-        outline: "border border-greenery-500 text-greenery-300 hover:bg-stone-800",
-        ghost: "hover:bg-stone-800 text-greenery-300",
-        secondary: "border border-stone-700 bg-stone-800/60 text-stone-200 hover:bg-stone-800 hover:border-stone-600",
+        // Главное действие панели/экрана — акцент; на экране он один.
+        default: "bg-gp-accent font-semibold text-gp-on-accent hover:bg-gp-accent-hover",
+        // «Зелёная» вторичная: выбранные чипы, мягкие подтверждения.
+        soft: "border border-gp-accent-soft-border bg-gp-accent-soft text-gp-text hover:bg-[#344230]",
+        outline: "border border-gp-border bg-transparent text-gp-text hover:bg-gp-hover",
+        // Текстовая кнопка-ссылка (акцентный цвет без фона).
+        ghost: "text-gp-accent hover:bg-gp-hover",
+        secondary: "border border-gp-border bg-transparent text-gp-text hover:bg-gp-hover",
       },
       size: {
-        default: "h-9 px-4 py-2",
-        sm: "h-8 px-3 text-xs",
-        icon: "h-8 w-8",
+        default: "h-10 px-4",
+        lg: "h-[42px] px-4 text-sm",
+        sm: "h-9 px-3 text-[13px]",
+        icon: "h-9 w-9",
       },
     },
     defaultVariants: { variant: "default", size: "default" },

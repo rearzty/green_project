@@ -7,13 +7,22 @@ import L, { type Layer, type PathOptions } from "leaflet";
 import type { Feature } from "geojson";
 
 import type { GeoJSONFeatureCollection, LayersRaster, LngLat } from "@/lib/api";
-import { plantingColor } from "@/lib/mapStyle";
+import { plantingColor, SELECTION_COLOR, VIOLATION_COLOR } from "@/lib/mapStyle";
 import { boundsOfItems, itemsInBox, type LatLngBox, type PlanIndex } from "@/lib/planIndex";
 
-// Selection is blue on purpose: red means "violates a setback norm", and an
-// item can be both selected and violating at the same time.
-const SELECTION_COLOR = "#2563eb";
-const VIOLATION_COLOR = "#dc2626";
+// Selection is blue on purpose: orange means "violates a setback norm", and
+// an item can be both selected and violating at the same time (colors live in
+// lib/mapStyle.ts next to the tokens they mirror).
+
+/** Тёмная приглушённая подложка для проектов с проверенной СК вместо светлых
+ * тайлов OSM (GREENPROJECT_REDESIGN.md §2): карта — подоснова, ярко рисуются
+ * только посадки, нарушения и выделение. CARTO Dark Matter; её условия
+ * требуют атрибуции (ниже) и бесплатны для некоммерческого использования —
+ * для коммерческого запуска нужна лицензия CARTO либо свой источник тайлов
+ * (поменять эти две константы). */
+const BASEMAP_URL = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png";
+const BASEMAP_ATTRIBUTION =
+  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>';
 
 /** Below this much pointer travel a press counts as a click, not a drag. */
 const DRAG_THRESHOLD_PX = 4;
@@ -35,27 +44,29 @@ const SELECTION_PANE = "selectionOverlay";
 function areaStyle(type: string, selected: boolean, violation: boolean): PathOptions {
   const base = plantingColor(type);
   return {
+    // Нарушение — оранжевая ПУНКТИРНАЯ обводка, а не только цвет заливки
+    // (п. 10 задания: форма читается и без цвета, как кольцо у точек);
+    // выделение — сплошная синяя. Оба сразу — синяя пунктирная.
     color: selected ? SELECTION_COLOR : violation ? VIOLATION_COLOR : base,
     fillColor: violation ? VIOLATION_COLOR : base,
     // Lawn is the only non-Point planting_type (see areaFeatures' filter
     // above), and it's mounted *after* the source-layer <ImageOverlay>s
     // below -- correctly, per the brief's "result on a separate layer over
-    // the original drawing". But at the old 0.7 it painted near-opaque over
-    // its own footprint, and generate_area_candidates() walks the whole
+    // the original drawing". But a heavy fill painted near-opaque over its
+    // own footprint, and generate_area_candidates() walks the whole
     // buildable_area -- which includes real existing turf (existing_lawn
     // isn't a hard obstacle, see buffers.HARD_OBSTACLE_ZONE_TYPES) -- so the
     // new lawn polygon routinely coincides with where existing_lawn's raster
-    // paints underneath it, at a near-identical pale-lime hue
-    // (PLANTING_COLORS.lawn #a3e635 vs. layer_raster.py's existing_lawn
-    // #bef264). The two together read as "the existing lawn never rendered
-    // at all" -- a repeat live complaint -- when it was rendering, just
-    // completely covered. Turned down so the backdrop (existing_lawn, and
-    // any other source context under the new lawn's outline) stays legible
-    // through it; violation keeps a stronger fill since it's the one state
-    // that should visually dominate, not blend in.
-    fillOpacity: violation ? 0.55 : 0.35,
-    weight: selected ? 3 : violation ? 2 : 1,
-    dashArray: selected ? "6 4" : undefined,
+    // paints underneath it. The two together read as "the existing lawn
+    // never rendered at all" -- a repeat live complaint -- when it was
+    // rendering, just completely covered. Заливка нового газона теперь
+    // rgba(140,200,110,.16) с обводкой .45 (макет), чтобы подоснова под ним
+    // читалась; у нарушения заливка чуть плотнее — единственное состояние,
+    // которое должно доминировать.
+    fillOpacity: violation ? 0.22 : selected ? 0.2 : 0.16,
+    opacity: selected || violation ? 1 : 0.45,
+    weight: selected ? 3 : violation ? 2.5 : 1,
+    dashArray: violation ? "6 4" : undefined,
   };
 }
 
@@ -80,6 +91,13 @@ function dotSize(type: string, crown?: string): number {
   return 12;
 }
 
+/** Толщина кольца нарушения (--gp-ring в globals.css): 3.5 px на широкой
+ * кроне, но не больше трети диаметра — на мелком кусте толще ничего бы не
+ * осталось от пустого центра. */
+function ringWidth(size: number): number {
+  return Math.min(3.5, Math.max(1.5, size / 3.4));
+}
+
 function iconKey(type: string, crown?: string): string {
   return `${type}:${type === "tree" ? crown ?? "" : ""}`;
 }
@@ -92,7 +110,7 @@ function planItemIcon(type: string, crown?: string): L.DivIcon {
     const box = size + 6;
     icon = L.divIcon({
       className: "gp-plan-marker",
-      html: `<span class="gp-plan-dot" style="background:${plantingColor(type)};width:${size}px;height:${size}px"></span>`,
+      html: `<span class="gp-plan-dot" style="background:${plantingColor(type)};width:${size}px;height:${size}px;--gp-ring:${ringWidth(size).toFixed(1)}px"></span>`,
       iconSize: [box, box],
       iconAnchor: [box / 2, box / 2],
     });
@@ -337,17 +355,221 @@ function FitToRequest({ request, crsVerified, planIndex }: { request?: MapFitReq
 }
 
 /** Leaflet only recalculates its container size on the window `resize`
- * event -- it has no way to know the sidebar's CSS width transition
- * (app/page.tsx) just resized *this* container instead. Without this, the
- * map stays cropped/offset to its old size after the panel is
- * collapsed/expanded. 220ms is just past the panel's own 200ms transition. */
-function InvalidateSizeOnChange({ trigger }: { trigger: unknown }) {
+ * event -- it has no way to know that a neighbouring column (the left
+ * panel's CSS width transition, the right inspector/Юна column appearing)
+ * just resized *this* container instead. Without this, the map stays
+ * cropped/offset to its old size. Was a 220ms timer keyed on the one
+ * sidebar toggle (InvalidateSizeOnChange); a ResizeObserver covers every
+ * cause at once, including the ones nobody has added yet. `debounceMoveend`
+ * keeps the transition's per-frame resizes from re-running the clustering
+ * recompute (it listens to moveend) twelve times in 200ms. */
+function InvalidateSizeOnResize() {
   const map = useMap();
   useEffect(() => {
-    const t = setTimeout(() => map.invalidateSize(), 220);
-    return () => clearTimeout(t);
-  }, [trigger, map]);
+    const element = map.getContainer();
+    let frame: number | null = null;
+    const observer = new ResizeObserver(() => {
+      if (frame !== null) return;
+      frame = requestAnimationFrame(() => {
+        frame = null;
+        map.invalidateSize({ animate: false, debounceMoveend: true });
+      });
+    });
+    observer.observe(element);
+    return () => {
+      observer.disconnect();
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, [map]);
   return null;
+}
+
+/** Отдаёт Leaflet-карту наружу: ей нужны элементам вне контейнера карты —
+ * кнопкам зума и статус-строке (масштаб, координаты курсора). Они лежат вне
+ * `<MapContainer>` намеренно: SelectionController слушает нажатия на
+ * контейнере в capture-фазе, и всё, что лежало бы внутри, получало бы
+ * жесты выделения вместо кликов. */
+function MapBridge({ onReady }: { onReady?: (map: L.Map | null) => void }) {
+  const map = useMap();
+  useEffect(() => {
+    onReady?.(map);
+    return () => onReady?.(null);
+  }, [map, onReady]);
+  return null;
+}
+
+/** Что показывает подсказка при наведении на посадку. */
+export interface HoverInfo {
+  title: string;
+  subtitle: string;
+  /** Ближайшее к пределу ограничение; null — обоснование недоступно. */
+  nearest: { label: string; actualM: number; requiredM: number; satisfied: boolean } | null;
+}
+
+const HOVER_SHOW_DELAY_MS = 250;
+/** Пока подсказка уже видна, соседняя посадка (ряд!) получает её быстро —
+ * иначе при движении мыши вдоль ряда подсказка мигала бы на каждой точке. */
+const HOVER_SWITCH_DELAY_MS = 60;
+const HOVER_HIDE_GRACE_MS = 90;
+const HOVER_CARD_WIDTH_PX = 220;
+const HOVER_CARD_HEIGHT_PX = 132;
+
+const hoverMeters = (m: number) => m.toLocaleString("ru-RU", { maximumFractionDigits: m < 10 ? 1 : 0 });
+
+/** Подсказка при наведении на посадку (Hover.dc.html, п. 4): через ~250 мс —
+ * порода, тип, ближайшее ограничение и «Клик — подробнее». Абсолютный div
+ * над картой, не Leaflet-popup (попапы перехватывали клики, см. заметку про
+ * SelectionController), `pointer-events: none` — не мешает клику и рамке.
+ * Слушает всплывающие `pointerover/out` на контейнере: у маркера
+ * `bubblingMouseEvents: false`, но это про события самого Leaflet, нативные
+ * DOM-события всплывают как обычно. Только мышь — на тач-экране наведения
+ * нет. Скрывается сразу при нажатии (перетаскивание, рамка) и при движении
+ * карты. Данные и кеш — у страницы (`load`/`peek`). */
+function HoverTooltipController({
+  enabled,
+  registryRef,
+  load,
+  peek,
+}: {
+  enabled: boolean;
+  registryRef: MutableRefObject<Map<string, RegistryEntry>>;
+  load: (id: string) => Promise<HoverInfo | null>;
+  peek: (id: string) => HoverInfo | null | undefined;
+}) {
+  const map = useMap();
+  const latest = useRef({ enabled, load, peek });
+  latest.current = { enabled, load, peek };
+  const [tip, setTip] = useState<{ x: number; y: number; info: HoverInfo } | null>(null);
+
+  useEffect(() => {
+    const container = map.getContainer();
+    let showTimer: ReturnType<typeof setTimeout> | undefined;
+    let hideTimer: ReturnType<typeof setTimeout> | undefined;
+    let targetId: string | null = null;
+    let shownId: string | null = null;
+    let pressed = false;
+
+    function setRing(id: string | null, on: boolean) {
+      if (!id) return;
+      const layer = registryRef.current.get(id)?.layer;
+      if (layer instanceof L.Marker) layer.getElement()?.classList.toggle("gp-hover", on);
+    }
+
+    function hide() {
+      clearTimeout(showTimer);
+      clearTimeout(hideTimer);
+      setRing(shownId, false);
+      shownId = null;
+      targetId = null;
+      setTip(null);
+    }
+
+    function place(id: string, info: HoverInfo) {
+      const layer = registryRef.current.get(id)?.layer;
+      const el = layer instanceof L.Marker ? layer.getElement() : null;
+      if (!el) return;
+      const box = container.getBoundingClientRect();
+      const r = el.getBoundingClientRect();
+      let x = r.right - box.left + 8;
+      let y = r.top - box.top + 8;
+      if (x + HOVER_CARD_WIDTH_PX > box.width - 8) x = r.left - box.left - HOVER_CARD_WIDTH_PX - 8;
+      if (y + HOVER_CARD_HEIGHT_PX > box.height - 8) y = r.bottom - box.top - HOVER_CARD_HEIGHT_PX - 8;
+      setRing(shownId, false);
+      shownId = id;
+      setRing(id, true);
+      setTip({ x: Math.max(8, x), y: Math.max(8, y), info });
+    }
+
+    function onOver(e: PointerEvent) {
+      if (!latest.current.enabled || e.pointerType !== "mouse" || pressed) return;
+      const id = hitItemId(e.target);
+      if (!id || id === targetId) {
+        if (id) clearTimeout(hideTimer);
+        return;
+      }
+      clearTimeout(showTimer);
+      clearTimeout(hideTimer);
+      targetId = id;
+      showTimer = setTimeout(
+        async () => {
+          const info = latest.current.peek(id) ?? (await latest.current.load(id));
+          // Курсор ушёл на другую посадку или с точки вовсе, пока данные шли.
+          if (targetId !== id || !info) return;
+          place(id, info);
+        },
+        shownId ? HOVER_SWITCH_DELAY_MS : HOVER_SHOW_DELAY_MS
+      );
+    }
+
+    function onOut(e: PointerEvent) {
+      const id = hitItemId(e.target);
+      if (!id) return;
+      if (hitItemId(e.relatedTarget) === id) return; // внутри той же точки
+      clearTimeout(showTimer);
+      targetId = null;
+      hideTimer = setTimeout(hide, HOVER_HIDE_GRACE_MS);
+    }
+
+    function onDown() {
+      pressed = true;
+      hide();
+    }
+    function onUp() {
+      pressed = false;
+    }
+
+    container.addEventListener("pointerover", onOver);
+    container.addEventListener("pointerout", onOut);
+    container.addEventListener("pointerdown", onDown, true);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    map.on("movestart zoomstart", hide);
+    return () => {
+      container.removeEventListener("pointerover", onOver);
+      container.removeEventListener("pointerout", onOut);
+      container.removeEventListener("pointerdown", onDown, true);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      map.off("movestart zoomstart", hide);
+      hide();
+    };
+  }, [map, registryRef]);
+
+  // Выключили (3D, нет плана) — прячем уже показанное.
+  useEffect(() => {
+    if (!enabled) setTip(null);
+  }, [enabled]);
+
+  if (!tip || !enabled) return null;
+  const { info } = tip;
+  const nearest = info.nearest;
+  const ratio = nearest && nearest.requiredM > 0 ? nearest.actualM / nearest.requiredM : 2;
+  const valueColor = !nearest ? "" : !nearest.satisfied ? "text-gp-violation-text" : ratio < 1.25 ? "text-gp-warn" : "text-gp-text-2";
+  return (
+    <div
+      role="tooltip"
+      style={{ left: tip.x, top: tip.y, width: HOVER_CARD_WIDTH_PX }}
+      className="pointer-events-none absolute z-[1100] box-border rounded-lg border border-gp-border bg-gp-float px-3.5 py-3 text-gp-text shadow-[0_10px_28px_rgba(0,0,0,.45)]"
+    >
+      <p className="m-0 text-sm font-medium">{info.title}</p>
+      <p className="m-0 mt-0.5 text-xs text-gp-text-2">{info.subtitle}</p>
+      {nearest && (
+        <div className="mt-2.5 border-t border-gp-line pt-2.5 text-xs">
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="text-gp-text-2">Ближе всего</span>
+            <span className={`flex-none font-mono tabular-nums ${valueColor}`}>
+              {hoverMeters(nearest.actualM)} / {hoverMeters(nearest.requiredM)} м
+            </span>
+          </div>
+          {/* Название ограничения — отдельной строкой: у «кабель силовой/связи»
+              или «опора освещения/контактной сети» оно длиннее, чем у макетного
+              «фонарь», и рядом с числом переносилось бы по словам. */}
+          <p className="m-0 mt-0.5 text-gp-text first-letter:uppercase">{nearest.label}</p>
+        </div>
+      )}
+      <p className="m-0 mt-2 text-[11px] text-gp-text-3">Клик — подробнее</p>
+    </div>
+  );
 }
 
 type RegistryEntry = { layer: Layer; type: string };
@@ -1159,10 +1381,14 @@ export interface MapViewProps {
   focusRequest?: { id: string; seq: number } | null;
   /** Fit the view to a group's bounds (Юна's «выдели …»), see FitToRequest. */
   fitRequest?: MapFitRequest | null;
-  /** Whether the control panel is currently shown -- purely to know when its
-   * CSS width transition finishes, so the map's container size can be
-   * recomputed (see InvalidateSizeOnChange below). Not otherwise used. */
-  sidebarOpen?: boolean;
+  /** Leaflet-карта наружу (кнопки зума и статус-строка вне контейнера). */
+  onMapReady?: (map: L.Map | null) => void;
+  /** Подсказка при наведении на посадку (п. 4): включена только на 2D при
+   * видимом плане; `load` — данные (с кешем у страницы), `peek` — то, что уже
+   * в кеше (для мгновенного повторного наведения). */
+  hoverEnabled?: boolean;
+  loadHoverInfo?: (id: string) => Promise<HoverInfo | null>;
+  peekHoverInfo?: (id: string) => HoverInfo | null | undefined;
 }
 
 export default function MapView({
@@ -1187,7 +1413,10 @@ export default function MapView({
   onViewChange,
   focusRequest,
   fitRequest,
-  sidebarOpen,
+  onMapReady,
+  hoverEnabled = false,
+  loadHoverInfo,
+  peekHoverInfo,
 }: MapViewProps) {
   // item id -> its Leaflet layer while on the map, so selection/violation
   // highlighting can restyle just the items whose state changed instead of
@@ -1250,7 +1479,7 @@ export default function MapView({
     [plan]
   );
 
-  // Only the currently-toggled-on source layer groups (see ControlPanel.tsx's
+  // Only the currently-toggled-on source layer groups (see components/map/ViewControls.tsx's
   // per-type legend) -- each group is already its own PNG, so "hidden" just
   // means "don't mount that <ImageOverlay>", no client-side feature filtering.
   const visibleRasterGroups = useMemo(() => {
@@ -1318,26 +1547,25 @@ export default function MapView({
       maxZoom={21}
       className={`h-full w-full ${crsVerified ? "" : "gp-neutral-map-bg"}`}
       attributionControl={false}
+      // Зум «+/−» рисует свой компонент в правом нижнем углу карты
+      // (components/map/ZoomControls.tsx): стандартный стоял слева сверху
+      // и перекрывал кнопки соседей.
+      zoomControl={false}
     >
       {/* prefix={false} drops the "Leaflet" credit -- just a courtesy line,
           not a license requirement (Leaflet is BSD-2-Clause). The OSM
           copyright below stays: that one *is* required by OpenStreetMap's
           tile usage policy for using their tiles at all. */}
-      <AttributionControl prefix={false} />
-      {crsVerified && (
-        <TileLayer
-          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-          maxNativeZoom={19}
-        />
-      )}
+      <AttributionControl position="bottomleft" prefix={false} />
+      {crsVerified && <TileLayer attribution={BASEMAP_ATTRIBUTION} url={BASEMAP_URL} subdomains="abcd" maxNativeZoom={20} />}
       <FitBounds fitKey={`${layersKey ?? ""}:${planId ?? ""}`} layersBounds={extentBounds} plan={plan} />
       <FitToRequest request={fitRequest} crsVerified={Boolean(crsVerified)} planIndex={showPlan ? planIndex : undefined} />
-      <InvalidateSizeOnChange trigger={sidebarOpen} />
+      <InvalidateSizeOnResize />
+      <MapBridge onReady={onMapReady} />
       {extentBounds && (
         <Rectangle
           bounds={extentBounds}
-          pathOptions={{ color: "#1e293b", weight: 1.5, dashArray: "6 4", fill: false }}
+          pathOptions={{ color: "#4A524D", weight: 1.5, dashArray: "6 4", fill: false }}
           interactive={false}
         />
       )}
@@ -1384,6 +1612,9 @@ export default function MapView({
         focusRequest={focusRequest}
         crsVerified={crsVerified}
       />
+      {loadHoverInfo && peekHoverInfo && (
+        <HoverTooltipController enabled={hoverEnabled && showPlan} registryRef={registryRef} load={loadHoverInfo} peek={peekHoverInfo} />
+      )}
     </MapContainer>
   );
 }

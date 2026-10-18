@@ -1,15 +1,7 @@
 import { cn } from "@/lib/utils";
 
-/** A keyboard-shortcut hint next to a button/menu label. */
+/** Подсказка клавиши рядом с названием действия: моно, третичным цветом, без
+ * рамки (рамки у каждой клавиши в меню и тулбаре дают визуальный шум). */
 export function Kbd({ children, className }: { children: React.ReactNode; className?: string }) {
-  return (
-    <kbd
-      className={cn(
-        "rounded border border-stone-600 bg-stone-800 px-1.5 py-px font-sans text-[11px] font-medium leading-4 text-stone-300",
-        className
-      )}
-    >
-      {children}
-    </kbd>
-  );
+  return <kbd className={cn("font-mono text-[11px] font-normal leading-4 tabular-nums text-gp-text-3", className)}>{children}</kbd>;
 }

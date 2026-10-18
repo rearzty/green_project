@@ -8,6 +8,8 @@ export interface KeyboardActions {
   deleteSelection: () => void;
   retype: (type: "tree" | "shrub") => void;
   toggleSelectMode: () => void;
+  /** V — инструмент «Выбор»: обычный режим (карта двигается, клик выделяет). */
+  selectTool: () => void;
   selectAll: () => void;
   escape: () => void;
   hasPlan: boolean;
@@ -31,6 +33,8 @@ const KEY_TO_CODE: Record<string, string> = {
   н: "KeyY",
   s: "KeyS",
   ы: "KeyS",
+  v: "KeyV",
+  м: "KeyV",
   a: "KeyA",
   ф: "KeyA",
   "1": "Digit1",
@@ -48,7 +52,7 @@ function physicalKey(e: KeyboardEvent): string {
   return e.code || KEY_TO_CODE[e.key.toLowerCase()] || e.key;
 }
 
-/** Global keyboard shortcuts for plan editing (Ctrl+Z/Y, S, Del, 1/2, Esc,
+/** Global keyboard shortcuts for plan editing (Ctrl+Z/Y, V, S, Del, 1/2, Esc,
  * Ctrl+A) -- registers one `keydown` listener for the component's lifetime
  * and reads the latest callbacks through a ref, so `actions` (which closes
  * over component state and is a new object every render) doesn't force the
@@ -84,6 +88,11 @@ export function useKeyboardShortcuts(actions: KeyboardActions) {
           // turning on is allowed, but always allows turning back off.
           e.preventDefault();
           a.toggleSelectMode();
+          break;
+        case "KeyV":
+          // Всегда можно: «Выбор» — обычный режим, выйти в него разрешено и без плана.
+          e.preventDefault();
+          a.selectTool();
           break;
         case "Delete":
         case "Backspace":

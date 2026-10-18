@@ -21,14 +21,23 @@ export const ZONE_COLORS: Record<string, string> = {
  * markers/lawn fills and plan3d.ts's 3D tree/shrub/lawn meshes, so a tree
  * looks the same color whichever view you're in. */
 export const PLANTING_COLORS: Record<string, string> = {
-  tree: "#15803d",
-  shrub: "#65a30d",
-  lawn: "#a3e635",
+  tree: "#7BD389",
+  shrub: "#C9DE6A",
+  // Основа газона rgb(140,200,110): заливка 16%, обводка 45% — MapView.tsx::areaStyle.
+  lawn: "#8CC86E",
 };
 
 export function plantingColor(type: string): string {
-  return PLANTING_COLORS[type] ?? "#22c55e";
+  return PLANTING_COLORS[type] ?? "#7BD389";
 }
+
+/** Нарушение норматива и выделение на карте: те же цвета, что у токенов
+ * gp-violation / gp-selection (tailwind.config.ts), — для мест, где Tailwind-
+ * класс недоступен (стили Leaflet, inline-стили иконок). */
+export const VIOLATION_COLOR = "#FF9351";
+export const SELECTION_COLOR = "#8AB4FF";
+/** Цвет фона карты (gp-map): обводка точек «отрывает» их от соседей. */
+export const MAP_BG_COLOR = "#2A302C";
 
 /** 3D-only (ThreeDView.tsx) seasonal palettes -- purely cosmetic, swaps
  * material colors on a full scene rebuild (see ThreeDView.tsx's comment on
@@ -54,7 +63,7 @@ export const SEASON_PALETTES: Record<Season, SeasonPalette> = {
   winter: { tree: "#e5e7eb", shrub: "#d1d5db", lawn: "#f8fafc", skyTop: "#64748b", skyBottom: "#e2e8f0" },
 };
 
-/** The shape ControlPanel.tsx's legend renders one row from -- now filled by
+/** The shape the "Слои" popover (components/LayersPopover.tsx) renders one row from -- now filled by
  * layer_raster.py's own grouping (api.ts::LayersRasterGroup, a structural
  * superset of this with a `url` field) rather than built here from
  * GeoJSON features. Kept as a separate type so the panel doesn't couple its

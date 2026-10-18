@@ -4,8 +4,6 @@ import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckCheck,
-  PanelLeftClose,
-  PanelLeftOpen,
   Redo2,
   Shrub,
   SquareDashedMousePointer,
@@ -14,13 +12,20 @@ import {
   Undo2,
   X,
 } from "lucide-react";
+import type { Map as LeafletMap } from "leaflet";
 
 import { AssistantChat } from "@/components/AssistantChat";
+import { CheckPanel } from "@/components/CheckPanel";
 import { ContextMenu, type ContextMenuEntry } from "@/components/ContextMenu";
-import { ControlPanel } from "@/components/ControlPanel";
-import { InspectorCard, type InspectedItem } from "@/components/InspectorCard";
-import type { MapFitRequest } from "@/components/MapView";
-import { PlanSummaryCard } from "@/components/PlanSummaryCard";
+import { DraftPanel } from "@/components/DraftPanel";
+import { Header, type Stage } from "@/components/Header";
+import { InspectorPanel, type InspectedItem } from "@/components/InspectorPanel";
+import { MapToolbar } from "@/components/map/MapToolbar";
+import { StatusBar, type LegendItem } from "@/components/map/StatusBar";
+import { ViewControls } from "@/components/map/ViewControls";
+import { ZoomControls } from "@/components/map/ZoomControls";
+import type { HoverInfo, MapFitRequest } from "@/components/MapView";
+import { PlanPanel } from "@/components/PlanPanel";
 import { Toaster } from "@/components/Toaster";
 import {
   fetchComplianceReport,
@@ -53,7 +58,7 @@ import {
   type SelectTarget,
   type UiAction,
 } from "@/lib/assistantCommands";
-import { countLabel, OBJECT_FORMS } from "@/lib/format";
+import { countLabel, CROWN_LABELS, OBJECT_FORMS, PLANTING_TYPE_LABELS } from "@/lib/format";
 import { useKeyboardShortcuts } from "@/lib/hooks/useKeyboardShortcuts";
 import { usePlanEdits } from "@/lib/hooks/usePlanEdits";
 import { useProjectSession } from "@/lib/hooks/useProjectSession";
@@ -78,7 +83,7 @@ const OTHER_OPERATION = "Сейчас идёт другая операция —
 const UNKNOWN_COMMAND = "Эту команду я пока не умею выполнять.";
 const SELECTION_CHANGED = "Выделение изменилось, пока Юна отвечала, — правка не выполнена. Повторите просьбу.";
 const NEEDS_ORDER_BOUNDARY_CONSENT =
-  "План не построен: границы работ в поставке нет, строить по границе заказа на съёмку можно только с вашего согласия. Настройки — в панели слева, подтвердите там «Да, по границе заказа».";
+  "План не построен: границы работ в поставке нет, строить по границе заказа на съёмку можно только с вашего согласия. Настройки — на вкладке «План» слева, подтвердите там «Да, по границе заказа».";
 /** Правка стартует в ближайшем рендере; не видно её и через это время —
  * runEdit отказался начинать (уже шла другая), ждать нечего. */
 const EDIT_START_TIMEOUT_MS = 3000;
@@ -88,10 +93,6 @@ const EDIT_FINISH_TIMEOUT_MS = 120_000;
  * держим, нарушения всё равно покажет сводка плана. */
 const VALIDATION_TIMEOUT_MS = 20_000;
 const NO_IDS: ReadonlySet<string> = new Set();
-
-/** Карточки над картой справа (сводка плана, выделение): right-4 + w-72 и
- * зазор до чата — столько чат Юны оставляет им у правого края окна. */
-const CARDS_RESERVED_PX = 16 + 288 + 8;
 
 function sameIds(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
   if (a === b) return true;
@@ -132,9 +133,9 @@ export default function Home() {
       cancelled = true;
     };
   }, [view3d, project, layers3d?.projectId]);
-  // Lifted out of ControlPanel (used to be its own local state) so
+  // Lifted out of the settings panel (used to be its own local state) so
   // AssistantChat can read and change the same generation recipe Юна talks
-  // about -- see ControlPanel.tsx's own comment on why this moved.
+  // about -- see PlanPanel.tsx's props on why this lives here.
   const [plantingTypes, setPlantingTypes] = useState<PlantingType[]>(["tree", "shrub", "lawn"]);
   const [scoringMode, setScoringMode] = useState<ScoringMode>("heuristic");
   // undefined = not overridden -- generate omits the field and the backend
@@ -147,7 +148,7 @@ export default function Home() {
   // «Покажи эти объекты» для карты — Юна выделила группу (selectByAssistant).
   const [fitRequest, setFitRequest] = useState<MapFitRequest | null>(null);
   // Юну попросили построить план, а нужен ответ на вопрос панели о границе
-  // заказа (ControlPanel.tsx::consentRequest) — счётчик, каждый — новый вопрос.
+  // заказа (PlanPanel.tsx::consentRequest) — счётчик, каждый — новый вопрос.
   const [consentRequest, setConsentRequest] = useState(0);
   // Defaults open (matches the always-visible panel this replaces) and is
   // corrected once on mount for phones -- SSR has no window to check, so a
@@ -156,6 +157,55 @@ export default function Home() {
 
   useEffect(() => {
     if (!window.matchMedia("(min-width: 768px)").matches) setSidebarOpen(false);
+  }, []);
+
+  // Вкладка этапа в шапке. По умолчанию следует за ходом работы: нет проекта —
+  // «Чертёж», проект без плана — «План», готовый план — «Проверка»; дальше
+  // пользователь ходит по вкладкам сам. Первая проверка срабатывает на смену
+  // проекта (в том числе на восстановление сессии: проект приходит раньше
+  // плана), вторая — когда план появляется впервые (восстановление, генерация).
+  // Переключение между версиями одного проекта вкладку не трогает.
+  const [stage, setStage] = useState<Stage>("draft");
+  useEffect(() => {
+    setStage(project ? (plan ? "check" : "plan") : "draft");
+    // plan читаем из текущего рендера: нужна лишь смена проекта
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project?.id]);
+  const hadPlanRef = useRef(false);
+  useEffect(() => {
+    const hasPlanNow = plan !== null;
+    if (hasPlanNow && !hadPlanRef.current) setStage("check");
+    hadPlanRef.current = hasPlanNow;
+  }, [plan]);
+
+  function handleStageChange(next: Stage) {
+    setStage(next);
+    // Вкладку выбрали — панель должна быть видна (свёрнутая на десктопе,
+    // закрытая шторка на телефоне).
+    setSidebarOpen(true);
+  }
+
+  // Юна — правая колонка, открывается кнопкой в шапке; точка у кнопки — ответ
+  // пришёл, пока колонка была закрыта.
+  const [assistantOpen, setAssistantOpen] = useState(false);
+  const [assistantUnread, setAssistantUnread] = useState(false);
+  function toggleAssistant() {
+    setAssistantOpen((v) => !v);
+    setAssistantUnread(false);
+  }
+  function openAssistant() {
+    setAssistantOpen(true);
+    setAssistantUnread(false);
+  }
+
+  // Leaflet-карта наружу (MapView.tsx::MapBridge): ей пользуются зум и
+  // статус-строка вне контейнера карты. В 3D — null.
+  const [leafletMap, setLeafletMap] = useState<LeafletMap | null>(null);
+
+  // Подсказка при наведении — только там, где есть наведение (не тач).
+  const [hoverCapable, setHoverCapable] = useState(false);
+  useEffect(() => {
+    setHoverCapable(window.matchMedia("(hover: hover) and (pointer: fine)").matches);
   }, []);
   // Sourced from the raster endpoint's own grouping now, not recomputed from
   // project.layers on the client -- layer_raster.py already walks every
@@ -185,7 +235,7 @@ export default function Home() {
   );
   const selection = useSelection(planIndex, planRevision, editing.violationIds);
 
-  // Обоснование ("Почему здесь?", ControlPanel.tsx) -- только для ровно одной
+  // Обоснование ("Почему здесь?", InspectorPanel.tsx) -- только для ровно одной
   // выделенной точки: geo_engine.compliance.explain_items не зависит от
   // остальных посадок, так что запрашивать его для группы бессмысленно (что
   // показывать -- обоснование какой из них?). Тот же id, что уже выделен на
@@ -283,6 +333,11 @@ export default function Home() {
     setContextMenu(null);
   }
 
+  /** «Выбор» (V): обычный режим карты — выйти из рамки; включать нечего. */
+  function selectTool() {
+    if (selection.selectMode) toggleSelectMode();
+  }
+
   function handleEscape() {
     if (contextMenu) setContextMenu(null);
     else if (selection.selectedIds.size > 0) selection.clear();
@@ -298,6 +353,7 @@ export default function Home() {
     deleteSelection: () => editing.handleDeleteSelection(selection.selectedIds),
     retype: (type) => editing.handleRetypeSelection(selection.selectedIds, planIndex, type),
     toggleSelectMode,
+    selectTool,
     selectAll: selection.selectAll,
     escape: handleEscape,
     hasPlan: plan !== null,
@@ -313,7 +369,7 @@ export default function Home() {
     [plan, project?.crs_verified, project?.source_crs]
   );
 
-  // Properties of the single selected feature for InspectorCard (species,
+  // Properties of the single selected feature for InspectorPanel (species,
   // crown, rationale) -- looked up in the current plan.features, which every
   // edit path keeps in sync, rather than a separately-stale copy.
   const inspectedItem = useMemo<InspectedItem | undefined>(() => {
@@ -321,6 +377,55 @@ export default function Home() {
     const feature = plan.features.features.find((f) => (f.properties as { id?: string }).id === singleSelectedId);
     return feature?.properties as InspectedItem | undefined;
   }, [plan, singleSelectedId]);
+
+  // --- подсказка при наведении на посадку (п. 4) ---
+  //
+  // Данные — то же обоснование, что открывает инспектор (getItemsCompliance),
+  // кеш по plan_id + planRevision + id: правка, тронувшая посадку, меняет
+  // расстояния и ревизию, и запись устаревает вместе с ней. Повторное
+  // наведение отвечает из кеша мгновенно (peek), параллельные наведения на
+  // одну точку делят один запрос. Неудачный запрос в кеш не кладём.
+  const hoverCacheRef = useRef(new Map<string, HoverInfo | null>());
+  const hoverInflightRef = useRef(new Map<string, Promise<HoverInfo | null>>());
+  const hoverKey = (id: string) => `${plan?.plan_id}:${planRevision}:${id}`;
+
+  function peekHoverInfo(id: string): HoverInfo | null | undefined {
+    return hoverCacheRef.current.get(hoverKey(id));
+  }
+
+  function loadHoverInfo(id: string): Promise<HoverInfo | null> {
+    const key = hoverKey(id);
+    const cached = hoverCacheRef.current.get(key);
+    if (cached !== undefined) return Promise.resolve(cached);
+    const running = hoverInflightRef.current.get(key);
+    if (running) return running;
+    const projectId = project?.id;
+    const planId = plan?.plan_id;
+    const type = planIndex?.get(id)?.type;
+    // Газон — площадной объект: подсказка есть только у деревьев и кустов.
+    if (!projectId || !planId || !type || type === "lawn") return Promise.resolve(null);
+    const props = plan?.features.features.find((f) => (f.properties as { id?: string }).id === id)?.properties as InspectedItem | undefined;
+    const promise = getItemsCompliance(projectId, planId, [id])
+      .then((items): HoverInfo => {
+        const checks = [...(items[0]?.checks ?? [])].sort((a, b) => a.actual_m - a.required_m - (b.actual_m - b.required_m));
+        const tightest = checks[0];
+        return {
+          title: props?.species && props.species !== "default" ? props.species : PLANTING_TYPE_LABELS[type],
+          subtitle: `${PLANTING_TYPE_LABELS[type]}${props?.crown && CROWN_LABELS[props.crown] ? ` · ${CROWN_LABELS[props.crown]}` : ""}`,
+          nearest: tightest
+            ? { label: tightest.object_label || tightest.object_type, actualM: tightest.actual_m, requiredM: tightest.required_m, satisfied: tightest.satisfied }
+            : null,
+        };
+      })
+      .then((info) => {
+        hoverCacheRef.current.set(key, info);
+        return info;
+      })
+      .catch(() => null)
+      .finally(() => hoverInflightRef.current.delete(key));
+    hoverInflightRef.current.set(key, promise);
+    return promise;
+  }
 
   // --- Юна: исполнение её команд ---
   //
@@ -447,6 +552,7 @@ export default function Home() {
     // построит именно то, о чём просили в чате.
     if (current.project.territory_source === "order_boundary" && !current.project.use_order_boundary) {
       applyGenerationSettings(next);
+      setStage("plan");
       setSidebarOpen(true);
       setConsentRequest((n) => n + 1);
       return { ok: false, text: NEEDS_ORDER_BOUNDARY_CONSENT };
@@ -757,166 +863,254 @@ export default function Home() {
     },
   ];
 
-  // Карточки над картой справа — сводка плана (и в 3D) и выделение (только 2D).
-  const cardsShown = planStats !== null || (!view3d && selection.summary !== null);
+  const canEditPlan = plan !== null && !editing.editBusy;
+  const violationPlants = editing.violations ? editing.violationIds.size : null;
+  // Правая колонка: Юна, если открыта, иначе — инспектор выделения (только 2D).
+  const showInspector = !view3d && selection.summary !== null && !assistantOpen;
+
+  // Легенда статус-строки — только то, что реально есть на экране (спека §3.3).
+  const legend: LegendItem[] = [];
+  if (planStats && showPlan) {
+    if (planStats.trees > 0) legend.push({ key: "tree", label: "Дерево", swatch: "tree" });
+    if (planStats.shrubs > 0) legend.push({ key: "shrub", label: "Кустарник", swatch: "shrub" });
+    if (planStats.lawnAreaM2 > 0) legend.push({ key: "lawn", label: "Газон", swatch: "lawn" });
+    if (violationPlants) legend.push({ key: "violation", label: "Нарушение", swatch: "violation" });
+  }
+  const legendGroup = (key: string) => layerLegend.find((entry) => entry.key === key && entry.count > 0 && !hiddenLayerTypes.has(key));
+  const utilities = legendGroup("utility");
+  if (utilities) legend.push({ key: "utility", label: "Сети", swatch: "dash", color: utilities.color });
+  const boundary = legendGroup("territory");
+  if (boundary) legend.push({ key: "territory", label: "Граница работ", swatch: "dash", color: boundary.color });
+
+  async function exportDxfWithToast() {
+    try {
+      await session.handleExportDxf();
+    } catch (e) {
+      toast.error(errorMessage(e));
+    }
+  }
 
   return (
-    <main className="flex h-full w-full">
-      <div
-        className={cn(
-          "h-full flex-none overflow-hidden transition-all duration-200 ease-in-out",
-          // Телефон: выезжающая шторка поверх карты — выше всего, что лежит
-          // на карте (контролы Leaflet 1000, карточки 1050, чат Юны 1100), но
-          // ниже уведомлений (1150), чтобы ошибка из панели была видна.
-          "fixed inset-y-0 left-0 z-[1120] md:static md:z-auto",
-          // Ширина обёртки на телефоне — ровно ширина самой панели
-          // (ControlPanel: w-[88vw] max-w-96): прозрачный остаток w-96 на
-          // 390 px экрана закрывал затемнённый фон, и закрыть шторку тапом
-          // было можно только по последним 6 px.
-          sidebarOpen ? "w-[88vw] max-w-96 translate-x-0 md:w-96" : "-translate-x-full md:w-0 md:translate-x-0"
+    <div className="flex h-full w-full flex-col bg-gp-panel text-gp-text">
+      <Header
+        stage={stage}
+        onStageChange={handleStageChange}
+        hasProject={project !== null}
+        hasPlan={plan !== null}
+        projectName={project?.name}
+        versionLabel={plans.length > 1 ? `${plans.length} ${plans.length < 5 ? "версии" : "версий"}` : undefined}
+        violationCount={violationPlants}
+        assistantOpen={assistantOpen}
+        assistantUnread={assistantUnread}
+        onToggleAssistant={toggleAssistant}
+        onExport={() => void exportDxfWithToast()}
+        exportDisabled={plan === null}
+        exporting={session.exporting}
+        onNewProject={session.handleClearAll}
+      />
+
+      <div className="flex min-h-0 flex-1">
+        <div
+          className={cn(
+            "flex-none overflow-hidden bg-gp-panel transition-all duration-200 ease-in-out",
+            // Телефон: выезжающая шторка поверх карты (под шапкой) — выше всего,
+            // что лежит на карте (контролы Leaflet 1000, плавающее 1050, правая
+            // шторка 1060), но ниже уведомлений (1150), чтобы ошибка из панели
+            // была видна. Десктоп: колонка в потоке, сворачивается до нуля.
+            "fixed bottom-0 left-0 top-12 z-[1120] md:static md:z-auto",
+            sidebarOpen ? "w-[88vw] max-w-[340px] translate-x-0 md:w-[340px]" : "-translate-x-full md:w-0 md:translate-x-0"
+          )}
+        >
+          <aside aria-label="Панель этапа" className="flex h-full w-[88vw] max-w-[340px] flex-col border-r border-gp-line bg-gp-panel md:w-[340px] md:max-w-none">
+            {/* Все три панели смонтированы всегда и прячутся атрибутом hidden:
+                форма загрузки и вопрос о границе заказа (PlanPanel,
+                consentRequest) хранят своё состояние между вкладками. */}
+            <div className={cn("min-h-0 flex-1", stage !== "draft" && "hidden")}>
+              <DraftPanel
+                hasProject={project !== null}
+                projectName={project?.name}
+                projectWarnings={session.projectLost ? [PROJECT_GONE_MESSAGE, ...(project?.warnings ?? [])] : project?.warnings}
+                restoring={session.restoring}
+                uploadProgress={session.uploadProgress}
+                onUpload={session.handleUpload}
+                layerLegend={layerLegend}
+                onNext={() => setStage("plan")}
+              />
+            </div>
+            <div className={cn("min-h-0 flex-1", stage !== "plan" && "hidden")}>
+              <PlanPanel
+                hasProject={project !== null}
+                hasPlan={plan !== null}
+                needsOrderBoundaryConsent={project?.territory_source === "order_boundary" && !project?.use_order_boundary}
+                consentRequest={consentRequest}
+                generating={session.generating}
+                generateProgress={session.generateProgress}
+                editBusy={editing.editBusy}
+                onGenerate={async (types, mode, spacing) => {
+                  await session.handleGenerate(types, mode, spacing);
+                  setStage("check");
+                }}
+                plantingTypes={plantingTypes}
+                onPlantingTypesChange={setPlantingTypes}
+                scoringMode={scoringMode}
+                onScoringModeChange={setScoringMode}
+                treeSpacingM={treeSpacingM}
+                onTreeSpacingMChange={setTreeSpacingM}
+                shrubSpacingM={shrubSpacingM}
+                onShrubSpacingMChange={setShrubSpacingM}
+                treeRows={treeRows}
+                onTreeRowsChange={setTreeRows}
+                treesInPaving={treesInPaving}
+                onTreesInPavingChange={setTreesInPaving}
+              />
+            </div>
+            {stage === "check" && (
+              <div className="min-h-0 flex-1">
+                <CheckPanel
+                  projectId={project?.id}
+                  planId={plan?.plan_id}
+                  planRevision={planRevision}
+                  hasPlan={plan !== null}
+                  validating={editing.validating}
+                  violations={editing.violations}
+                  itemCount={plan?.features.features.length ?? 0}
+                  typeOf={(id) => planIndex?.get(id)?.type}
+                  stats={planStats}
+                  areaBudget={plan?.area_budget}
+                  showPlan={showPlan}
+                  selectedItemId={singleSelectedId}
+                  editBusy={editing.editBusy}
+                  onFocusItem={selection.focusItem}
+                  plans={plans}
+                  currentPlanId={plan?.plan_id}
+                  onSelectPlan={session.handleSelectPlan}
+                  onDeletePlan={session.handleDeletePlan}
+                  exporting={session.exporting}
+                  onExportDxf={session.handleExportDxf}
+                  onDownloadComplianceReport={(format) => {
+                    downloadComplianceReport(format).catch((e) => toast.error(errorMessage(e)));
+                  }}
+                />
+              </div>
+            )}
+          </aside>
+        </div>
+        {sidebarOpen && <div className="fixed inset-0 z-[1110] bg-black/40 md:hidden" onClick={() => setSidebarOpen(false)} aria-hidden />}
+
+        <main className="flex min-w-0 flex-1 flex-col bg-gp-map">
+          <div className="relative min-h-0 flex-1 overflow-hidden">
+            {view3d ? (
+              <ThreeDView
+                layers={layers3d?.projectId === project?.id ? layers3d?.layers : undefined}
+                plan={plan?.features}
+                crsVerified={project?.crs_verified}
+                season={season}
+                storageKey={project?.id}
+              />
+            ) : (
+              <MapView
+                layersRaster={layersRaster}
+                crsVerified={project?.crs_verified}
+                plan={plan?.features}
+                planIndex={planIndex}
+                layersKey={project?.id}
+                planId={plan?.plan_id}
+                planRevision={planRevision}
+                hiddenLayerTypes={hiddenLayerTypes}
+                showPlan={showPlan}
+                selectMode={selection.selectMode}
+                selectedIds={selection.selectedIds}
+                violationIds={editing.violationIds}
+                editsLocked={editing.editBusy}
+                onSelectionChange={selection.setSelection}
+                onMoveItems={editing.handleMoveItems}
+                onContextMenu={handleContextMenu}
+                onViewChange={closeContextMenu}
+                focusRequest={selection.focusRequest}
+                fitRequest={fitRequest}
+                onMapReady={setLeafletMap}
+                hoverEnabled={hoverCapable && plan !== null}
+                loadHoverInfo={loadHoverInfo}
+                peekHoverInfo={peekHoverInfo}
+              />
+            )}
+            {/* Всё, что лежит поверх карты, — вне контейнера Leaflet и с
+                data-map-overlay (MapView.tsx::freeMapRects не кладёт под него
+                рамку «выдели …»). */}
+            <MapToolbar
+              panelOpen={sidebarOpen}
+              onTogglePanel={() => setSidebarOpen((v) => !v)}
+              showTools={!view3d && plan !== null}
+              selectMode={selection.selectMode}
+              onSelectTool={selectTool}
+              onBoxTool={toggleSelectMode}
+              boxDisabled={!showPlan}
+              canUndo={editing.canUndo}
+              canRedo={editing.canRedo}
+              canEdit={canEditPlan}
+              onUndo={() => editing.undo()}
+              onRedo={editing.redo}
+            />
+            <ViewControls
+              view3d={view3d}
+              canShow3d={plan !== null}
+              onSetView3d={(on) => {
+                if (on !== view3d) toggleView3d();
+              }}
+              layerLegend={layerLegend}
+              hiddenLayerTypes={hiddenLayerTypes}
+              onToggleLayerType={handleToggleLayerType}
+              showPlan={showPlan}
+              onToggleShowPlan={handleToggleShowPlan}
+              hasPlan={plan !== null}
+              season={season}
+              onSeasonChange={setSeason}
+            />
+            {!view3d && <ZoomControls map={leafletMap} />}
+          </div>
+          <StatusBar
+            map={view3d ? null : leafletMap}
+            crsVerified={Boolean(project?.crs_verified)}
+            legend={legend}
+            hint={!view3d && hoverCapable && plan !== null && showPlan ? "Наведите на посадку, чтобы увидеть ближайшее ограничение" : null}
+          />
+        </main>
+
+        {showInspector && selection.summary && (
+          <InspectorPanel
+            key={singleSelectedId ?? "group"}
+            selection={selection.summary}
+            item={inspectedItem}
+            compliance={complianceForSelection}
+            complianceLoading={complianceLoading}
+            canEdit={canEditPlan}
+            onRetype={(type) => editing.handleRetypeSelection(selection.selectedIds, planIndex, type)}
+            onDelete={() => editing.handleDeleteSelection(selection.selectedIds)}
+            onClear={selection.clear}
+            onAskYuna={openAssistant}
+          />
         )}
-      >
-        <ControlPanel
-          hasProject={project !== null}
-          projectName={project?.name}
-          projectWarnings={session.projectLost ? [PROJECT_GONE_MESSAGE, ...(project?.warnings ?? [])] : project?.warnings}
-          needsOrderBoundaryConsent={project?.territory_source === "order_boundary" && !project?.use_order_boundary}
-          consentRequest={consentRequest}
-          areaBudget={plan?.area_budget}
-          hasPlan={plan !== null}
-          restoring={session.restoring}
+        <AssistantChat
+          projectId={project?.id}
           generating={session.generating}
-          uploadProgress={session.uploadProgress}
-          generateProgress={session.generateProgress}
-          exporting={session.exporting}
-          onUpload={session.handleUpload}
-          onGenerate={session.handleGenerate}
-          plantingTypes={plantingTypes}
-          onPlantingTypesChange={setPlantingTypes}
-          scoringMode={scoringMode}
-          onScoringModeChange={setScoringMode}
-          treeSpacingM={treeSpacingM}
-          onTreeSpacingMChange={setTreeSpacingM}
-          shrubSpacingM={shrubSpacingM}
-          onShrubSpacingMChange={setShrubSpacingM}
-          treeRows={treeRows}
-          onTreeRowsChange={setTreeRows}
-          treesInPaving={treesInPaving}
-          onTreesInPavingChange={setTreesInPaving}
-          onExportDxf={session.handleExportDxf}
-          onDownloadComplianceReport={(format) => {
-            downloadComplianceReport(format).catch((e) => toast.error(errorMessage(e)));
-          }}
-          onClearAll={session.handleClearAll}
-          layerLegend={layerLegend}
-          hiddenLayerTypes={hiddenLayerTypes}
-          onToggleLayerType={handleToggleLayerType}
-          showPlan={showPlan}
-          onToggleShowPlan={handleToggleShowPlan}
-          view3d={view3d}
-          onToggleView3d={toggleView3d}
-          season={season}
-          onSeasonChange={setSeason}
-          plans={plans}
-          currentPlanId={plan?.plan_id}
-          onSelectPlan={session.handleSelectPlan}
-          onDeletePlan={session.handleDeletePlan}
-          editBusy={editing.editBusy}
-          canUndo={editing.canUndo}
-          canRedo={editing.canRedo}
-          onUndo={() => editing.undo()}
-          onRedo={editing.redo}
-          selectMode={selection.selectMode}
-          onToggleSelectMode={toggleSelectMode}
-          selection={selection.summary}
-          onSelectAll={selection.selectAll}
-          validating={editing.validating}
-          violations={editing.violations}
-          onFocusItem={selection.focusItem}
+          settings={generationSettings}
+          planId={plan?.plan_id}
+          selectedItemId={singleSelectedId}
+          selection={assistantSelection}
+          selectedIds={selection.selectedIds}
+          // Посадок с нарушениями, а не записей о нарушениях: у одной посадки
+          // их бывает две (отступ и интервал), а Юна говорит о посадках.
+          violationsCount={violationPlants}
+          view={view3d ? "3d" : "2d"}
+          planTrees={planStats?.trees ?? 0}
+          open={assistantOpen}
+          onClose={() => setAssistantOpen(false)}
+          onUnread={() => setAssistantUnread(true)}
+          projectLost={session.projectLost}
+          onCommands={handleAssistantCommands}
         />
       </div>
-      {sidebarOpen && (
-        <div className="fixed inset-0 z-[1110] bg-black/40 md:hidden" onClick={() => setSidebarOpen(false)} aria-hidden />
-      )}
-      <button
-        onClick={() => setSidebarOpen((v) => !v)}
-        title={sidebarOpen ? "Скрыть панель" : "Показать панель"}
-        aria-pressed={sidebarOpen}
-        className={cn(
-          // top-24, not top-4 -- Leaflet's own zoom control sits at the
-          // map's top-left corner (~10-74px from the top, confirmed live)
-          // and renders above this button (leaflet's z-index 1000 > our
-          // 500), silently eating clicks at a naive top-4 position.
-          "fixed top-24 rounded-md border border-stone-700 bg-stone-900 p-1.5 text-stone-300 shadow transition-[left] duration-200 ease-in-out hover:bg-stone-800",
-          // Открытая шторка телефона: кнопка — у её правого края (ширина та
-          // же, что у панели) и над затемнением; left-[400px] уводил её за
-          // край 390 px экрана.
-          sidebarOpen ? "left-[calc(min(88vw,24rem)+0.5rem)] z-[1130] md:left-[400px] md:z-[500]" : "left-4 z-[500]"
-        )}
-      >
-        {sidebarOpen ? <PanelLeftClose className="h-4 w-4" aria-hidden /> : <PanelLeftOpen className="h-4 w-4" aria-hidden />}
-      </button>
-      <div className="relative min-w-0 flex-1">
-        {view3d ? (
-          <ThreeDView
-            layers={layers3d?.projectId === project?.id ? layers3d?.layers : undefined}
-            plan={plan?.features}
-            crsVerified={project?.crs_verified}
-            season={season}
-            storageKey={project?.id}
-          />
-        ) : (
-          <MapView
-            layersRaster={layersRaster}
-            crsVerified={project?.crs_verified}
-            plan={plan?.features}
-            planIndex={planIndex}
-            layersKey={project?.id}
-            planId={plan?.plan_id}
-            planRevision={planRevision}
-            hiddenLayerTypes={hiddenLayerTypes}
-            showPlan={showPlan}
-            selectMode={selection.selectMode}
-            selectedIds={selection.selectedIds}
-            violationIds={editing.violationIds}
-            editsLocked={editing.editBusy}
-            onSelectionChange={selection.setSelection}
-            onMoveItems={editing.handleMoveItems}
-            onContextMenu={handleContextMenu}
-            onViewChange={closeContextMenu}
-            focusRequest={selection.focusRequest}
-            fitRequest={fitRequest}
-            sidebarOpen={sidebarOpen}
-          />
-        )}
-        <div className="pointer-events-none absolute bottom-24 right-4 top-4 z-[1050] flex flex-col items-end gap-3">
-          {/* Обе карточки помечены data-map-overlay сами (а не эта колонка во
-              всю высоту): рамка «выдели …» (MapView.tsx::freeMapRects) может
-              лечь и под ними, если там свободно. */}
-          {planStats && (
-            <PlanSummaryCard
-              stats={planStats}
-              violations={editing.violations ? editing.violationIds.size : null}
-              validating={editing.validating}
-              territoryM2={plan?.area_budget?.[0]?.territory_m2}
-              scoringMode={plan?.scoring_mode}
-            />
-          )}
-          {!view3d && selection.summary && (
-            <InspectorCard
-              key={singleSelectedId ?? "group"}
-              selection={selection.summary}
-              item={inspectedItem}
-              compliance={complianceForSelection}
-              complianceLoading={complianceLoading}
-              canEdit={plan !== null && !editing.editBusy}
-              onRetype={(type) => editing.handleRetypeSelection(selection.selectedIds, planIndex, type)}
-              onDelete={() => editing.handleDeleteSelection(selection.selectedIds)}
-              onClear={selection.clear}
-            />
-          )}
-        </div>
-      </div>
+
       {contextMenu && (
         <ContextMenu
           x={contextMenu.x}
@@ -927,24 +1121,6 @@ export default function Home() {
         />
       )}
       <Toaster />
-      <AssistantChat
-        projectId={project?.id}
-        generating={session.generating}
-        settings={generationSettings}
-        planId={plan?.plan_id}
-        selectedItemId={singleSelectedId}
-        selection={assistantSelection}
-        selectedIds={selection.selectedIds}
-        // Посадок с нарушениями, а не записей о нарушениях: у одной посадки
-        // их бывает две (отступ и интервал), а Юна говорит о посадках.
-        violationsCount={editing.violations ? editing.violationIds.size : null}
-        view={view3d ? "3d" : "2d"}
-        planTrees={planStats?.trees ?? 0}
-        sidebarOpen={sidebarOpen}
-        reservedRight={cardsShown ? CARDS_RESERVED_PX : 0}
-        projectLost={session.projectLost}
-        onCommands={handleAssistantCommands}
-      />
-    </main>
+    </div>
   );
 }

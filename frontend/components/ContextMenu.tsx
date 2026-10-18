@@ -45,6 +45,29 @@ export function ContextMenu({
     });
   }, [x, y]);
 
+  // Клавиатура: меню забирает фокус на первый доступный пункт, стрелки ходят
+  // по пунктам, Enter нажимает (это настоящие <button>). Esc закрывает
+  // страница (handleEscape) — тут не дублируем.
+  useEffect(() => {
+    const items = () => Array.from(ref.current?.querySelectorAll<HTMLButtonElement>("button[role=menuitem]:not(:disabled)") ?? []);
+    items()[0]?.focus({ preventScroll: true });
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== "ArrowDown" && e.key !== "ArrowUp" && e.key !== "Home" && e.key !== "End") return;
+      const list = items();
+      if (list.length === 0) return;
+      e.preventDefault();
+      const current = list.indexOf(document.activeElement as HTMLButtonElement);
+      let next = current;
+      if (e.key === "ArrowDown") next = current < 0 ? 0 : (current + 1) % list.length;
+      else if (e.key === "ArrowUp") next = current <= 0 ? list.length - 1 : current - 1;
+      else if (e.key === "Home") next = 0;
+      else next = list.length - 1;
+      list[next]?.focus({ preventScroll: true });
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   useEffect(() => {
     function onPointerDown(e: PointerEvent) {
       if (!ref.current?.contains(e.target as Node)) onClose();
@@ -65,11 +88,11 @@ export function ContextMenu({
       role="menu"
       style={position}
       onContextMenu={(e) => e.preventDefault()}
-      className="gp-menu fixed z-[1200] min-w-[16rem] rounded-lg border border-stone-700 bg-stone-900/95 py-1 text-sm shadow-xl backdrop-blur"
+      className="gp-menu fixed z-[1200] min-w-[16rem] rounded-lg border border-gp-border bg-gp-panel py-1.5 text-sm shadow-xl"
     >
-      {title && <div className="px-3 pb-1 pt-1.5 text-xs font-medium text-stone-400">{title}</div>}
+      {title && <div className="px-3 pb-1.5 pt-1 text-[13px] font-medium text-gp-text-2">{title}</div>}
       {entries.map((entry, i) => {
-        if (entry === "separator") return <div key={`sep-${i}`} className="my-1 border-t border-stone-800" />;
+        if (entry === "separator") return <div key={`sep-${i}`} className="my-1.5 border-t border-gp-line" />;
         const Icon = entry.icon;
         return (
           <button
@@ -80,8 +103,8 @@ export function ContextMenu({
               onClose();
               entry.onSelect();
             }}
-            className={`flex w-full items-center gap-2.5 px-3 py-1.5 text-left transition-colors disabled:cursor-default disabled:opacity-40 ${
-              entry.danger ? "text-red-400 enabled:hover:bg-red-950/60" : "text-stone-100 enabled:hover:bg-stone-800"
+            className={`flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm transition-colors disabled:cursor-default disabled:opacity-40 enabled:hover:bg-gp-hover-strong focus-visible:bg-gp-hover-strong focus-visible:outline-none ${
+              entry.danger ? "text-gp-violation-danger" : "text-gp-text"
             }`}
           >
             {Icon ? <Icon className="h-4 w-4 flex-none opacity-80" aria-hidden /> : <span className="w-4 flex-none" />}
