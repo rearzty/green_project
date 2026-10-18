@@ -25,6 +25,9 @@ class GenerateRequest(BaseModel):
     tree_rows: int = Field(default=1, ge=1, le=2)
     # Деревья в покрытии тротуара с приствольной решёткой (743-ПП п. 9.8).
     trees_in_paving: bool = False
+    # Согласие строить по границе заказа на съёмку, когда границы работ в
+    # поставке нет (geo_engine.territory.OrderBoundaryOnlyError).
+    use_order_boundary: bool = False
 
 
 class GenerateJobOut(BaseModel):

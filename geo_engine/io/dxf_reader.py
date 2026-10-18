@@ -268,8 +268,9 @@ MOSGEOTREST_LAYER_MAP: LayerMap = {
 #   polygon; mapping it to "road" would buffer a line that is not the road.
 # * "Граница заказа" (geobase "...brd" sheets) — how much survey was ordered,
 #   not what is being designed. On the reference street it covers 119011 m²
-#   against the work area's 45870, so using it as the territory would invite
-#   plantings onto a third of a neighbouring block. Left unmapped on purpose.
+#   against the work area's 45870, so it is NOT the territory. It is recognised
+#   (layer_rules: "order_boundary") only as a fallback outline for a delivery
+#   with no work-area boundary at all — see geo_engine.territory.territory_source.
 # * No "territory" layer. The pilot drawings carry the work-area outline on
 #   "!!!_1. ГРАНИЦА РАБОТ" / "!Граница работ", but in the sheets checked those
 #   layers hold only stray fragments (2 and 5 vertices) — the real outline lives
@@ -1475,6 +1476,10 @@ def resolve_layer(layer: str, layer_map: LayerMap, use_rules: bool = True) -> tu
 RECONSTRUCT_FOOTPRINT_ZONE_TYPES: dict[str, tuple[float, float]] = {
     "building": (DEFAULT_SNAP_GRID_M, DEFAULT_DANGLE_BUFFER_M),
     "territory": (2.0, 0.0),
+    # Запасная граница участка (geo_engine.territory.ORDER_BOUNDARY_ZONE_TYPE) —
+    # те же числа и та же причина, что у "territory": это тоже контур участка,
+    # и выдуманная из обрывка площадь хуже честной ошибки.
+    "order_boundary": (2.0, 0.0),
     "existing_greenery": (DEFAULT_SNAP_GRID_M, DEFAULT_DANGLE_BUFFER_M),
 }
 

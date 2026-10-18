@@ -335,6 +335,7 @@ export default function Home() {
         <ControlPanel
           hasProject={project !== null}
           projectWarnings={project?.warnings}
+          needsOrderBoundaryConsent={project?.territory_source === "order_boundary" && !project?.use_order_boundary}
           areaBudget={plan?.area_budget}
           hasPlan={plan !== null}
           restoring={session.restoring}
