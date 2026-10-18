@@ -86,12 +86,39 @@ SOLITAIRE_RATIONALE_PREFIX = (
     "Солитер: одиночное дерево на открытом месте, 743-ПП прил., п. 10.8.1 (по аналогии)."
 )
 
-# Интервал внутри куртины. 743-ПП, табл. 3.6.2: «групповая посадка
-# кустарников — 0,3 м». Берётся 0,5 м, а не 0,3: таблица даёт ориентир для
-# рядовой и групповой посадки вперемешку, а 515-ПП табл. 5 задаёт плотность
-# 1-3 шт/м², чему 0,5 м (около 4 шт/м² по сетке, меньше после прореживания
-# кругами крон) соответствует ближе, чем 0,3 (около 11 шт/м²).
+# Интервал внутри куртины для породы, у которой 515-ПП плотности не даёт
+# (см. group_pitch_for ниже). 743-ПП, табл. 3.6.2: «групповая посадка
+# кустарников — 0,3 м»; берётся 0,5 м — ближе к плотностям 1-3 шт/м²,
+# которые 515-ПП задаёт остальным породам, чем 0,3 (около 11 шт/м²).
 IN_GROUP_PITCH_M = 0.5
+
+# Плотность куртины — по породе, из 515-ПП табл. 5 приложения («группы,
+# 3 штуки/кв. м» и т. п., `Species.density_per_m2`). Плотность переводится в
+# минимальный шаг так, чтобы её нельзя было превысить ни при какой
+# раскладке: самая плотная упаковка точек с попарным расстоянием d —
+# гексагональная, 2/(√3·d²) шт/м², отсюда d = √(2/(√3·плотность)). Для
+# диапазона («2-3 штуки») в каталоге стоит середина. Порода без плотности в
+# акте (можжевельник: «группы» без числа) — IN_GROUP_PITCH_M выше.
+GROUP_DENSITY_SOURCE = "515-ПП, табл. 5 приложения"
+
+
+def group_pitch_for(species) -> float:
+    """Шаг внутри куртины для породы, м (см. GROUP_DENSITY_SOURCE)."""
+    density = getattr(species, "density_per_m2", None)
+    if not density or density <= 0:
+        return IN_GROUP_PITCH_M
+    return math.sqrt(2.0 / (math.sqrt(3.0) * density))
+
+
+def group_rationale(species) -> str:
+    """Обоснование куртины: откуда взят шаг."""
+    density = getattr(species, "density_per_m2", None)
+    if not density or density <= 0:
+        return GROUP_RATIONALE_PREFIX
+    return (
+        f"{GROUP_RATIONALE_PREFIX} Плотность не выше {density:g} шт/м² "
+        f"({GROUP_DENSITY_SOURCE}), шаг {group_pitch_for(species):.2f} м."
+    )
 
 # Интервал внутри рядовой посадки (живой изгороди) для типов, чей обычный
 # интервал (`type_norms.spacing_for`) настроен под другой паттерн, а не под
@@ -913,7 +940,6 @@ def _plan_type_items(
         # обычному: иначе greedy_select, буферизующий каждую точку на
         # canopy_radius_m от одиночной посадки, прорядил бы группу до той
         # же россыпи, ради ухода от которой она и делается.
-        group_norms = type_norms.with_spacing_override(planting_type, IN_GROUP_PITCH_M)
         # Куртина не должна перекрыть только что поставленную изгородь — тот
         # же класс проблемы, что и у россыпи после ряда ниже (свой
         # пространственный индекс на каждую фазу, общей памяти нет).
@@ -935,11 +961,14 @@ def _plan_type_items(
         # центров 14 м), так что общий отбор между ними не нужен.
         for index, disc in enumerate(discs):
             disc_species = species if override else _palette_pick(palette, index)
+            pitch = group_pitch_for(disc_species)
+            group_norms = type_norms.with_spacing_override(planting_type, pitch)
+            prefix = group_rationale(disc_species)
             clumps = fill_group(
                 disc,
                 exclusion,
                 planting_type,
-                IN_GROUP_PITCH_M,
+                pitch,
                 seed + index,
                 zoning_zones=zones,
                 exclusion_index=exclusion_index,
@@ -948,7 +977,7 @@ def _plan_type_items(
             if not clumps:
                 continue
             for item in greedy_select(clumps, score_fn, group_norms):
-                item.rationale = f"{GROUP_RATIONALE_PREFIX} {item.rationale}"
+                item.rationale = f"{prefix} {item.rationale}"
                 if disc_species is not None:
                     item.species = disc_species.name
                 group_items.append(item)
@@ -1187,7 +1216,10 @@ def _equivalence_key(species: Species, planting_type: str, norms: PlantingNorms,
         for object_type in sorted(norms.setbacks_m)
     )
     interval = catalogue.spacing_for_crown(species.crown) if planting_type in CROWN_SPACING_TYPES else None
-    return setbacks + (interval,)
+    # Шаг в куртине по плотности 515-ПП: замена породы на ту, чья плотность
+    # ниже, сделала бы уже расставленную куртину плотнее нормы.
+    group_pitch = round(group_pitch_for(species), 3) if planting_type in GROUP_PLANTING_TYPES else None
+    return setbacks + (interval, group_pitch)
 
 
 def _diversify_species(
