@@ -434,6 +434,26 @@ class TestInvalidUtilityGeometry:
         line = LineString([(0, 0), (10, 0)])
         assert repaired_for_buffering([line])[0].geom_type == "LineString"
 
+    # Канализация с «3. 3-я Парковая» (сдвинута к началу координат, до 1 мм):
+    # первый отрезок идёт вперёд и тем же путём назад. Линия валидна, но
+    # налегает сама на себя, и её буфер выходил обрывком — дыра в зоне отступов.
+    _BACKTRACKING_SEWER = "LINESTRING (0.544 0.334, 0.555 0.025, 0.544 0.334, 0.547 0.371, 0.562 0.418, 0.574 0.45, 0.594 0.476, 0.616 0.5, 0.634 0.517, 0.659 0.531, 0.679 0.539, 0.704 0.544, 1.289 0.565, 1.316 0.562, 1.344 0.556, 1.377 0.537, 1.408 0.512, 1.429 0.486, 1.449 0.45, 1.462 0.409, 1.47 0.379, 1.474 0.34, 1.483 0.063, 1.474 0.34, 1.47 0.379, 1.462 0.409, 1.449 0.45, 1.429 0.486, 1.408 0.512, 1.377 0.537, 1.344 0.556, 1.316 0.562, 1.289 0.565, 0.704 0.544, 0.679 0.539, 0.659 0.531, 0.634 0.517, 0.616 0.5, 0.594 0.476, 0.574 0.45, 0.562 0.418, 0.547 0.371, 0.544 0.334)"
+
+    def test_a_self_overlapping_line_gets_its_full_buffer(self):
+        from shapely import wkt
+        from shapely.geometry import Point
+
+        from geo_engine.buffers import repaired_for_buffering
+
+        line = wkt.loads(self._BACKTRACKING_SEWER)
+        shrub = Point(2.012, 0.156)  # куст изгороди в 0,53 м от трубы
+        assert line.is_valid and not line.is_simple
+        assert not line.buffer(1.0, quad_segs=32).covers(shrub), "фикстура обязана воспроизводить обрыв буфера"
+
+        [fixed] = repaired_for_buffering([line])
+
+        assert fixed.buffer(1.0, quad_segs=32).covers(shrub)
+
     def test_the_exclusion_covers_the_setback_around_a_broken_utility(self):
         from geo_engine.buffers import build_exclusion_zone, repaired_for_buffering
         from geo_engine.model import Utility

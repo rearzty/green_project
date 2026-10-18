@@ -111,14 +111,28 @@ def repaired_for_buffering(geometries: list[BaseGeometry]) -> list[BaseGeometry]
     `valid_polygonal_union()`: сеть — это чаще всего линия, и буфер вокруг
     линии и есть её охранная зона. Отбросить линейное значило бы потерять
     почти все сети разом.
+
+    Второй случай того же класса — линия ВАЛИДНАЯ, но налегает сама на себя
+    (`is_simple` ложно): живьём на «3. 3-я Парковая» канализация шла отрезком
+    вперёд и тем же отрезком назад. `buffer()` такой линии тоже не падает, а
+    возвращает обрывок (1,4 м² вместо ~10 м² на 3,6 м трубы при отступе 1 м),
+    и два куста изгороди встали в 0,53 и 0,59 м при требуемом метре. На улице
+    таких сетей 850 из 62 427 линий, у 78 буфер выходил урезанным.
+    `unary_union` разрезает линию в местах наложения и склеивает совпадающие
+    участки — буфер получается полным.
     """
     if not geometries:
         return []
     array = np.array(geometries, dtype=object)
     healthy = shapely.is_valid(array)
-    if healthy.all():
+    linear = np.isin(shapely.get_type_id(array), (1, 5))  # LineString, MultiLineString
+    overlapping = linear & healthy & ~shapely.is_simple(array)
+    if healthy.all() and not overlapping.any():
         return geometries
-    return list(np.where(healthy, array, shapely.make_valid(array)))
+    repaired = np.where(healthy, array, shapely.make_valid(array))
+    if overlapping.any():
+        repaired[overlapping] = shapely.union_all(array[overlapping][:, None], axis=1)
+    return list(repaired)
 
 
 def build_exclusion_zone(
