@@ -106,6 +106,9 @@ class SelectedItemFacts:
     ranking_rationale: str = ""
     # Ближайшие к пределу ограничения — по запасу до нормы, самые жёсткие первыми.
     checks: list[CheckFacts] = field(default_factory=list)
+    # Правили ли её руками (перенос, смена типа); None — неизвестно. Без этого
+    # Юна объясняла любое нарушение «ручной правкой», даже у нетронутой посадки.
+    is_manual_edit: bool | None = None
 
 
 @dataclass
@@ -126,6 +129,10 @@ class PlanFacts:
     lawn_area_m2: float = 0.0
     budgets: list[BudgetFacts] = field(default_factory=list)
     selected: SelectedItemFacts | None = None
+    # Сколько посадок изменено вручную (перенос, смена типа); None — неизвестно
+    # (план не материализован). Нужно ответу «почему нарушения?»: валить их на
+    # ручные правки можно, только когда правки были.
+    manual_edits: int | None = None
 
     def count(self, planting_type: str) -> int:
         return self.counts.get(planting_type, 0)
@@ -182,12 +189,14 @@ def _selected_item(project: Project, plan: Plan, item_id: str) -> SelectedItemFa
         return None
     _, record = records[0]
     checks = sorted(record.checks, key=lambda c: c.actual_m - c.required_m)[:_MAX_CHECKS]
+    row = next((item for item in plan.items if item.id == item_id), None)
     return SelectedItemFacts(
         planting_type=record.planting_type,
         species=record.species,
         compliant=record.compliant,
         summary=record.summary,
         ranking_rationale=record.ranking_rationale,
+        is_manual_edit=row.is_manual_edit if row is not None else None,
         checks=[
             CheckFacts(
                 object_type=c.object_type,
@@ -229,6 +238,7 @@ def build_plan_facts(project: Project, plan_id: str, selected_item_id: str | Non
         facts.lawn_area_m2 = sum(
             float(getattr(item.geometry, "area", 0.0) or 0.0) for item in plan.items if item.planting_type == "lawn"
         )
+        facts.manual_edits = sum(1 for item in plan.items if item.is_manual_edit)
     if selected_item_id:
         facts.selected = _selected_item(project, plan, selected_item_id)
     return facts
@@ -253,6 +263,8 @@ def _render_summary(facts: PlanFacts) -> list[str]:
                 schemes.append(f"из них в покрытии тротуара {type_facts.in_paving}")
             lines.append(f"- {TYPE_LABELS[planting_type]}: " + ", ".join(schemes))
             lines.append("  породы: " + ", ".join(f"{name} {n}" for name, n in type_facts.species[:_MAX_SPECIES]))
+        if facts.manual_edits is not None:
+            lines.append(f"- изменено вручную (перенос, смена типа): {facts.manual_edits}")
     for budget in facts.budgets:
         label = TYPE_LABELS.get(budget.planting_type, budget.planting_type)
         blockers = ", ".join(f"{b.label} — {round(100 * b.share)} %" for b in budget.blockers[:_MAX_BLOCKERS])
@@ -264,9 +276,10 @@ def _render_summary(facts: PlanFacts) -> list[str]:
 
 
 def _render_selected(selected: SelectedItemFacts) -> list[str]:
+    edited = {True: ", изменена вручную", False: ", ручных правок нет"}.get(selected.is_manual_edit, "")
     lines = [
         f"Выделенная на карте посадка: {TYPE_LABELS.get(selected.planting_type, selected.planting_type)}, "
-        f"{selected.species}, {'соответствует нормам' if selected.compliant else 'НАРУШАЕТ нормы'}.",
+        f"{selected.species}, {'соответствует нормам' if selected.compliant else 'НАРУШАЕТ нормы'}{edited}.",
         f"- {selected.summary}",
     ]
     if selected.ranking_rationale:

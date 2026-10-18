@@ -127,7 +127,8 @@ def test_tool_call_builds_action_and_keeps_untouched_fields(llm):
     assert action.tree_spacing_m == 7.0
     assert action.shrub_spacing_m == CURRENT.shrub_spacing_m
     assert action.planting_types == CURRENT.planting_types
-    assert reply == "Интервал деревьев 5 → 7 м, перестраиваю план."  # filled in when the model gave no text
+    # Filled in when the model gave no text; a tree interval is a floor over the crown-class norm.
+    assert reply == "Интервал деревьев — не меньше 7 м вместо 5 (широким кронам норма — 8 м), перестраиваю план."
 
 
 def test_tool_call_arguments_are_clamped_to_valid_bounds(llm):
@@ -266,7 +267,7 @@ class TestSeveralToolCalls:
             ("ui_action", {"command": "show_3d"}),
         ]))
 
-        _reply, actions = _ask("кусты пореже, покажи нарушения в 3D", violations_count=2)
+        _reply, actions = _ask("кусты пореже, покажи нарушения в 3D", violations_count=2, facts=PLAN)
 
         assert [a.type for a in actions] == ["settings", "select", "ui"]
         assert actions[1] == SelectCommand(target="violations")
@@ -286,7 +287,9 @@ class TestSeveralToolCalls:
         assert [a.type for a in actions] == ["settings", "ui"]
         action = _settings_of(actions)
         assert action.tree_spacing_m == 7.0 and action.tree_rows == 2
-        assert reply.startswith("Интервал деревьев 5 → 7 м, деревья двумя рядами, перестраиваю план.")
+        assert reply.startswith(
+            "Интервал деревьев — не меньше 7 м вместо 5 (широким кронам норма — 8 м), деревья двумя рядами, перестраиваю план."
+        )
 
     def test_calls_with_values_outside_the_enums_are_dropped(self, llm):
         llm(_chat_completion(content="Сделала.", calls=[
@@ -755,3 +758,305 @@ def test_plan_facts_keep_structure_for_the_rules_mode():
     assert facts.budget("tree").blockers[0].object_type == "road"
     assert facts.budget("shrub") is None
     assert facts.tree_rows == 2 and facts.trees_in_paving is True and facts.selected is None
+
+
+NORM = AssistantGenerationSettings(planting_types=["tree", "shrub", "lawn"])  # no own intervals: the plan's real state
+OAKLESS = PlanFacts(
+    plan_id="p", scoring_mode="heuristic", tree_rows=1, trees_in_paving=False, materialized=True, item_count=40,
+    counts={"tree": 30, "lawn": 10}, types={"tree": TypeFacts("tree", 30, species=[("Липа мелколистная", 30)])},
+)
+
+
+class TestAFailedSelectInTheSameAnswer:
+    """The model's select_items was dropped (species not in the plan, nothing
+    to select, a made-up target) -- its edit_selection must not fall back on
+    whatever is selected right now."""
+
+    @pytest.mark.parametrize(
+        "select_args, violations, said",
+        [
+            ({"target": "trees", "species": "Дуб"}, 2, "Породы «Дуб» в плане нет"),
+            ({"target": "violations"}, 0, "Нарушений нет — все посадки проходят по нормам."),
+            ({"target": "violations"}, None, "ещё не готова"),
+            ({"target": "shrubs"}, 2, "Кустов в плане нет — выделять нечего."),
+            ({"target": "everything"}, 2, None),
+        ],
+    )
+    @pytest.mark.parametrize("operation", ["delete", "to_shrub"])
+    def test_the_edit_is_dropped_too(self, llm, select_args, violations, said, operation):
+        llm(_chat_completion(content="Готово, удалила.", calls=[("select_items", select_args), ("edit_selection", {"operation": operation})]))
+
+        reply, actions = _ask("выдели их и удали", facts=OAKLESS, selection=SELECTED, violations_count=violations)
+
+        assert actions == []
+        assert "удалила" not in reply
+        if said:
+            assert said in reply  # the refusal first, then what wasn't done
+        assert reply.endswith("Удалять ничего не стала." if operation == "delete" else "Тип не меняла.")
+
+    def test_a_successful_select_and_a_retype_is_two_steps(self, llm):
+        llm(_chat_completion(content="Сделала их деревьями.", calls=[
+            ("select_items", {"target": "shrubs"}), ("edit_selection", {"operation": "to_tree"}),
+        ]))
+        facts = PlanFacts(plan_id="p", scoring_mode="heuristic", tree_rows=1, trees_in_paving=False, materialized=True,
+                          item_count=120, counts={"shrub": 120})
+
+        reply, actions = _ask("сделай все кусты деревьями", facts=facts, selection=SELECTED)
+
+        assert actions == [SelectCommand(target="shrubs")]
+        assert reply == "Выделила все кусты (120) — скажите «сделай их деревьями», если хотите поменять тип."
+
+
+class TestKnownEmptySelect:
+    def test_selecting_zero_violations_is_said_truthfully(self, llm):
+        llm(_chat_completion(content="Выделила посадки с нарушениями.", calls=[("select_items", {"target": "violations"})]))
+
+        reply, actions = _ask("покажи нарушения", facts=PLAN, violations_count=0)
+
+        assert actions == [] and reply == "Нарушений нет — все посадки проходят по нормам."
+
+    def test_selecting_an_absent_type(self, llm):
+        llm(_chat_completion(content="Выделила все кусты.", calls=[("select_items", {"target": "shrubs"})]))
+
+        reply, actions = _ask("выдели кусты", facts=OAKLESS)
+
+        assert actions == [] and reply == "Кустов в плане нет — выделять нечего."
+
+    def test_violations_that_exist_are_selected(self, llm):
+        llm(_chat_completion(content=None, calls=[("select_items", {"target": "violations"})]))
+
+        reply, actions = _ask("покажи нарушения", facts=PLAN, violations_count=1)
+
+        assert actions == [SelectCommand(target="violations")] and reply == "Выделила 1 нарушение."
+
+
+class TestQuestionsInTheModelPath:
+    """A model may obey «можно удалить выделенные?» literally: the code drops
+    the edit and answers with what would happen."""
+
+    @pytest.mark.parametrize("message", ["можно удалить выделенные?", "что будет, если удалить выделенные?", "а если удалить их"])
+    def test_a_question_never_deletes(self, llm, message):
+        llm(_chat_completion(content="Удаляю выделенные.", calls=[("edit_selection", {"operation": "delete"})]))
+
+        reply, actions = _ask(message, facts=PLAN, selection=SELECTED)
+
+        assert actions == []
+        assert reply == (
+            "Если удалить выделенное (3 объекта), оно исчезнет из плана — вернуть можно Ctrl+Z. "
+            "Чтобы удалить, скажите «удали выделенные»."
+        )
+
+    def test_a_retype_question(self, llm):
+        llm(_chat_completion(content=None, calls=[("edit_selection", {"operation": "to_tree"})]))
+
+        reply, actions = _ask("что будет, если сделать их деревьями?", facts=PLAN, selection=SELECTED)
+
+        assert actions == [] and "могут появиться нарушения" in reply and "«сделай их деревьями»" in reply
+
+    def test_a_plain_request_next_to_a_question_goes_through(self, llm):
+        llm(_chat_completion(content=None, calls=[("edit_selection", {"operation": "delete"})]))
+
+        _reply, actions = _ask("удали выделенные. А сколько кустов?", facts=PLAN, selection=SELECTED)
+
+        assert actions == [EditSelectionCommand(operation="delete")]
+
+
+class TestDeselectAndEditInOneAnswer:
+    def test_neither_runs_and_the_selection_stays(self, llm):
+        llm(_chat_completion(content="Сняла выделение и удалила.", calls=[
+            ("select_items", {"target": "none"}), ("edit_selection", {"operation": "delete"}),
+        ]))
+
+        reply, actions = _ask("сними выделение и удали", facts=PLAN, selection=SELECTED)
+
+        assert actions == []
+        assert reply.startswith("Не поняла: удалить выделенное или только снять выделение? Выделено 3 объекта")
+        assert "ничего не выделено" not in reply
+
+
+class TestIntervalSemantics:
+    """A tree interval is a floor over the crown-class norm (3/5/8 m), shrubs
+    are mostly a 0.5 m hedge -- what the model is told, and what the code
+    holds when the model computes from the old 5 m / 3 m defaults anyway."""
+
+    def test_the_prompt_and_the_context_tell_the_real_intervals(self, llm):
+        llm(_chat_completion(content="Ок."), client=_RecordingClient)
+
+        _ask("какой интервал?", current=NORM)
+
+        system = _RecordingClient.sent["json"]["messages"][0]["content"]
+        assert "{" not in system.split("Текущие настройки")[0]  # every placeholder filled in
+        assert "широкая крона — 8 м, средняя — 5 м, узкая — 3 м" in system
+        assert "интервал деревьев = не задан — по норме класса кроны" in system
+        assert "интервал кустарников = не задан — живая изгородь 0.5 м" in system
+        assert "поставь 7 м" in system and "шагом 0.5 м" in system
+
+    def test_an_own_tree_floor_is_told_as_a_floor(self, llm):
+        llm(_chat_completion(content="Ок."), client=_RecordingClient)
+
+        _ask("какой интервал?", current=AssistantGenerationSettings(planting_types=["tree"], tree_spacing_m=7.0, shrub_spacing_m=0.7))
+
+        system = _RecordingClient.sent["json"]["messages"][0]["content"]
+        assert "интервал деревьев = не меньше 7.0 м" in system and "интервал кустарников = 0.7 м (шаг живой изгороди)" in system
+
+    def test_default_spacing_is_the_crown_norm_and_the_hedge(self):
+        assert assistant_service.default_spacing() == {"tree": 5.0, "shrub": 0.5}
+
+    @pytest.mark.parametrize("tree", [3.5, 2.0, 3.0])
+    def test_denser_trees_at_the_norm_change_nothing_whatever_the_model_sends(self, llm, tree):
+        # 3.5 m (the old «5 m × 0.7») only thins the narrow crowns out; 3 m and
+        # below moves no tree at all.
+        llm(_chat_completion(content="Сделала деревья гуще.", calls=[("update_generation_settings", {"tree_spacing_m": tree})]))
+
+        reply, actions = _ask("сделай деревья погуще", current=NORM, facts=PLAN)
+
+        assert actions == []
+        assert reply.startswith("Гуще нормы деревья не поставить") and "гуще." not in reply
+        assert "«деревья двумя рядами»" in reply
+
+    def test_the_norm_answer_keeps_the_rest_of_the_call(self, llm):
+        llm(_chat_completion(content=None, calls=[("update_generation_settings", {"tree_spacing_m": 3.5, "tree_rows": 2})]))
+
+        reply, actions = _ask("деревья погуще, двумя рядами", current=NORM, facts=PLAN)
+
+        settings_ = _settings_of(actions)
+        assert settings_.tree_spacing_m is None and settings_.tree_rows == 2
+        assert "Гуще нормы деревья не поставить" in reply and reply.endswith("Деревья двумя рядами, перестраиваю план.")
+
+    def test_a_floor_that_reaches_the_norm_is_dropped(self, llm):
+        llm(_chat_completion(content=None, calls=[("update_generation_settings", {"tree_spacing_m": 2.8})]))
+
+        reply, actions = _ask("деревья погуще", current=AssistantGenerationSettings(planting_types=["tree"], tree_spacing_m=4.0))
+
+        assert _settings_of(actions).tree_spacing_m is None
+        assert reply == "Интервал деревьев — по норме класса кроны (3–8 м), перестраиваю план."
+
+    def test_denser_shrubs_from_the_old_3_m_default_are_corrected(self, llm):
+        # 3 m × 0.7 = 2.1 m would make the 0.5 m hedge four times sparser.
+        llm(_chat_completion(content="Сделала кусты гуще.", calls=[("update_generation_settings", {"shrub_spacing_m": 2.1})]))
+
+        _reply, actions = _ask("кусты погуще", current=NORM, facts=PLAN)
+
+        assert _settings_of(actions).shrub_spacing_m == 0.35
+
+    def test_a_model_number_in_the_right_direction_stands(self, llm):
+        llm(_chat_completion(content=None, calls=[("update_generation_settings", {"shrub_spacing_m": 0.8, "tree_spacing_m": 6.0})]))
+
+        reply, actions = _ask("кусты и деревья пореже", current=NORM, facts=PLAN)
+
+        settings_ = _settings_of(actions)
+        assert (settings_.shrub_spacing_m, settings_.tree_spacing_m) == (0.8, 6.0)
+        assert reply.startswith("Интервал деревьев — не меньше 6 м (широким кронам норма — 8 м)")
+
+
+SHRUBBY = PlanFacts(
+    plan_id="p", scoring_mode="heuristic", tree_rows=1, trees_in_paving=False, materialized=True, item_count=150,
+    counts={"shrub": 120, "tree": 30},
+    types={"tree": TypeFacts("tree", 30, species=[("Липа мелколистная", 30)]), "shrub": TypeFacts("shrub", 120, species=[("Спирея японская", 120)])},
+)
+CONFIRM_SHRUBS = "Выделила все кусты (120) — скажите «удали выделенные», если хотите удалить."
+
+
+class TestDeleteAGroupIsOneMeaning:
+    """«Удали все кусты» is select + confirm in both modes. Seen live on GLM-5.3
+    Flash: the shrubs removed from the recipe instead (1 in 4), or selected
+    with no word about confirming."""
+
+    def test_the_parser_agrees_with_the_model_so_no_second_turn(self, llm, monkeypatch):
+        _ScriptedClient.sent = []
+        _ScriptedClient.script = [_chat_completion(content="Выделила все кустарники на карте — их 120 штук.",
+                                                   calls=[("select_items", {"target": "shrubs"})])]
+        monkeypatch.setattr(assistant_service.httpx, "AsyncClient", _ScriptedClient)
+
+        reply, actions = _ask("удали все кусты", facts=SHRUBBY, selection=SELECTED)
+
+        assert actions == [SelectCommand(target="shrubs")] and len(_ScriptedClient.sent) == 1
+        assert reply == CONFIRM_SHRUBS  # the confirmation is always asked for
+
+    @pytest.mark.parametrize(
+        "calls",
+        [
+            [("update_generation_settings", {"planting_types": ["tree", "lawn"]})],
+            [("edit_selection", {"operation": "delete"})],
+            [("select_items", {"target": "shrubs"}), ("update_generation_settings", {"planting_types": ["tree", "lawn"]})],
+        ],
+    )
+    def test_any_other_answer_gives_way_to_the_two_steps(self, llm, calls):
+        llm(_chat_completion(content="Убираю кустарник из плана:", calls=calls))
+
+        reply, actions = _ask("удали все кусты", facts=SHRUBBY, selection=SELECTED)
+
+        assert actions == [SelectCommand(target="shrubs")] and reply == CONFIRM_SHRUBS
+
+    def test_mass_retype_too(self, llm):
+        llm(_chat_completion(content=None, calls=[("edit_selection", {"operation": "to_tree"})]))
+
+        reply, actions = _ask("сделай все кусты деревьями", facts=SHRUBBY, selection=SELECTED)
+
+        assert actions == [SelectCommand(target="shrubs")]
+        assert reply == "Выделила все кусты (120) — скажите «сделай их деревьями», если хотите поменять тип."
+
+    def test_the_recipe_wording_is_still_the_recipe(self, llm):
+        llm(_chat_completion(content=None, calls=[("update_generation_settings", {"planting_types": ["tree", "lawn"]})]))
+
+        reply, actions = _ask("убери кусты из плана", facts=SHRUBBY, selection=SELECTED)
+
+        assert _settings_of(actions).planting_types == ["tree", "lawn"] and reply == "Без кустов, перестраиваю план."
+
+    def test_a_pronoun_after_a_count_is_the_counted_group(self, llm):
+        # «Их» are the shrubs just counted; the reply keeps the count too.
+        llm(_chat_completion(content="Удаляю их.", calls=[("select_items", {"target": "shrubs"})]))
+
+        reply, actions = _ask("сколько кустов? удали их", facts=SHRUBBY, selection=SELECTED)
+
+        assert actions == [SelectCommand(target="shrubs")]
+        assert reply.startswith("Кустов в плане 120.") and reply.endswith(CONFIRM_SHRUBS)
+
+    def test_a_bare_delete_for_an_absent_species_never_hits_the_selection(self, llm):
+        llm(_chat_completion(content="Удаляю дубы.", calls=[("edit_selection", {"operation": "delete"})]))
+
+        reply, actions = _ask("удали дубы", facts=SHRUBBY, selection=SELECTED)
+
+        assert actions == [] and reply.startswith("Породы «Дуб черешчатый» в плане нет")
+
+
+class TestLeadInReplies:
+    def test_a_reply_that_only_leads_in_to_the_calls_is_replaced(self, llm):
+        llm(_chat_completion(content="Конечно, выделяю посадки с нарушениями нормативов:",
+                             calls=[("select_items", {"target": "violations"})]))
+
+        reply, _ = _ask("покажи нарушения", facts=PLAN, violations_count=4)
+
+        assert reply == "Выделила 4 нарушения."
+
+    def test_offers_at_the_tree_norm_are_offered_not_applied(self, llm):
+        # Seen live 1 in 4: «погуще» answered by switching two rows and trees in
+        # paving on unasked, with «включу двухрядную аллею … :».
+        llm(_chat_completion(content="Гуще нельзя, зато включу двухрядную аллею и деревья в тротуаре:",
+                             calls=[("update_generation_settings", {"tree_rows": 2, "trees_in_paving": True})]))
+
+        reply, actions = _ask("сделай деревья погуще", current=NORM, facts=PLAN)
+
+        assert actions == [] and reply.startswith("Гуще нормы деревья не поставить") and "«деревья двумя рядами»" in reply
+
+
+def test_plan_facts_count_manual_edits_so_violations_are_not_blamed_on_them_blindly():
+    from shapely.geometry import Point
+
+    from backend.app.db.models import Plan, PlantingItemRow, Project
+    from backend.app.services.assistant_context import build_plan_facts, render_plan_facts
+
+    project = Project(name="t")
+    plan = Plan(project_id=project.id, planting_types=["tree"])
+    plan.items = [
+        PlantingItemRow(plan_id=plan.id, geometry=Point(0, 0), planting_type="tree", species="Липа", is_manual_edit=True),
+        PlantingItemRow(plan_id=plan.id, geometry=Point(9, 0), planting_type="tree", species="Липа"),
+    ]
+    project.plans = [plan]
+
+    facts = build_plan_facts(project, plan.id)
+
+    assert facts.manual_edits == 1
+    assert "- изменено вручную (перенос, смена типа): 1" in render_plan_facts(facts)
+    plan.materialized, plan.items = False, []
+    assert build_plan_facts(project, plan.id).manual_edits is None  # unknown, not «none»

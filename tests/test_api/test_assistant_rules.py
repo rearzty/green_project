@@ -41,7 +41,7 @@ from backend.app.services.assistant_rules import (
     split_clauses,
 )
 
-DEFAULTS = {"tree": 5.0, "shrub": 3.0}
+DEFAULTS = {"tree": 5.0, "shrub": 0.5}
 NOTHING = AssistantSelection(count=0)
 THREE = AssistantSelection(count=3, trees=1, shrubs=2)
 
@@ -146,11 +146,18 @@ class TestHelpAndFallback:
 
     def test_greeting_with_a_request_does_the_request(self):
         reply, actions = ask("Юна, привет! Сделай кусты пореже")
-        assert reply == "Привет! Интервал кустов 3 → 4,2 м, перестраиваю план."
-        assert recipe(actions).shrub_spacing_m == 4.2
+        assert reply == "Привет! Интервал кустов в живой изгороди 0,5 → 0,7 м, перестраиваю план."
+        assert recipe(actions).shrub_spacing_m == 0.7
 
     def test_thanks(self):
         assert ask("спасибо!")[0].startswith("Пожалуйста")
+
+    @pytest.mark.parametrize("message", ["спасибо, удачи!", "удачи!", "до свидания"])
+    def test_farewell_is_answered_and_never_edits(self, message):
+        # «Спасибо, удачи!» used to be typo-corrected into «спасибо, удали!» and
+        # deleted the three selected objects.
+        reply, actions = ask(message, selection=THREE)
+        assert actions == [] and reply.startswith(("Пожалуйста", "Спасибо"))
 
     @pytest.mark.parametrize("message", ["расскажи анекдот", "какая погода в Москве?", "ок", "", "   ", "!!!", "🙂🙂", "ы" * 5000])
     def test_unknown_gets_the_fallback_that_says_it_is_basic_mode(self, message):
@@ -190,12 +197,33 @@ class TestWhyFew:
         assert "В плане 120 кустов" in reply and "9 000 м²" in reply and "14,8 %" in reply
         assert "тротуар" not in reply
 
-    def test_roomy_plot_points_at_the_interval_not_the_norms(self):
+    def test_roomy_plot_offers_the_planting_schemes_not_a_denser_interval(self):
+        # Trees already stand at their crown-class norm: «почаще» would change
+        # nothing, so the advice is what can add trees -- and only what is off.
         facts = _facts(budgets=[BudgetFacts("tree", 3611.0, 8000.0, 0.451, [BlockerFacts("building", "стена здания", 0.23)])])
         reply, _ = ask("почему так мало деревьев?", facts=facts)
         assert "3 611 м² из 8 000 м² (45,1 % участка)" in reply
-        assert "«деревья почаще»" in reply
-        assert "норматив" not in reply and "тротуар" not in reply
+        assert "гуще нормы класса кроны их не поставить" in reply
+        assert "«деревья двумя рядами»" in reply and "«разреши деревья в тротуаре»" in reply
+        assert "почаще" not in reply and "норматив" not in reply
+
+        reply, _ = ask("почему так мало деревьев?", facts=facts, settings=_settings(tree_rows=2))
+        assert "двумя рядами" not in reply and "«разреши деревья в тротуаре»" in reply
+
+    def test_roomy_plot_with_a_user_floor_suggests_lowering_it(self):
+        facts = _facts(budgets=[BudgetFacts("tree", 3611.0, 8000.0, 0.451, [])])
+        reply, _ = ask("почему так мало деревьев?", facts=facts, settings=_settings(tree_spacing_m=7.0))
+        assert "не меньше 7 м" in reply and "«деревья почаще»" in reply
+
+    def test_roomy_shrubs_get_the_hedge_hint(self):
+        facts = _facts(budgets=[BudgetFacts("shrub", 9000.0, 20000.0, 0.45, [])])
+        assert "живая изгородь станет гуще" in ask("почему так мало кустов?", facts=facts)[0]
+        assert "изгородь" not in ask("почему так мало кустов?", facts=facts, settings=_settings(shrub_spacing_m=0.3))[0]
+
+    def test_a_pruned_plan_does_not_claim_there_are_no_trees(self):
+        facts = _facts(materialized=False, counts={}, types={})
+        reply, _ = ask("почему так мало деревьев?", facts=facts)
+        assert "нет" not in reply.split(":")[0] and reply.startswith("Под деревья по нормам остаётся 204 м²")
 
     def test_a_type_switched_off_in_the_settings_is_named_as_the_reason(self):
         facts = _facts(counts={"shrub": 120}, types={})
@@ -235,11 +263,36 @@ class TestWhyHere:
         assert actions == []
         assert reply.startswith("Липа мелколистная (дерево) стоит по нормам.")
         assert "край проезжей части: нужно 2 м, здесь 2,35 м (СП 42.13330.2016, п. 9.6, таблица 9.1)" in reply
-        assert "Место выбрано так: Рядовая посадка вдоль линейного ориентира." in reply
+        # Mid-sentence, so lower case; the card's real section title, not «Почему здесь?».
+        assert "Место выбрано так: рядовая посадка вдоль линейного ориентира." in reply
+        assert reply.endswith("Все отступы — в карточке посадки, раздел «Почему здесь можно».")
 
     def test_violating_item_names_the_broken_setback_with_a_short_act(self):
         reply, _ = ask("почему здесь?", facts=_facts(selected=self.VIOLATING), selection=AssistantSelection(count=1, trees=1))
         assert "нарушает нормы: газопровод — нужно 2,4 м, а здесь 1 м (743-ПП, п. 3.6.3, таблица 3.6.1)" in reply
+        assert "раздел «Нормативные отступы»" in reply
+
+    def test_a_violation_is_blamed_on_a_manual_edit_only_when_there_was_one(self):
+        from dataclasses import replace
+
+        selection = AssistantSelection(count=1, trees=1)
+        untouched = ask("почему здесь?", facts=_facts(selected=replace(self.VIOLATING, is_manual_edit=False)), selection=selection)[0]
+        edited = ask("почему здесь?", facts=_facts(selected=replace(self.VIOLATING, is_manual_edit=True)), selection=selection)[0]
+        assert "вручную" not in untouched and "правк" not in untouched
+        assert "Посадку правили вручную" in edited
+
+    def test_distances_are_rounded_like_the_card(self):
+        from dataclasses import replace
+
+        far = CheckFacts("building", "стена здания", 5.0, 14.16, True, "СП 42.13330.2016", "п. 9.6, таблица 9.1")
+        reply, _ = ask("почему здесь?", facts=_facts(selected=replace(self.COMPLIANT, checks=[far])),
+                       selection=AssistantSelection(count=1, trees=1))
+        assert "здесь 14,2 м" in reply  # InspectorCard.tsx `meters`: one digit from 10 m up
+
+    def test_a_lawn_has_no_species_name(self):
+        lawn = SelectedItemFacts(planting_type="lawn", species="default", compliant=True, summary="Газон: допустимо.")
+        reply, _ = ask("почему здесь?", facts=_facts(selected=lawn), selection=AssistantSelection(count=1, lawns=1))
+        assert reply.startswith("Этот участок газона стоит по нормам") and "default" not in reply
 
     def test_nothing_selected_asks_to_select_one(self):
         reply, _ = ask("почему эта посадка здесь?")
@@ -286,7 +339,12 @@ class TestCounts:
     def test_settings_summary(self):
         reply, actions = ask("какие сейчас настройки?", settings=_settings(tree_spacing_m=7.0))
         assert actions == []
-        assert "интервал деревьев 7 м, кустов 3 м (по умолчанию)" in reply and "режим эвристики" in reply
+        assert "интервал деревьев — не меньше 7 м, кустов — живая изгородь 0,5 м (по умолчанию)" in reply
+        assert "режим эвристики" in reply
+
+    def test_settings_summary_without_own_intervals_tells_the_norm(self):
+        reply, _ = ask("какие сейчас настройки?")
+        assert "интервал деревьев — по норме класса кроны (МГСН 1.02-02 п. 4.2.9.2: широкая крона — 8 м" in reply
 
 
 class TestViolations:
@@ -304,10 +362,23 @@ class TestViolations:
         reply, actions = ask("покажи нарушения", violations=None)
         assert actions == [] and "ещё не готова" in reply
 
-    def test_why_violations_explains_and_selects(self):
-        reply, actions = ask("почему нарушения?", violations=2)
+    def test_why_violations_names_manual_edits_when_there_are_some(self):
+        reply, actions = ask("почему нарушения?", violations=2, facts=_facts(manual_edits=3))
         assert actions == [SelectCommand(target="violations")]
-        assert "после ручной правки" in reply
+        assert "3 посадки в плане изменены вручную" in reply
+
+    def test_why_violations_does_not_blame_edits_that_never_happened(self):
+        reply, actions = ask("почему нарушения?", violations=2, facts=_facts(manual_edits=0))
+        assert actions == [SelectCommand(target="violations")]
+        assert "Ручных правок в плане нет" in reply and "изменены вручную" not in reply
+        # Unknown (old facts): no cause is made up, the card shows it.
+        reply, _ = ask("почему нарушения?", violations=2)
+        assert "правк" not in reply and reply.startswith("Выделила 2 нарушения.")
+
+    def test_one_violation_is_not_any_of_many(self):
+        reply, _ = ask("покажи нарушения", violations=1)
+        assert reply == "Выделила 1 нарушение. Какой отступ нарушен — в карточке посадки."
+        assert "по любому" in ask("покажи нарушения", violations=3)[0]
 
 
 # --- Generation settings --------------------------------------------------------
@@ -320,17 +391,75 @@ class TestSpacing:
          "меньше кустов", "увеличь интервал кустов"],
     )
     def test_sparser_shrubs(self, message):
+        # Without an own interval the shrubs are a hedge at 0,5 m
+        # (planner.IN_ROW_PITCH_M), not planting_norms.yaml's 3 m.
         reply, actions = ask(message)
-        assert recipe(actions).shrub_spacing_m == 4.2
-        assert reply == "Интервал кустов 3 → 4,2 м, перестраиваю план."
+        assert recipe(actions).shrub_spacing_m == 0.7
+        assert reply == "Интервал кустов в живой изгороди 0,5 → 0,7 м, перестраиваю план."
+
+    def test_denser_shrubs_down_to_the_low_hedge_bound(self):
+        reply, actions = ask("кусты погуще")
+        assert recipe(actions).shrub_spacing_m == 0.35 and "0,5 → 0,35 м" in reply
+        assert recipe(ask("кусты погуще", settings=_settings(shrub_spacing_m=0.35))[1]).shrub_spacing_m == 0.3
+        reply, actions = ask("кусты погуще", settings=_settings(shrub_spacing_m=0.3))
+        assert actions == [] and reply == (
+            "Интервал кустов уже минимальный — 0,3 м: нижняя граница 743-ПП табл. 3.6.2 для низкой живой изгороди."
+        )
 
     @pytest.mark.parametrize(
         "message", ["деревья гуще", "погуще деревья", "плотнее деревья", "деревья ближе друг к другу", "больше деревьев",
-                    "уменьши расстояние между деревьями", "посади деревья почаще"],
+                    "уменьши расстояние между деревьями", "посади деревья почаще", "сделай деревья в 2 раза гуще"],
     )
-    def test_denser_trees(self, message):
-        _, actions = ask(message)
-        assert recipe(actions).tree_spacing_m == 3.5
+    def test_denser_trees_without_an_own_interval_change_nothing_and_say_why(self, message):
+        # A user interval is a floor over the crown-class norm: trees can't
+        # stand denser than 3/5/8 m. «5 → 3,5 м» used to be claimed, and
+        # measured on three synthetic plots it changed nothing.
+        reply, actions = ask(message)
+        assert actions == []
+        assert reply.startswith("Гуще нормы деревья не поставить")
+        assert "МГСН 1.02-02 п. 4.2.9.2: широкая крона — 8 м, средняя — 5 м, узкая — 3 м" in reply
+        assert "«деревья двумя рядами»" in reply and "«разреши деревья в тротуаре»" in reply
+
+    def test_the_denser_trees_answer_offers_only_what_is_off(self):
+        reply, _ = ask("деревья гуще", settings=_settings(tree_rows=2))
+        assert "двумя рядами" not in reply and "«разреши деревья в тротуаре»" in reply
+        reply, _ = ask("деревья гуще", settings=_settings(tree_rows=2, trees_in_paving=True))
+        assert reply.endswith("Двухрядная аллея и деревья в покрытии тротуара уже включены.")
+        # Switched on in the same message -- not offered again.
+        reply, actions = ask("деревья погуще и двумя рядами")
+        assert recipe(actions).tree_rows == 2 and "«деревья двумя рядами»" not in reply
+
+    def test_an_own_interval_at_or_below_the_narrow_norm_is_the_norm(self):
+        assert ask("деревья гуще", settings=_settings(tree_spacing_m=3.0))[1] == []
+        assert ask("деревья гуще", settings=_settings(tree_spacing_m=2.0))[0].startswith("Гуще нормы деревья не поставить")
+
+    def test_denser_trees_lower_an_own_floor_and_drop_it_at_the_norm(self):
+        reply, actions = ask("деревья гуще", settings=_settings(tree_spacing_m=6.0))
+        assert recipe(actions).tree_spacing_m == 4.2
+        assert reply == (
+            "Интервал деревьев — не меньше 4,2 м вместо 6 (средним кронам норма — 5 м, широким — 8 м), перестраиваю план."
+        )
+        reply, actions = ask("деревья гуще", settings=_settings(tree_spacing_m=4.0))
+        assert recipe(actions).tree_spacing_m is None  # 2,8 m is below every crown norm
+        assert reply == "Интервал деревьев — по норме класса кроны (3–8 м), перестраиваю план."
+
+    def test_sparser_trees_without_an_own_interval_start_from_the_medium_crown(self):
+        reply, actions = ask("деревья пореже")
+        assert recipe(actions).tree_spacing_m == 7.0
+        assert reply == "Интервал деревьев — не меньше 7 м (широким кронам норма — 8 м), перестраиваю план."
+
+    def test_an_explicit_tree_interval_is_a_floor(self):
+        reply, actions = ask("интервал деревьев 6 м")
+        assert recipe(actions).tree_spacing_m == 6.0
+        assert reply == "Интервал деревьев — не меньше 6 м (широким кронам норма — 8 м), перестраиваю план."
+        assert "кронам" not in ask("интервал деревьев 9 м")[0]  # above every norm: every tree at 9 m
+
+    @pytest.mark.parametrize("message", ["интервал деревьев 2 м", "деревья через 3 метра", "интервал деревьев 0,2 м"])
+    def test_an_explicit_tree_interval_below_the_norm_is_the_norm(self, message):
+        reply, actions = ask(message)
+        assert actions == [] and "это интервал по норме" in reply
+        reply, actions = ask(message, settings=_settings(tree_spacing_m=7.0))
+        assert recipe(actions).tree_spacing_m is None
 
     @pytest.mark.parametrize(
         "message, value",
@@ -353,9 +482,9 @@ class TestSpacing:
         _, actions = ask(message)
         assert recipe(actions).shrub_spacing_m == value
 
-    def test_relative_change_starts_from_the_norms_default_when_spacing_is_unset(self):
+    def test_relative_change_starts_from_the_hedge_pitch_when_spacing_is_unset(self):
         reply, actions = ask("кусты пореже", settings=_settings(shrub_spacing_m=None))
-        assert recipe(actions).shrub_spacing_m == 4.2 and "3 → 4,2" in reply
+        assert recipe(actions).shrub_spacing_m == 0.7 and "0,5 → 0,7" in reply
 
     def test_relative_change_uses_the_defaults_it_is_given(self):
         _, actions = ask("кусты пореже", defaults={"tree": 5.0, "shrub": 2.0})
@@ -363,17 +492,18 @@ class TestSpacing:
 
     def test_relative_change_starts_from_the_current_value(self):
         reply, actions = ask("деревья пореже", settings=_settings(tree_spacing_m=7.0))
-        assert recipe(actions).tree_spacing_m == 9.8 and "7 → 9,8" in reply
+        assert recipe(actions).tree_spacing_m == 9.8 and "не меньше 9,8 м вместо 7" in reply
 
     @pytest.mark.parametrize(
-        "message, field, value",
-        [("интервал деревьев 20 м", "tree_spacing_m", 15.0), ("кусты через 0,1 м", "shrub_spacing_m", 0.3),
-         ("интервал деревьев 0,2 м", "tree_spacing_m", 0.5), ("кусты через 50 метров", "shrub_spacing_m", 10.0)],
+        "message, field, value, said",
+        [("интервал деревьев 20 м", "tree_spacing_m", 15.0, "можно до 15 м"),
+         ("кусты через 0,1 м", "shrub_spacing_m", 0.3, "можно от 0,3 до 10 м"),
+         ("кусты через 50 метров", "shrub_spacing_m", 10.0, "можно от 0,3 до 10 м")],
     )
-    def test_explicit_values_are_clamped_to_the_generate_bounds(self, message, field, value):
+    def test_explicit_values_are_clamped_to_the_generate_bounds(self, message, field, value, said):
         reply, actions = ask(message)
         assert getattr(recipe(actions), field) == value
-        assert "можно от" in reply
+        assert said in reply
 
     def test_already_at_the_limit_changes_nothing(self):
         reply, actions = ask("деревья пореже", settings=_settings(tree_spacing_m=15.0))
@@ -385,8 +515,12 @@ class TestSpacing:
         assert recipe(ask("чуть реже деревья")[1]).tree_spacing_m == 6.0
 
     def test_no_subject_relative_change_applies_to_trees_and_shrubs(self):
-        settings = recipe(ask("посади погуще")[1])
-        assert settings.tree_spacing_m == 3.5 and settings.shrub_spacing_m == 2.1
+        reply, actions = ask("посади погуще")
+        settings = recipe(actions)
+        assert settings.tree_spacing_m is None and settings.shrub_spacing_m == 0.35
+        assert "Гуще нормы деревья не поставить" in reply
+        settings = recipe(ask("посади пореже")[1])
+        assert settings.tree_spacing_m == 7.0 and settings.shrub_spacing_m == 0.7
 
     def test_no_subject_explicit_number_asks_which(self):
         reply, actions = ask("интервал 4 м")
@@ -470,28 +604,30 @@ class TestCombinedRequests:
         reply, actions = ask("кусты пореже и двумя рядами")
         assert len(actions) == 1
         settings = recipe(actions)
-        assert settings.shrub_spacing_m == 4.2 and settings.tree_rows == 2
-        assert reply == "Интервал кустов 3 → 4,2 м, деревья двумя рядами, перестраиваю план."
+        assert settings.shrub_spacing_m == 0.7 and settings.tree_rows == 2
+        assert reply == "Интервал кустов в живой изгороди 0,5 → 0,7 м, деревья двумя рядами, перестраиваю план."
 
     def test_different_changes_for_different_types(self):
         settings = recipe(ask("деревья пореже, а кусты погуще")[1])
-        assert settings.tree_spacing_m == 7.0 and settings.shrub_spacing_m == 2.1
+        assert settings.tree_spacing_m == 7.0 and settings.shrub_spacing_m == 0.35
 
     def test_shared_predicate_for_two_subjects(self):
         for message in ("деревья и кусты пореже", "пореже деревья и кусты"):
             settings = recipe(ask(message)[1])
-            assert settings.tree_spacing_m == 7.0 and settings.shrub_spacing_m == 4.2
+            assert settings.tree_spacing_m == 7.0 and settings.shrub_spacing_m == 0.7
 
     def test_four_changes_at_once(self):
         settings = recipe(ask("кусты погуще, деревья реже, без газона и двумя рядами")[1])
         assert (settings.shrub_spacing_m, settings.tree_spacing_m, settings.planting_types, settings.tree_rows) == (
-            2.1, 7.0, ["tree", "shrub"], 2,
+            0.35, 7.0, ["tree", "shrub"], 2,
         )
 
     def test_settings_and_a_view_switch_keep_their_order(self):
         reply, actions = ask("сделай деревья пореже и покажи в 3D")
         assert [a.type for a in actions] == ["settings", "ui"]
-        assert reply == "Интервал деревьев 5 → 7 м, перестраиваю план. Показываю план в 3D."
+        assert reply == (
+            "Интервал деревьев — не меньше 7 м (широким кронам норма — 8 м), перестраиваю план. Показываю план в 3D."
+        )
 
 
 # --- Selection and edits ---------------------------------------------------------
@@ -582,16 +718,222 @@ class TestSafetyRules:
         assert actions == [SelectCommand(target="all")]
         assert "скажите «удали выделенные»" in reply
 
+
+class TestDeleteAGroupMeansTheMap:
+    """«Удали все кусты» -- one meaning in both modes: select the group, show
+    it, delete on the second request (the model's prompt already said so;
+    rules mode used to regenerate the plan without shrubs). Removing a type
+    from the recipe is «убери кусты», «без кустов», «убери/удали кусты из плана»."""
+
+    @pytest.mark.parametrize(
+        "message, command, said",
+        [
+            ("удали все кусты", SelectCommand(target="shrubs"), "Выделила все кусты (120)"),
+            ("удали кусты", SelectCommand(target="shrubs"), "Выделила все кусты (120)"),
+            ("удали деревья", SelectCommand(target="trees"), "Выделила все деревья (40)"),
+            ("удали газон", SelectCommand(target="lawn"), "Выделила весь газон (12 участков)"),
+            ("удали липы", SelectCommand(target="trees", species="Липа мелколистная"), "Выделила породу «Липа мелколистная»"),
+            ("сотри все спиреи серые", SelectCommand(target="shrubs", species="Спирея серая"), "«Спирея серая»"),
+        ],
+    )
+    def test_select_and_confirm(self, message, command, said):
+        for selection in (NOTHING, THREE):
+            reply, actions = ask(message, selection=selection)
+            assert actions == [command]
+            assert said in reply and "скажите «удали выделенные», если хотите удалить" in reply
+
+    def test_an_absent_species_is_said_and_nothing_is_deleted(self):
+        reply, actions = ask("удали дубы", selection=THREE)
+        assert actions == [] and reply.startswith("Породы «Дуб черешчатый» в плане нет")
+
+    def test_an_absent_type_is_said(self):
+        reply, actions = ask("удали все кусты", selection=THREE, facts=NO_SHRUBS)
+        assert actions == [] and reply == "Кустов в плане нет — выделять нечего."
+
+    @pytest.mark.parametrize(
+        "message, types",
+        [("убери кусты", ["tree", "lawn"]), ("убери все кусты", ["tree", "lawn"]), ("без кустов", ["tree", "lawn"]),
+         ("убери кусты из плана", ["tree", "lawn"]), ("удали кусты из плана", ["tree", "lawn"]),
+         ("удали газон из генерации", ["tree", "shrub"])],
+    )
+    def test_the_recipe_wording_still_changes_the_planting_types(self, message, types):
+        assert recipe(ask(message, selection=THREE)[1]).planting_types == types
+
     def test_guard_drops_edit_without_selection(self):
         kept, dropped = guard_commands([EditSelectionCommand(operation="delete"), UiCommand(command="show_3d")], None)
         assert kept == [UiCommand(command="show_3d")]
         assert [(d.operation, d.reason) for d in dropped] == [("delete", "nothing_selected")]
 
-    def test_guard_drops_delete_next_to_a_select_but_keeps_retype(self):
+    def test_guard_drops_every_edit_next_to_a_select_retype_too(self):
+        # Mass edits are always two steps -- a retype of a group selected in
+        # the same answer used to go through.
         commands = [SelectCommand(target="shrubs"), EditSelectionCommand(operation="delete"), EditSelectionCommand(operation="to_tree")]
         kept, dropped = guard_commands(commands, THREE)
-        assert kept == [SelectCommand(target="shrubs"), EditSelectionCommand(operation="to_tree")]
-        assert [(d.operation, d.reason) for d in dropped] == [("delete", "after_select")]
+        assert kept == [SelectCommand(target="shrubs")]
+        assert [(d.operation, d.reason) for d in dropped] == [("delete", "after_select"), ("to_tree", "after_select")]
+
+    def test_guard_drops_edits_after_a_select_that_failed(self):
+        kept, dropped = guard_commands([EditSelectionCommand(operation="delete")], THREE, select_attempted=True)
+        assert kept == [] and [(d.operation, d.reason) for d in dropped] == [("delete", "select_failed")]
+
+    def test_guard_drops_an_edit_that_was_only_asked_about(self):
+        commands = [EditSelectionCommand(operation="delete"), UiCommand(command="show_3d")]
+        kept, dropped = guard_commands(commands, THREE, asked={"delete"})
+        assert kept == [UiCommand(command="show_3d")] and [d.reason for d in dropped] == ["asked"]
+
+    def test_guard_keeps_the_selection_when_deselect_and_edit_come_together(self):
+        commands = [SelectCommand(target="none"), EditSelectionCommand(operation="delete")]
+        kept, dropped = guard_commands(commands, THREE)
+        assert kept == [] and [d.reason for d in dropped] == ["with_deselect"]
+        # Nothing selected -- nothing to keep, the deselect stays harmless.
+        kept, dropped = guard_commands(commands, NOTHING)
+        assert kept == [SelectCommand(target="none")] and [d.reason for d in dropped] == ["nothing_selected"]
+
+
+NO_SHRUBS = _facts(counts={"tree": 40, "lawn": 12}, types={k: v for k, v in _facts().types.items() if k == "tree"})
+
+
+class TestAFailedSelectNeverEditsTheCurrentSelection:
+    """«Выдели дубы и удали их» without oaks left a bare «удали их», which
+    deleted whatever was selected at the time. Any select attempt in the
+    message -- successful or not -- turns every edit into a confirmation."""
+
+    @pytest.mark.parametrize(
+        "message, facts, violations, said",
+        [
+            ("выдели дубы и удали их", "default", 2, "Породы «Дуб черешчатый» в плане нет"),
+            ("выдели кусты и удали их", NO_SHRUBS, 2, "Кустов в плане нет — выделять нечего."),
+            ("покажи нарушения и удали их", "default", 0, "Нарушений нет"),
+            ("покажи нарушения и удали их", "default", None, "ещё не готова"),
+            ("выдели все липы, а потом удали", "default", 2, None),
+            ("выдели деревья у дороги и удали их", "default", 2, "по месту"),
+            ("выдели и удали", "default", 2, "Что выделить?"),
+        ],
+    )
+    def test_delete(self, message, facts, violations, said):
+        reply, actions = ask(message, selection=THREE, facts=facts, violations=violations)
+        assert not any(isinstance(a, EditSelectionCommand) for a in actions)
+        if said:
+            assert said in reply and reply.endswith("Удалять ничего не стала.")
+
+    @pytest.mark.parametrize("message", ["выдели дубы и сделай их кустами", "выдели дубы, сделай их деревьями"])
+    def test_retype(self, message):
+        reply, actions = ask(message, selection=THREE)
+        assert actions == [] and reply.endswith("Тип не меняла.")
+
+    def test_a_successful_select_asks_for_the_second_step_retype_too(self):
+        reply, actions = ask("выдели все липы и сделай их кустами", selection=THREE)
+        assert actions == [SelectCommand(target="trees", species="Липа мелколистная")]
+        assert "скажите «сделай их кустами»" in reply
+
+    def test_the_selection_itself_is_still_edited_in_one_step(self):
+        assert ask("удали выделенные", selection=THREE)[1] == [EditSelectionCommand(operation="delete")]
+        assert ask("сделай их кустами", selection=AssistantSelection(count=2, trees=2))[1] == [
+            EditSelectionCommand(operation="to_shrub")
+        ]
+
+
+class TestAPronounAfterAQuestionMeansTheGroupAskedAbout:
+    """«Сколько кустов? Удали их» deleted the current selection, though «их»
+    are the shrubs just counted -- now the same two steps as «удали все кусты»."""
+
+    @pytest.mark.parametrize(
+        "message, command, said",
+        [
+            ("сколько кустов? удали их", SelectCommand(target="shrubs"), "скажите «удали выделенные»"),
+            ("сколько лип? сделай их кустами", SelectCommand(target="trees", species="Липа мелколистная"), "«сделай их кустами»"),
+            ("какие породы деревьев? удали их", SelectCommand(target="trees"), "скажите «удали выделенные»"),
+            ("сколько всего посадок? удали их", SelectCommand(target="all"), "скажите «удали выделенные»"),
+            ("сколько нарушений? удали их", SelectCommand(target="violations"), "скажите «удали выделенные»"),
+        ],
+    )
+    def test_select_and_confirm(self, message, command, said):
+        reply, actions = ask(message, selection=THREE)
+        assert actions == [command] and said in reply
+
+    def test_the_violation_count_does_not_offer_what_is_already_done(self):
+        reply, _ = ask("сколько нарушений? удали их", selection=THREE)
+        assert reply == "Выделила 2 нарушения — скажите «удали выделенные», если хотите удалить."
+
+    @pytest.mark.parametrize(
+        "message", ["сколько кустов? удали выделенные", "сколько выделено? удали их", "я выделил деревья, удали их"]
+    )
+    def test_the_selection_is_still_the_selection(self, message):
+        assert ask(message, selection=THREE)[1] == [EditSelectionCommand(operation="delete")]
+
+
+class TestQuestionsAreNotRequests:
+    """The parser strips «?» with the punctuation, so «можно удалить
+    выделенные?» deleted. A question or a condition gets the consequences and
+    the words to say -- never an executed edit."""
+
+    @pytest.mark.parametrize(
+        "message",
+        ["можно удалить выделенные?", "что будет, если удалить выделенные?", "а если удалить их?", "удали выделенные?",
+         "можно удалить выделенные", "а если их удалить", "стоит ли их удалить", "можешь удалить выделенное?",
+         "удали их, если можно", "Юна, а можно их удалить?"],
+    )
+    def test_delete_questions(self, message):
+        reply, actions = ask(message, selection=THREE)
+        assert actions == []
+        assert reply == (
+            "Если удалить выделенное (3 объекта), оно исчезнет из плана — вернуть можно Ctrl+Z. "
+            "Чтобы удалить, скажите «удали выделенные»."
+        )
+
+    @pytest.mark.parametrize(
+        "message, operation, said",
+        [("что будет, если сделать их деревьями?", "to_tree", "могут появиться нарушения"),
+         ("а если сделать их кустами?", "to_shrub", "по нормам для кустарника")],
+    )
+    def test_retype_questions(self, message, operation, said):
+        reply, actions = ask(message, selection=THREE)
+        assert actions == [] and said in reply and f"скажите «{'сделай их деревьями' if operation == 'to_tree' else 'сделай их кустами'}»" in reply
+
+    def test_a_question_about_a_lawn_still_gets_the_lawn_answer(self):
+        reply, _ = ask("можно сделать их деревьями?", selection=AssistantSelection(count=2, lawns=2))
+        assert "Газон — это площадь" in reply
+
+    def test_a_separate_request_next_to_a_question_is_done(self):
+        reply, actions = ask("удали выделенные. А сколько кустов?", selection=THREE)
+        assert actions == [EditSelectionCommand(operation="delete")] and "Кустов в плане 120" in reply
+        # Asked first, then said plainly -- the plain request wins.
+        assert ask("можно их удалить? удали", selection=THREE)[1] == [EditSelectionCommand(operation="delete")]
+
+    def test_questions_about_other_things_still_work(self):
+        assert recipe(ask("можно деревья в асфальте?")[1]).trees_in_paving is True
+        assert ask("можно выделить все кусты?")[1] == [SelectCommand(target="shrubs")]
+
+
+class TestDeselectAndEditTogether:
+    @pytest.mark.parametrize("message", ["сними выделение и удали", "удали выделенные и сними выделение"])
+    def test_neither_happens_and_the_question_is_put(self, message):
+        reply, actions = ask(message, selection=THREE)
+        assert actions == []
+        assert reply == (
+            "Не поняла: удалить выделенное или только снять выделение? Выделено 3 объекта — "
+            "скажите «удали выделенные» или «сними выделение»."
+        )
+
+
+class TestTypoCorrectionIsNeverDestructive:
+    def test_no_correction_target_is_a_destructive_verb(self):
+        from backend.app.services.assistant_rules import _DELETE, _ERASE, _TYPO_TARGETS
+
+        assert not [t for t in _TYPO_TARGETS if _DELETE.search(t) or _ERASE.search(t)]
+
+    @pytest.mark.parametrize(
+        "word",
+        ["удачи", "удача", "удачу", "удалы", "удала", "удалой", "удила", "удалишь", "удаляя", "удары", "удавы", "убери",
+         "уберу", "убеги", "убеди", "убили", "убрал", "сотри", "стерли", "снесли", "вырежу", "удаль", "удалю"],
+    )
+    def test_words_one_edit_from_a_destructive_verb_stay_what_they_are(self, word):
+        assert normalize(word) == word
+        assert normalize(f"спасибо, {word}!") == f"спасибо, {word}!"
+
+    @pytest.mark.parametrize("message", ["удоли выделенные", "удалт выделенные", "удачи выделенным", "уддали их"])
+    def test_a_misspelt_delete_does_not_delete(self, message):
+        assert not any(isinstance(a, EditSelectionCommand) for a in ask(message, selection=THREE)[1])
 
     @pytest.mark.parametrize(
         "message",
@@ -635,6 +977,12 @@ class TestUi:
         assert ask("покажи в 3D", view="3d") == ("План и так показан в 3D.", [])
         assert ask("вернись на карту", view="2d") == ("Мы и так на 2D-карте.", [])
 
+    @pytest.mark.parametrize("message", ["убери 3D", "закрой 3д", "выйди из 3D", "хватит 3D", "выключи 3d вид"])
+    def test_leaving_3d_goes_back_to_the_map(self, message):
+        # «Убери 3D» used to open 3D (or say it was already open).
+        assert ask(message, view="3d")[1] == [UiCommand(command="show_2d")]
+        assert ask(message, view="2d") == ("Мы и так на 2D-карте.", [])
+
     def test_export_without_a_plan(self):
         reply, actions = ask("скачай DXF", facts=None)
         assert actions == [] and "Плана пока нет" in reply
@@ -656,7 +1004,7 @@ class TestLookalikes:
 
     def test_lawn_is_not_a_gas_pipe(self):
         reply, actions = ask("посади кусты ближе к газону")
-        assert reply != NORMS_REFUSAL and recipe(actions).shrub_spacing_m == 2.1
+        assert reply != NORMS_REFUSAL and recipe(actions).shrub_spacing_m == 0.35
 
     def test_gas_pipe_still_is(self):
         assert ask("посади деревья ближе к газопроводу")[0] == NORMS_REFUSAL
@@ -697,10 +1045,7 @@ def test_word_salad_never_raises_and_always_fits_the_contract():
             reply, actions = ask(message, selection=selection, violations=rng.choice([None, 0, 3]), view=rng.choice(["2d", "3d"]))
             assert reply
             AssistantMessageResponse.model_validate({"reply": reply, "actions": [a.model_dump() for a in actions], "mode": "rules"})
-            deletes = [a for a in actions if isinstance(a, EditSelectionCommand)]
-            assert not deletes or (selection is not None and selection.count > 0)  # rule (a)
-            if any(isinstance(a, SelectCommand) for a in actions):
-                assert all(a.operation != "delete" for a in deletes)  # rule (b)
+            _assert_safety_rules(message, selection, actions)
 
 
 # --- Stress-test regressions ------------------------------------------------------
@@ -736,8 +1081,10 @@ class TestUnknownObjectDoesNotDeleteTheSelection:
         _, actions = ask("удали лишнее", selection=THREE)
         assert not any(isinstance(a, EditSelectionCommand) for a in actions)
 
-    @pytest.mark.parametrize("message", ["удали пожалуйста", "ну удаляй", "можешь удалить выделенное?"])
+    @pytest.mark.parametrize("message", ["удали пожалуйста", "ну удаляй", "можешь удалить выделенное"])
     def test_a_bare_delete_still_deletes_the_selection(self, message):
+        # «Можешь удалить выделенное?» -- with the question mark -- is a
+        # question now (TestQuestionsAreNotRequests).
         assert ask(message, selection=THREE)[1] == [EditSelectionCommand(operation="delete")]
 
 
@@ -806,23 +1153,28 @@ class TestSpacingPhrasings:
 
     def test_one_request_in_two_parts_changes_the_interval_once(self):
         settings = recipe(ask("слишком густо, разреди")[1])
-        assert (settings.tree_spacing_m, settings.shrub_spacing_m) == (7.0, 4.2)
+        assert (settings.tree_spacing_m, settings.shrub_spacing_m) == (7.0, 0.7)
 
     @pytest.mark.parametrize(
         "message", ["кустов многовато", "кусты слишком плотные", "столько кустов не нужно", "уменьши количество кустов"]
     )
     def test_too_many_shrubs_means_sparser_not_fewer_types(self, message):
         settings = recipe(ask(message)[1])
-        assert settings.shrub_spacing_m == 4.2 and settings.planting_types == ["tree", "shrub", "lawn"]
+        assert settings.shrub_spacing_m == 0.7 and settings.planting_types == ["tree", "shrub", "lawn"]
 
-    def test_more_trees_by_count(self):
-        assert recipe(ask("увеличь количество деревьев")[1]).tree_spacing_m == 3.5
+    def test_more_trees_by_count_is_the_norm_answer(self):
+        reply, actions = ask("увеличь количество деревьев")
+        assert actions == [] and reply.startswith("Гуще нормы деревья не поставить")
+
+    def test_more_trees_switched_off_switches_them_on(self):
+        settings = recipe(ask("больше деревьев", settings=_settings(planting_types=["shrub", "lawn"]))[1])
+        assert settings.planting_types == ["tree", "shrub", "lawn"] and settings.tree_spacing_m is None
 
 
 class TestTypos:
     @pytest.mark.parametrize(
-        "message, field, value", [("кусиы пореже", "shrub_spacing_m", 4.2), ("дерьвья погуще", "tree_spacing_m", 3.5),
-                                  ("пореж кусты", "shrub_spacing_m", 4.2)],
+        "message, field, value", [("кусиы пореже", "shrub_spacing_m", 0.7), ("дерьвья пореже", "tree_spacing_m", 7.0),
+                                  ("пореж кусты", "shrub_spacing_m", 0.7)],
     )
     def test_a_typo_in_the_subject_changes_only_that_type(self, message, field, value):
         # Without the fix the subject wasn't found and both types changed.
@@ -830,11 +1182,12 @@ class TestTypos:
         other = "tree_spacing_m" if field == "shrub_spacing_m" else "shrub_spacing_m"
         assert getattr(settings, field) == value and getattr(settings, other) is None
 
-    def test_typos_in_select_count_types_and_delete(self):
+    def test_typos_in_select_count_and_types_but_never_in_delete(self):
         assert ask("выдели кусиы")[1] == [SelectCommand(target="shrubs")]
         assert recipe(ask("газно убери")[1]).planting_types == ["tree", "shrub"]
         assert ask("сколко кустов")[0].startswith("Кустов в плане 120")
-        assert ask("удоли выделенные", selection=THREE)[1] == [EditSelectionCommand(operation="delete")]
+        # Deleting needs the verb spelt right: no correction may produce one.
+        assert ask("удоли выделенные", selection=THREE)[1] == []
 
     @pytest.mark.parametrize(
         "word", ["деревня", "газом", "газовой", "столько", "почище", "дешево", "плотные", "удалил", "выделил", "куска"]
@@ -924,12 +1277,23 @@ def test_word_salad_with_negations_typos_and_places_keeps_the_safety_rules():
             reply, actions = ask(message, selection=selection, violations=rng.choice([None, 0, 3]))
             assert reply
             AssistantMessageResponse.model_validate({"reply": reply, "actions": [a.model_dump() for a in actions], "mode": "rules"})
-            edits = [a for a in actions if isinstance(a, EditSelectionCommand)]
-            assert not edits or (selection is not None and selection.count > 0)  # rule (a)
-            if any(isinstance(a, SelectCommand) for a in actions):
-                assert all(a.operation != "delete" for a in edits)  # rule (b)
+            _assert_safety_rules(message, selection, actions)
             for action in actions:
                 if isinstance(action, SettingsCommand):
                     for planting_type, (low, high) in SPACING_LIMITS.items():
                         value = getattr(action.settings, f"{planting_type}_spacing_m")
                         assert value is None or low <= value <= high
+                    # A tree floor at or below the narrow-crown norm is stored as «по норме».
+                    assert action.settings.tree_spacing_m is None or action.settings.tree_spacing_m > 3.0
+
+
+def _assert_safety_rules(message, selection, actions):
+    import re
+
+    edits = [a for a in actions if isinstance(a, EditSelectionCommand)]
+    assert not edits or (selection is not None and selection.count > 0)  # rule (a)
+    if any(isinstance(a, SelectCommand) for a in actions):
+        assert not edits  # rule (b): no edit at all -- delete or retype -- next to a select
+    sentences = [s for s in re.split(r"[.!?\n]", message) if s.strip()]
+    if len(sentences) == 1 and message.rstrip().endswith("?"):
+        assert not edits  # rule (c): a one-sentence question never edits

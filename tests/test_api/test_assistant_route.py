@@ -77,8 +77,8 @@ class TestWithoutAModel:
         assert response.status_code == 200
         body = response.json()
         assert body["mode"] == "rules" and body["notice"] is None
-        assert body["reply"] == "Интервал кустов 3 → 4,2 м, перестраиваю план."
-        assert body["actions"] == [{"type": "settings", "settings": {**SETTINGS, "tree_spacing_m": None, "shrub_spacing_m": 4.2}}]
+        assert body["reply"] == "Интервал кустов в живой изгороди 0,5 → 0,7 м, перестраиваю план."
+        assert body["actions"] == [{"type": "settings", "settings": {**SETTINGS, "tree_spacing_m": None, "shrub_spacing_m": 0.7}}]
         # The legacy field still carries the recipe of the first settings command.
         assert body["action"] == body["actions"][0]["settings"]
 
@@ -287,3 +287,34 @@ class TestProviderSettings:
         config = Settings()
         assert (config.llm_base_url, config.llm_model) == (SELECTEL_BASE_URL, SELECTEL_MODEL)
         assert config.llm_key is None and not config.llm_configured
+
+
+class TestAPrunedPlan:
+    def test_is_materialized_before_the_facts_are_built(self, client, no_llm):
+        """Another tab's generate prunes every other unedited plan
+        (pipeline_service._prune_stale_plans); the chat used to build facts
+        from the empty plan and say «деревьев в плане нет»."""
+        import asyncio
+        from pathlib import Path
+
+        from backend.app.services import pipeline_service
+        from backend.app.services.project_service import create_project_from_file
+
+        path = Path(__file__).resolve().parents[2] / "data" / "synthetic" / "territory_0.geojson"
+        project = asyncio.run(create_project_from_file("синтетика", path, source_crs="EPSG:32637"))
+        store.save_project(project)
+        try:
+            shown = asyncio.run(pipeline_service.generate_plan(project, ["tree", "shrub"], "heuristic"))
+            trees = sum(1 for item in shown.items if item.planting_type == "tree")
+            asyncio.run(pipeline_service.generate_plan(project, ["tree"], "heuristic", tree_rows=2))
+            assert not shown.materialized and trees > 0  # pruned by the second generate
+
+            body = client.post(
+                f"/api/projects/{project.id}/assistant/message",
+                json={"message": "сколько деревьев?", "settings": SETTINGS, "plan_id": shown.id},
+            ).json()
+
+            assert body["reply"].startswith(f"Деревьев в плане {trees}")
+            assert shown.materialized
+        finally:
+            store._projects.pop(project.id, None)
