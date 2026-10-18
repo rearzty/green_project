@@ -65,6 +65,9 @@ export interface ControlPanelProps {
   hasProject: boolean;
   /** Upload warnings of the current project (ProjectOut.warnings). */
   projectWarnings?: string[];
+  /** The delivery has no work-area boundary, only the survey order boundary,
+   * and the user hasn't agreed to plan by it yet -- ask before generating. */
+  needsOrderBoundaryConsent?: boolean;
   /** PlanOut.area_budget of the shown plan -- why a type got few plantings. */
   areaBudget?: AreaBudget[];
   hasPlan: boolean;
@@ -91,7 +94,7 @@ export interface ControlPanelProps {
   onGenerate: (
     plantingTypes: PlantingType[],
     scoringMode: ScoringMode,
-    spacing?: { treeSpacingM?: number; shrubSpacingM?: number; treeRows?: number; treesInPaving?: boolean }
+    spacing?: { treeSpacingM?: number; shrubSpacingM?: number; treeRows?: number; treesInPaving?: boolean; useOrderBoundary?: boolean }
   ) => Promise<void>;
   /** Lifted to app/page.tsx (not local state here anymore) so AssistantChat.tsx
    * can read/change the same recipe Юна talks about -- both this panel and
@@ -196,6 +199,7 @@ function describeSelection(selection: SelectionSummary): string {
 export function ControlPanel({
   hasProject,
   projectWarnings = [],
+  needsOrderBoundaryConsent = false,
   areaBudget = [],
   hasPlan,
   restoring = false,
@@ -254,6 +258,7 @@ export function ControlPanel({
 }: ControlPanelProps) {
   const [file, setFile] = useState<File | null>(null);
   const [name, setName] = useState("Тестовая территория");
+  const [askOrderBoundary, setAskOrderBoundary] = useState(false);
   // Defaults to the CRS scripts/generate_synthetic_data.py writes test data
   // in (UTM 37N, covers Moscow) so synthetic uploads land on the real map
   // out of the box — clear/replace it once real Mosgeotrest data (unknown
@@ -499,10 +504,44 @@ export function ControlPanel({
           </div>
           <Button
             disabled={!hasProject || plantingTypes.length === 0 || busy || editBusy || generating}
-            onClick={() => guarded(() => onGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM, treeRows, treesInPaving }))}
+            onClick={() =>
+              needsOrderBoundaryConsent
+                ? setAskOrderBoundary(true)
+                : guarded(() => onGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM, treeRows, treesInPaving }))
+            }
           >
             Сгенерировать план
           </Button>
+          {askOrderBoundary && needsOrderBoundaryConsent && (
+            <div className="flex flex-col gap-2 rounded border border-amber-600/60 bg-amber-950/40 p-2 text-xs text-amber-100">
+              <p className="font-medium">Границы работ не найдены — генерировать по границе заказа на съёмку?</p>
+              <p className="text-amber-200/80">
+                Граница заказа шире фактического участка работ: отступы от сетей и зданий соблюдаются, но посадки
+                могут оказаться за участком. Результат предварительный.
+              </p>
+              <div className="flex gap-2">
+                <Button
+                  onClick={() => {
+                    setAskOrderBoundary(false);
+                    guarded(() =>
+                      onGenerate(plantingTypes, scoringMode, {
+                        treeSpacingM,
+                        shrubSpacingM,
+                        treeRows,
+                        treesInPaving,
+                        useOrderBoundary: true,
+                      })
+                    );
+                  }}
+                >
+                  Да, по границе заказа
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => setAskOrderBoundary(false)}>
+                  Отмена
+                </Button>
+              </div>
+            </div>
+          )}
           {generateProgress && <ProgressBar label={generateProgress.stage} progress={generateProgress.progress} />}
           {hasPlan && areaBudget.length > 0 && <AreaBudgetList budgets={areaBudget} />}
         </section>
