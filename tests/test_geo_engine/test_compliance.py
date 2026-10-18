@@ -250,3 +250,13 @@ class TestNeighbourSpacing:
         records = explain_items(items, [], [], norms, catalogue)
 
         assert not [c for r in records for c in r.checks if c.object_type == NEIGHBOUR_OBJECT_TYPE]
+
+
+def test_every_setback_object_type_has_a_russian_label():
+    """Карточка «Почему здесь?» и отчёт показывают подпись, а не ключ из кода:
+    сырой «slope_toe» в обосновании для эксперта выглядит как сбой."""
+    from geo_engine.compliance import OBJECT_LABELS_RU
+    from geo_engine.norms import load_norms
+
+    missing = [key for key in load_norms().setbacks_m if key not in OBJECT_LABELS_RU]
+    assert missing == []
