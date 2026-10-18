@@ -853,10 +853,56 @@ class TestQuestionsInTheModelPath:
 
         assert actions == [] and "могут появиться нарушения" in reply and "«сделай их деревьями»" in reply
 
-    def test_a_plain_request_next_to_a_question_goes_through(self, llm):
+    def test_a_request_next_to_a_question_is_answered_not_done(self, llm):
+        # Strict gate (assistant_rules.edit_gate): a question anywhere in the
+        # message means no edit -- the user says it plainly next time.
         llm(_chat_completion(content=None, calls=[("edit_selection", {"operation": "delete"})]))
 
         _reply, actions = _ask("удали выделенные. А сколько кустов?", facts=PLAN, selection=SELECTED)
+
+        assert actions == []
+
+
+class TestModelAndParserMustAgreeOnAnEdit:
+    """Adversarial check (PR #32): the model can be talked into an edit, and a
+    parser-side guard once turned the model's refusal into a delete. An edit
+    now needs both to read the message as that edit."""
+
+    def test_a_model_edit_the_message_does_not_ask_for_is_dropped(self, llm):
+        llm(_chat_completion(content="Удаляю.", calls=[("edit_selection", {"operation": "delete"})]))
+
+        reply, actions = _ask("покажи нарушения", facts=PLAN, selection=SELECTED)
+
+        assert not any(isinstance(a, EditSelectionCommand) for a in actions)
+
+    def test_a_dropped_model_edit_is_said_out_loud(self, llm):
+        llm(_chat_completion(content="Удаляю.", calls=[("edit_selection", {"operation": "delete"})]))
+
+        reply, actions = _ask("сделай кусты пореже", facts=PLAN, selection=SELECTED)
+
+        assert not any(isinstance(a, EditSelectionCommand) for a in actions)
+        assert "Удалять ничего не стала" in reply
+
+    def test_the_parser_never_edits_in_place_of_a_model_that_declined(self, llm):
+        llm(_chat_completion(content="Лучше не буду ничего удалять без уточнения.", calls=[]))
+
+        reply, actions = _ask("удали выделенные", facts=PLAN, selection=SELECTED)
+
+        assert actions == []
+        assert reply == "Лучше не буду ничего удалять без уточнения."
+
+    @pytest.mark.parametrize("message", ["ни удаляй выделенные", "удали всё кроме выделенных", "а можно удалить выделенные"])
+    def test_the_strict_gate_holds_in_the_model_path(self, llm, message):
+        llm(_chat_completion(content="Удаляю.", calls=[("edit_selection", {"operation": "delete"})]))
+
+        _reply, actions = _ask(message, facts=PLAN, selection=SELECTED)
+
+        assert not any(isinstance(a, EditSelectionCommand) for a in actions)
+
+    def test_both_agreeing_on_a_plain_request_edits(self, llm):
+        llm(_chat_completion(content=None, calls=[("edit_selection", {"operation": "delete"})]))
+
+        _reply, actions = _ask("удали выделенные", facts=PLAN, selection=SELECTED)
 
         assert actions == [EditSelectionCommand(operation="delete")]
 

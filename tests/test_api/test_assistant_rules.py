@@ -855,11 +855,13 @@ class TestAPronounAfterAQuestionMeansTheGroupAskedAbout:
         reply, _ = ask("сколько нарушений? удали их", selection=THREE)
         assert reply == "Выделила 2 нарушения — скажите «удали выделенные», если хотите удалить."
 
-    @pytest.mark.parametrize(
-        "message", ["сколько кустов? удали выделенные", "сколько выделено? удали их", "я выделил деревья, удали их"]
-    )
-    def test_the_selection_is_still_the_selection(self, message):
-        assert ask(message, selection=THREE)[1] == [EditSelectionCommand(operation="delete")]
+    @pytest.mark.parametrize("message", ["сколько кустов? удали выделенные", "сколько выделено? удали их"])
+    def test_a_question_alongside_never_deletes(self, message):
+        # Strict gate (edit_gate): a message with a question in it gets answers
+        # and the words to say, never a delete -- one more message is cheap.
+        reply, actions = ask(message, selection=THREE)
+        assert not any(isinstance(a, EditSelectionCommand) for a in actions)
+        assert "«удали выделенные»" in reply
 
 
 class TestQuestionsAreNotRequests:
@@ -894,11 +896,10 @@ class TestQuestionsAreNotRequests:
         reply, _ = ask("можно сделать их деревьями?", selection=AssistantSelection(count=2, lawns=2))
         assert "Газон — это площадь" in reply
 
-    def test_a_separate_request_next_to_a_question_is_done(self):
+    def test_a_request_next_to_a_question_is_answered_not_done(self):
         reply, actions = ask("удали выделенные. А сколько кустов?", selection=THREE)
-        assert actions == [EditSelectionCommand(operation="delete")] and "Кустов в плане 120" in reply
-        # Asked first, then said plainly -- the plain request wins.
-        assert ask("можно их удалить? удали", selection=THREE)[1] == [EditSelectionCommand(operation="delete")]
+        assert actions == [] and "Кустов в плане 120" in reply
+        assert ask("можно их удалить? удали", selection=THREE)[1] == []
 
     def test_questions_about_other_things_still_work(self):
         assert recipe(ask("можно деревья в асфальте?")[1]).trees_in_paving is True
@@ -1063,8 +1064,8 @@ class TestNegatedEditsNeverEdit:
         reply, actions = ask(message, selection=THREE)
         assert actions == [] and reply == DECLINED_TEXT
 
-    def test_the_other_half_of_the_sentence_still_runs(self):
-        assert ask("не удаляй, а сделай их кустами", selection=THREE)[1] == [EditSelectionCommand(operation="to_shrub")]
+    def test_any_negation_stops_every_edit(self):
+        assert ask("не удаляй, а сделай их кустами", selection=THREE)[1] == []
 
     def test_keep_as_is_is_declined_too(self):
         assert ask("оставь кусты как есть") == (DECLINED_TEXT, [])
@@ -1112,9 +1113,12 @@ class TestPastAndFutureTenseDescribeNotAsk:
             "tree", "shrub", "lawn",
         ]
 
-    def test_i_selected_trees_delete_them_deletes_my_selection(self):
+    def test_i_selected_trees_delete_them_keeps_my_selection(self):
         # Used to replace the user's own selection with all trees.
-        assert ask("я выделил деревья, удали их", selection=THREE)[1] == [EditSelectionCommand(operation="delete")]
+        trees_only = AssistantSelection(count=2, trees=2)
+        assert ask("я выделил деревья, удали их", selection=trees_only)[1] == [EditSelectionCommand(operation="delete")]
+        # The selection holds shrubs too -- deleting "them" would take the shrubs.
+        assert ask("я выделил деревья, удали их", selection=THREE)[1] == []
 
     @pytest.mark.parametrize("message", ["я превратил их в кусты", "это удалит выделенные?", "ты удалила газон?"])
     def test_no_edit_for_a_description_or_a_question(self, message):
@@ -1297,3 +1301,49 @@ def _assert_safety_rules(message, selection, actions):
     sentences = [s for s in re.split(r"[.!?\n]", message) if s.strip()]
     if len(sentences) == 1 and message.rstrip().endswith("?"):
         assert not edits  # rule (c): a one-sentence question never edits
+
+
+class TestStrictEditGate:
+    """Holes the adversarial check found (PR #32): negation with typos, «кроме»,
+    questions without «?», a request about part of the selection."""
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "ни удаляй выделенные",
+            "не удоляй выделеные",
+            "нельзя удалять выделенные",
+            "удали выделенные, хотя нет",
+            "подожди, удали выделенные",
+        ],
+    )
+    def test_negation_never_deletes(self, message):
+        assert ask(message, selection=THREE)[1] == []
+
+    @pytest.mark.parametrize("message", ["удали всё кроме выделенных", "удали остальные", "удали невыделенные"])
+    def test_except_never_edits(self, message):
+        reply, actions = ask(message, selection=THREE)
+        assert not any(isinstance(a, EditSelectionCommand) for a in actions)
+
+    @pytest.mark.parametrize(
+        "message",
+        ["а можно удалить выделенные", "удалить ли выделенные", "если удалить выделенные что будет", "как удалить выделенные"],
+    )
+    def test_a_question_without_a_question_mark_never_deletes(self, message):
+        assert not any(isinstance(a, EditSelectionCommand) for a in ask(message, selection=THREE)[1])
+
+    def test_a_request_about_part_of_the_selection_is_refused(self):
+        reply, actions = ask("удали выделенные кусты", selection=THREE)
+        assert actions == []
+        assert "выделите только нужные" in reply
+
+    def test_a_request_about_all_of_the_selection_goes_through(self):
+        shrubs_only = AssistantSelection(count=2, shrubs=2)
+        assert ask("удали выделенные кусты", selection=shrubs_only)[1] == [EditSelectionCommand(operation="delete")]
+        assert ask("удали выделенные", selection=THREE)[1] == [EditSelectionCommand(operation="delete")]
+        assert ask("можешь удалить выделенное", selection=THREE)[1] == [EditSelectionCommand(operation="delete")]
+
+    def test_retype_of_part_of_the_selection_is_refused(self):
+        assert ask("сделай выделенные кусты деревьями", selection=THREE)[1] == []
+        shrubs_only = AssistantSelection(count=2, shrubs=2)
+        assert ask("сделай выделенные кусты деревьями", selection=shrubs_only)[1] == [EditSelectionCommand(operation="to_tree")]

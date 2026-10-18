@@ -169,7 +169,10 @@ def _crown_interval(item: PlantingItem, catalogue: SpeciesCatalogue) -> tuple[fl
 
 
 def _neighbour_checks(
-    items: list[PlantingItem], norms: PlantingNorms, catalogue: SpeciesCatalogue
+    items: list[PlantingItem],
+    norms: PlantingNorms,
+    catalogue: SpeciesCatalogue,
+    neighbours: list[PlantingItem] | None = None,
 ) -> dict[int, ConstraintCheck]:
     """Расстояние до ближайшей соседней посадки того же типа.
 
@@ -182,9 +185,15 @@ def _neighbour_checks(
 
     Один `query_nearest` с `exclusive=True` на тип посадки, а не цикл по
     объектам: на реальном масштабе плана это сотни тысяч точек.
+
+    `neighbours` — остальные посадки плана, когда объясняется только часть
+    (карточка одной выделенной посадки): соседом может оказаться и не
+    объясняемая посадка. Без них дерево, которое проверка плана красит
+    нарушением, карточка называла допустимым — ближайший сосед не был виден.
     """
+    pool = items + list(neighbours or [])
     by_type: dict[str, list[int]] = {}
-    for index, item in enumerate(items):
+    for index, item in enumerate(pool):
         if item.planting_type in SPACING_CHECKED_TYPES and item.geometry is not None:
             by_type.setdefault(item.planting_type, []).append(index)
 
@@ -197,16 +206,19 @@ def _neighbour_checks(
             # с бесконечным расстоянием значило бы засорить отчёт строкой,
             # которая ничего не утверждает.
             continue
-        geometries = [items[i].geometry for i in positions]
+        geometries = [pool[i].geometry for i in positions]
+        explained = [i for i in positions if i < len(items)]
+        if not explained:
+            continue
         tree = STRtree(geometries)
         pairs, measured = tree.query_nearest(
-            geometries, exclusive=True, all_matches=False, return_distance=True
+            [pool[i].geometry for i in explained], exclusive=True, all_matches=False, return_distance=True
         )
         for offset, local in enumerate(pairs[0]):
-            index = positions[int(local)]
+            index = explained[int(local)]
             neighbour = positions[int(pairs[1][offset])]
-            own_interval, own_crown = _crown_interval(items[index], catalogue)
-            other_interval, other_crown = _crown_interval(items[neighbour], catalogue)
+            own_interval, own_crown = _crown_interval(pool[index], catalogue)
+            other_interval, other_crown = _crown_interval(pool[neighbour], catalogue)
             known = [v for v in (own_interval, other_interval) if v]
             if not known:
                 # Порода не в каталоге либо у её класса кроны интервал не
@@ -223,7 +235,7 @@ def _neighbour_checks(
                 species_rule=(
                     f"крона {CROWN_LABELS_RU.get(own_crown, own_crown or '—')} "
                     f"и {CROWN_LABELS_RU.get(other_crown, other_crown or '—')} "
-                    f"({items[neighbour].species}) — берётся больший интервал"
+                    f"({pool[neighbour].species}) — берётся больший интервал"
                 ),
                 act=source.act if source else "Норматив не сопоставлен",
                 clause=source.clause if source else "—",
@@ -240,8 +252,12 @@ def explain_items(
     zones: list[Zone],
     norms: PlantingNorms,
     catalogue: SpeciesCatalogue | None = None,
+    neighbours: list[PlantingItem] | None = None,
 ) -> list[ComplianceRecord]:
     """Build a citable justification for every item.
+
+    `neighbours` — the rest of the plan when only some items are explained
+    (see _neighbour_checks): records are built for `items` only.
 
     One `STRtree.query_nearest` per object type over the whole item list, not a
     loop per item: at real scale a plan holds hundreds of thousands of plantings
@@ -254,7 +270,7 @@ def explain_items(
 
     catalogue = catalogue or load_catalogue()
     groups = _constraint_groups(utilities, zones, norms)
-    neighbour_checks = _neighbour_checks(items, norms, catalogue)
+    neighbour_checks = _neighbour_checks(items, norms, catalogue, neighbours)
     geometries = [item.geometry for item in items]
 
     # object_type -> distance from each item to the nearest object of that type.
