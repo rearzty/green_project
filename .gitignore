@@ -48,5 +48,3 @@ preview/
 # Кэш scripts/evaluate.py: сконвертированные DWG, прочитанный вход улиц, эталон, результаты
 data/eval_cache*/
 
-# Установщики ODA для сборки образа — локально, не в git (см. infra/vendor/README.md)
-infra/vendor/*.deb
