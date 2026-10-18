@@ -118,13 +118,16 @@ function FitBounds({
   dataRef.current = { layersBounds, plan };
 
   useEffect(() => {
+    // With a plan, fit the plan itself: the raster canvas carries a fixed
+    // 150 m context margin around the territory (layer_raster.py), which on
+    // a small site shrank the actual planting to a speck in the middle.
     const bounds = L.latLngBounds([]);
-    if (dataRef.current.layersBounds) bounds.extend(dataRef.current.layersBounds);
     if (dataRef.current.plan) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const planBounds = L.geoJSON(dataRef.current.plan as any).getBounds();
       if (planBounds.isValid()) bounds.extend(planBounds);
     }
+    if (!bounds.isValid() && dataRef.current.layersBounds) bounds.extend(dataRef.current.layersBounds);
     if (bounds.isValid()) map.fitBounds(bounds, { padding: [20, 20] });
     // `layersBounds` itself isn't a dep (an edit shouldn't yank the view --
     // see this function's own doc comment), but its *presence* has to be:
@@ -139,6 +142,72 @@ function FitBounds({
     // from "not there" without measuring. Same reasoning for `plan`.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fitKey, map, Boolean(layersBounds), Boolean(plan)]);
+
+  return null;
+}
+
+/** «Покажи эти объекты» — рамка группы, которую выделила Юна (app/page.tsx).
+ * Каждый запрос — новый объект: повтор с той же рамкой тоже срабатывает. */
+export interface MapFitRequest {
+  box: LatLngBox;
+}
+
+// Модульная, а не ref: карта размонтируется в 3D, и запрос, уже показанный
+// до этого, не должен срабатывать заново при возврате на 2D (тогда вид
+// подгоняет FitBounds под весь план, как всегда при монтировании).
+let appliedFitRequest: MapFitRequest | null = null;
+
+/** Подгоняет вид под рамку запроса, оставляя её между тем, что лежит поверх
+ * карты: справа — сводка плана и карточка выделения (w-72), слева снизу —
+ * открытый чат Юны (w-[22rem]), откуда такой запрос обычно и приходит. */
+function FitToRequest({ request, crsVerified }: { request?: MapFitRequest | null; crsVerified: boolean }) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (!request || request === appliedFitRequest) return;
+    let cancelled = false;
+    const fit = () => {
+      if (cancelled) return;
+      // Leaflet молча отбрасывает новый вид, пока идёт анимация зума, — а
+      // она как раз идёт, если план только что перегенерирован или карта
+      // только что вернулась из 3D и FitBounds подгоняет её под весь план.
+      if ((map as unknown as { _animatingZoom?: boolean })._animatingZoom) {
+        map.once("zoomend", fit);
+        return;
+      }
+      appliedFitRequest = request;
+      const { box } = request;
+      // Зум 18 Web Mercator — около 0,35 м/px на широте Москвы; в CRS.Simple
+      // (метры чертежа, 2^zoom px на метр) тот же масштаб — зум 2.
+      const closeZoom = crsVerified ? 18 : 2;
+      if (box.minLat === box.maxLat && box.minLng === box.maxLng) {
+        map.setView([box.minLat, box.minLng], Math.max(map.getZoom(), closeZoom));
+        return;
+      }
+      const size = map.getSize();
+      const roomy = size.x - 380 - 312 >= 320;
+      map.fitBounds(
+        [
+          [box.minLat, box.minLng],
+          [box.maxLat, box.maxLng],
+        ],
+        {
+          paddingTopLeft: L.point(roomy ? 380 : 32, 32),
+          paddingBottomRight: L.point(roomy ? 312 : 32, 32),
+          maxZoom: closeZoom,
+        }
+      );
+    };
+    // Два кадра: FitBounds при смене плана или монтировании запускает зум
+    // в requestAnimationFrame, и наш вид должен лечь после него, а не быть
+    // им перезаписан.
+    const frame = requestAnimationFrame(() => requestAnimationFrame(fit));
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(frame);
+      map.off("zoomend", fit);
+    };
+  }, [request, map, crsVerified]);
 
   return null;
 }
@@ -898,6 +967,8 @@ export interface MapViewProps {
   onViewChange?: () => void;
   /** Pan/zoom to this item; `seq` makes a repeat request for the same id re-fire. */
   focusRequest?: { id: string; seq: number } | null;
+  /** Fit the view to a group's bounds (Юна's «выдели …»), see FitToRequest. */
+  fitRequest?: MapFitRequest | null;
   /** Whether the control panel is currently shown -- purely to know when its
    * CSS width transition finishes, so the map's container size can be
    * recomputed (see InvalidateSizeOnChange below). Not otherwise used. */
@@ -925,6 +996,7 @@ export default function MapView({
   onContextMenu,
   onViewChange,
   focusRequest,
+  fitRequest,
   sidebarOpen,
 }: MapViewProps) {
   // item id -> its Leaflet layer while on the map, so selection/violation
@@ -1063,6 +1135,7 @@ export default function MapView({
         />
       )}
       <FitBounds fitKey={`${layersKey ?? ""}:${planId ?? ""}`} layersBounds={extentBounds} plan={plan} />
+      <FitToRequest request={fitRequest} crsVerified={Boolean(crsVerified)} />
       <InvalidateSizeOnChange trigger={sidebarOpen} />
       {extentBounds && (
         <Rectangle

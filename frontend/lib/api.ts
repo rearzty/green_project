@@ -487,6 +487,10 @@ export interface ComplianceCheck {
   citation: string;
   table_row: string;
   verified: boolean;
+  /** Подпись объекта по-русски (geo_engine/compliance.py::OBJECT_LABELS_RU). */
+  object_label: string;
+  /** Поправка по породе, если она увеличила табличный отступ. */
+  species_rule: string;
 }
 
 export interface ItemCompliance {
@@ -517,7 +521,8 @@ export function complianceReportUrl(projectId: string, planId: string, format: "
 }
 
 // Юна -- the in-app chat assistant (components/AssistantChat.tsx). The
-// backend is a stateless proxy to an LLM (see assistant_service.py): it
+// backend is stateless -- an LLM when a key is configured, built-in command
+// parsing otherwise (see assistant_service.py): it
 // holds no conversation of its own, so the full chat log travels on every
 // message, same as `settings` (the panel's current generation recipe) --
 // Юна reasons about new absolute values relative to what's actually set,
@@ -546,9 +551,35 @@ export interface AssistantAction {
   trees_in_paving: boolean;
 }
 
+export interface AssistantSelection {
+  count: number;
+  trees: number;
+  shrubs: number;
+  lawns: number;
+}
+
+/** Действия, которые Юна просит выполнить, — фронт делает их тем же кодом,
+ * что кнопки панели и карточки. Контракт: backend/app/schemas/assistant.py. */
+export type AssistantCommand =
+  | { type: "settings"; settings: AssistantAction }
+  | { type: "edit_selection"; operation: "delete" | "to_tree" | "to_shrub" }
+  | { type: "select"; target: "violations" | "trees" | "shrubs" | "lawn" | "all" | "none"; species?: string | null }
+  | { type: "ui"; command: "export_dxf" | "report_json" | "report_csv" | "show_3d" | "show_2d" };
+
 export interface AssistantMessageResult {
   reply: string;
+  actions: AssistantCommand[];
+  /** Устаревшее: рецепт первой settings-команды. */
   action: AssistantAction | null;
+  /** "llm" — ответила языковая модель, "rules" — встроенный разбор команд без ИИ. */
+  mode: "llm" | "rules";
+  notice?: string | null;
+}
+
+export interface AssistantStatus {
+  llm_configured: boolean;
+  provider: string;
+  model?: string | null;
 }
 
 export async function askAssistant(
@@ -556,15 +587,33 @@ export async function askAssistant(
   message: string,
   history: AssistantChatMessage[],
   currentSettings: AssistantGenerationSettings,
-  // Какой план на экране и какая посадка выделена: по ним бэкенд собирает
-  // для Юны сводку плана и обоснование посадки (assistant_context.py).
-  context?: { planId?: string; selectedItemId?: string }
+  // Что сейчас на экране. По плану и выделенной посадке бэкенд собирает Юне
+  // сводку и обоснование (assistant_context.py); по выделению, нарушениям и
+  // виду решает, какие команды вообще имеют смысл («удали выделенные» без
+  // выделения — нет).
+  context: {
+    planId?: string;
+    selectedItemId?: string;
+    selection?: AssistantSelection;
+    /** null — план ещё не проверен на нормативы. */
+    violationsCount?: number | null;
+    view?: "2d" | "3d";
+  } = {}
 ): Promise<AssistantMessageResult> {
   return postJson(`/api/projects/${projectId}/assistant/message`, {
     message,
     history,
     settings: currentSettings,
-    plan_id: context?.planId,
-    selected_item_id: context?.selectedItemId,
+    plan_id: context.planId,
+    selected_item_id: context.selectedItemId,
+    selection: context.selection,
+    violations_count: context.violationsCount,
+    view: context.view,
   });
+}
+
+/** Подключена ли языковая модель — для значка режима в шапке чата. Без неё
+ * Юна не молчит, а отвечает встроенным разбором команд (mode "rules"). */
+export async function getAssistantStatus(): Promise<AssistantStatus> {
+  return request("/api/config/assistant");
 }
