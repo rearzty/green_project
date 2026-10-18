@@ -26,6 +26,7 @@ from backend.app.db.models import Plan
 from backend.app.schemas.compliance import ComplianceCheckOut, ItemComplianceOut, ItemsComplianceRequest, ItemsComplianceResponse
 from backend.app.services import compliance_service
 from backend.app.services.pipeline_service import plan_norms
+from geo_engine.compliance import OBJECT_LABELS_RU
 from geo_engine.norms import PlantingNorms
 
 router = APIRouter(prefix="/api/projects/{project_id}/plans/{plan_id}", tags=["compliance"])
@@ -56,6 +57,8 @@ def _to_schema(item_id: str, record) -> ItemComplianceOut:
                 citation=c.citation,
                 table_row=c.table_row,
                 verified=c.verified,
+                object_label=OBJECT_LABELS_RU.get(c.object_type, c.object_type),
+                species_rule=c.species_rule,
             )
             for c in record.checks
         ],

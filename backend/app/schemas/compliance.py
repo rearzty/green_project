@@ -19,6 +19,10 @@ class ComplianceCheckOut(BaseModel):
     citation: str
     table_row: str
     verified: bool
+    # Подпись объекта по-русски и поправка по породе — чтобы карточка «Почему
+    # здесь?» не держала свою копию OBJECT_LABELS_RU (geo_engine/compliance.py).
+    object_label: str = ""
+    species_rule: str = ""
 
 
 class ItemComplianceOut(BaseModel):
