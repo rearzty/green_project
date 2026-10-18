@@ -13,12 +13,14 @@ const KIND_STYLES: Record<ToastKind, { accent: string; icon: typeof Info; iconCl
 
 /** Stacked notification cards, bottom-right over the map. z-index sits above
  * Leaflet's own controls (1000) so a toast is never hidden under the zoom
- * buttons or attribution. */
+ * buttons or attribution -- and above the phone drawer (app/page.tsx,
+ * 1120): an upload error raised from inside the open panel must not land
+ * underneath it. */
 export function Toaster() {
   const toasts = useSyncExternalStore(subscribeToasts, getToasts, getServerToasts);
 
   return (
-    <div className="pointer-events-none fixed bottom-4 right-4 z-[1100] flex w-[22rem] max-w-[calc(100vw-2rem)] flex-col gap-2" aria-live="polite">
+    <div className="pointer-events-none fixed bottom-4 right-4 z-[1150] flex w-[22rem] max-w-[calc(100vw-2rem)] flex-col gap-2" aria-live="polite">
       {toasts.map((t) => {
         const style = KIND_STYLES[t.kind];
         const Icon = style.icon;

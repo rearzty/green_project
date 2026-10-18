@@ -65,6 +65,11 @@ export function usePlanEdits(
   // own `violations` would be the render's snapshot, not the latest.
   const violationsRef = useRef(violations);
   violationsRef.current = violations;
+  // Чья полная проверка закончилась (удачно — итог в `violations`, нет —
+  // `violations` null): сразу после смены плана в них ещё лежит итог
+  // прежнего (сброс — в эффекте следующего рендера), и Юне после
+  // перегенерации надо дождаться проверки именно нового (app/page.tsx).
+  const [checkedPlanId, setCheckedPlanId] = useState<string | null>(null);
   const [validating, setValidating] = useState(false);
   const [editBusy, setEditBusy] = useState(false);
   const editBusyRef = useRef(false);
@@ -101,6 +106,7 @@ export function usePlanEdits(
    * them have to remember to trigger it. */
   useEffect(() => {
     setViolations(null);
+    setCheckedPlanId(null);
     if (!project || !plan) return;
     const seq = ++validateSeqRef.current;
     const forPlanId = plan.plan_id;
@@ -113,7 +119,9 @@ export function usePlanEdits(
         if (seq === validateSeqRef.current) toast.error(`Не удалось проверить нормативы: ${errorMessage(e)}`);
       })
       .finally(() => {
-        if (seq === validateSeqRef.current) setValidating(false);
+        if (seq !== validateSeqRef.current) return;
+        setValidating(false);
+        if (planIdRef.current === forPlanId) setCheckedPlanId(forPlanId);
       });
     // Only re-run for a genuinely different plan -- an in-place edit reuses
     // the same plan_id (see useProjectSession::applyLocalEdit), and that
@@ -285,6 +293,7 @@ export function usePlanEdits(
   return {
     violations,
     violationIds,
+    checkedPlanId,
     validating,
     editBusy,
     canUndo,

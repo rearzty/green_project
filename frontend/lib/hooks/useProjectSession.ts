@@ -10,6 +10,7 @@ import {
   getPlan,
   getProject,
   listPlans,
+  subscribeProjectLost,
   uploadProject,
   type GeoJSONFeature,
   type GenerateJobStatus,
@@ -22,6 +23,7 @@ import {
   type ScoringMode,
 } from "@/lib/api";
 import { buildPlanIndex, patchPlanIndex, type PlanIndex } from "@/lib/planIndex";
+import { rememberPlanRecipe } from "@/lib/planRecipes";
 import { clearAllUndoHistory } from "@/lib/undoStack";
 
 // Remembers which project/plan was open so a page refresh doesn't lose it --
@@ -120,6 +122,24 @@ export function useProjectSession() {
   const [generateProgress, setGenerateProgress] = useState<JobProgress | null>(null);
   const [exporting, setExporting] = useState(false);
   const [restoring, setRestoring] = useState(true);
+  // Сервер ответил, что открытого проекта у него больше нет (перезапуск —
+  // проекты живут только в его памяти, см. api.ts::PROJECT_GONE_MESSAGE).
+  // План остаётся на экране, чтобы не пропадали карта и разговор с Юной, а
+  // запомненная сессия забывается сразу — как при неудачном восстановлении
+  // на старте: после обновления страницы ждать от сервера нечего.
+  const [projectLost, setProjectLost] = useState(false);
+  const projectIdRef = useRef<string | undefined>(undefined);
+  projectIdRef.current = project?.id;
+
+  useEffect(
+    () =>
+      subscribeProjectLost((lostId) => {
+        if (lostId !== projectIdRef.current) return;
+        setProjectLost(true);
+        saveStoredSession(null);
+      }),
+    []
+  );
 
   // Not React state on purpose: a full rebuild on every edit (the natural
   // useMemo-on-plan approach) measured at up to ~1.6s on a real-scale plan
@@ -208,6 +228,7 @@ export function useProjectSession() {
       });
       const fetched = await getProject(project_id);
       setProject(fetched);
+      setProjectLost(false);
       await refreshLayersRaster(project_id);
       applyPlan(null);
       setPlans([]);
@@ -229,6 +250,17 @@ export function useProjectSession() {
       const generated = await generatePlan(project.id, plantingTypes, scoringMode, {
         ...spacing,
         onPoll: (status) => setGenerateProgress(progressFromStatus(status)),
+      });
+      // До applyPlan: страница восстанавливает поля панели из рецепта плана,
+      // как только он на экране (app/page.tsx). Пропущенные поля — те же
+      // значения по умолчанию, что подставит GenerateRequest.
+      rememberPlanRecipe(generated.plan_id, {
+        planting_types: plantingTypes,
+        tree_spacing_m: spacing?.treeSpacingM,
+        shrub_spacing_m: spacing?.shrubSpacingM,
+        scoring_mode: scoringMode,
+        tree_rows: spacing?.treeRows ?? 1,
+        trees_in_paving: spacing?.treesInPaving ?? false,
       });
       applyPlan(generated);
       if (spacing?.useOrderBoundary) setProject({ ...project, use_order_boundary: true });
@@ -288,6 +320,7 @@ export function useProjectSession() {
     saveStoredSession(null);
     clearAllUndoHistory();
     setProject(null);
+    setProjectLost(false);
     setLayersRaster(null);
     applyPlan(null);
     setPlans([]);
@@ -308,6 +341,7 @@ export function useProjectSession() {
     generateProgress,
     exporting,
     restoring,
+    projectLost,
     applyPlan,
     applyLocalEdit,
     bumpPlanRevision,

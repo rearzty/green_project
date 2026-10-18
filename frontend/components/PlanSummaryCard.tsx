@@ -17,7 +17,8 @@ export function PlanSummaryCard({
   scoringMode,
 }: {
   stats: PlanStats;
-  /** null -- план ещё не проверен. */
+  /** Посадок с нарушениями (не записей о нарушениях: у одной посадки их
+   * бывает две — отступ и интервал). null -- план ещё не проверен. */
   violations: number | null;
   validating: boolean;
   /** Площадь участка, м² (PlanOut.area_budget[].territory_m2). */
@@ -36,7 +37,9 @@ export function PlanSummaryCard({
   ];
 
   return (
-    <div className="pointer-events-auto w-72 rounded-xl border border-stone-700/80 bg-stone-900/90 p-3 text-stone-100 shadow-lg backdrop-blur">
+    // data-map-overlay: лежит поверх карты — MapView.tsx::freeMapRects не
+    // кладёт под карточку рамку «выдели …».
+    <div data-map-overlay className="pointer-events-auto w-72 rounded-xl border border-stone-700/80 bg-stone-900/90 p-3 text-stone-100 shadow-lg backdrop-blur">
       <div className="mb-2 flex items-baseline justify-between">
         <p className="text-xs font-medium uppercase tracking-wide text-stone-400">План озеленения</p>
         {scoringMode && (
@@ -113,7 +116,7 @@ export function PlanSummaryCard({
         ) : (
           <>
             <TriangleAlert className="h-3.5 w-3.5" aria-hidden />
-            Нарушений норматива: {violations} — отмечены красным
+            Посадок с нарушениями норм: {violations} — отмечены красным
           </>
         )}
       </div>

@@ -29,17 +29,38 @@ export type UiAction = Extract<AssistantCommand, { type: "ui" }>["command"];
 
 type Forms = [one: string, few: string, many: string];
 
+/** Существительное итогов: формы при числе и род — от рода зависит
+ * причастие при единице («удалена посадка», «удалён куст», «удалено дерево»). */
+export interface Noun {
+  forms: Forms;
+  gender: "m" | "f" | "n";
+}
+
 // В чате говорим «кусты», как сам пользователь («кусты пореже»), а не
 // «кустарник», как подписи панели.
-export const PLANTING_FORMS: Forms = ["посадка", "посадки", "посадок"];
-const TREE_FORMS: Forms = ["дерево", "дерева", "деревьев"];
-const SHRUB_FORMS: Forms = ["куст", "куста", "кустов"];
-const LAWN_FORMS: Forms = ["участок газона", "участка газона", "участков газона"];
+export const PLANTING: Noun = { forms: ["посадка", "посадки", "посадок"], gender: "f" };
+/** «Удаляю 1 посадку» — винительный падеж. */
+export const PLANTING_ACC: Forms = ["посадку", "посадки", "посадок"];
+/** «Меняю тип у 21 посадки» — родительный. */
+export const PLANTING_GEN: Forms = ["посадки", "посадок", "посадок"];
+const TREE: Noun = { forms: ["дерево", "дерева", "деревьев"], gender: "n" };
+const SHRUB: Noun = { forms: ["куст", "куста", "кустов"], gender: "m" };
+const LAWN: Noun = { forms: ["участок газона", "участка газона", "участков газона"], gender: "m" };
 
 /** «1 234 дерева» — с разделителем разрядов, в отличие от format.ts::countLabel:
  * в итогах Юны бывают десятки тысяч кустов. */
 export function countText(n: number, forms: Forms): string {
   return `${n.toLocaleString("ru-RU")} ${pluralRu(n, forms)}`;
+}
+
+const ONE_ENDING: Record<Noun["gender"], string> = { m: "", f: "а", n: "о" };
+
+/** «Удалена 1 посадка», «Удалены 3 посадки», «Удалено 5 посадок», «Удалена
+ * 21 посадка»: краткое причастие согласуется с числом по тем же правилам,
+ * что и существительное (pluralRu), а при единице — ещё и с родом. `stem` —
+ * основа без окончания: «Удален», «Выделен». */
+export function doneText(stem: string, n: number, noun: Noun): string {
+  return `${pluralRu(n, [stem + ONE_ENDING[noun.gender], `${stem}ы`, `${stem}о`])} ${countText(n, noun.forms)}`;
 }
 
 // --- настройки генерации ---
@@ -98,8 +119,8 @@ export function describeSettingsChange(prev: AssistantGenerationSettings, next: 
 /** «118 деревьев, 960 кустов, газон 1 240 м²» — по сводке плана (planStats.ts). */
 export function planCountsText(stats: { trees: number; shrubs: number; lawnAreaM2: number }): string {
   const parts: string[] = [];
-  if (stats.trees > 0) parts.push(countText(stats.trees, TREE_FORMS));
-  if (stats.shrubs > 0) parts.push(countText(stats.shrubs, SHRUB_FORMS));
+  if (stats.trees > 0) parts.push(countText(stats.trees, TREE.forms));
+  if (stats.shrubs > 0) parts.push(countText(stats.shrubs, SHRUB.forms));
   if (stats.lawnAreaM2 >= 1) parts.push(`газон ${Math.round(stats.lawnAreaM2).toLocaleString("ru-RU")} м²`);
   return parts.join(", ") || "посадок нет";
 }
@@ -109,7 +130,7 @@ export function planCountsText(stats: { trees: number; shrubs: number; lawnAreaM
 type GroupTarget = Exclude<SelectTarget, "violations" | "none">;
 
 const TARGET_TYPES: Record<Exclude<GroupTarget, "all">, PlantingType> = { trees: "tree", shrubs: "shrub", lawn: "lawn" };
-const TARGET_FORMS: Record<GroupTarget, Forms> = { trees: TREE_FORMS, shrubs: SHRUB_FORMS, lawn: LAWN_FORMS, all: PLANTING_FORMS };
+const TARGET_NOUNS: Record<GroupTarget, Noun> = { trees: TREE, shrubs: SHRUB, lawn: LAWN, all: PLANTING };
 const TARGET_MISSING: Record<GroupTarget, string> = {
   trees: "Деревьев в плане нет.",
   shrubs: "Кустов в плане нет.",
@@ -146,9 +167,15 @@ export function idsForTarget(index: PlanIndex, features: GeoJSONFeatureCollectio
   return ids;
 }
 
+/** «Выделены 3 дерева — «липа»» — строка итога целиком. */
 export function selectedText(target: GroupTarget, n: number, species?: string | null): string {
-  const base = countText(n, TARGET_FORMS[target]);
+  const base = doneText("Выделен", n, TARGET_NOUNS[target]);
   return species ? `${base} — «${species}»` : base;
+}
+
+/** «Выделена 1 посадка с нарушениями — она отмечена красным». */
+export function violationsSelectedText(n: number): string {
+  return `${doneText("Выделен", n, PLANTING)} с нарушениями — ${n === 1 ? "она отмечена" : "они отмечены"} красным`;
 }
 
 export function missingText(target: GroupTarget, species?: string | null): string {
@@ -172,8 +199,9 @@ export interface SuggestionState {
 const MAX_SUGGESTIONS = 5;
 
 /** Готовые фразы по тому, что сейчас на экране. Только те, что понимает и
- * базовый режим без ИИ (assistant_service.py), — подсказка, на которую Юна
- * без ключа ответила бы «не поняла», хуже, чем никакой. */
+ * базовый режим без ИИ (backend/app/services/assistant_rules.py), —
+ * подсказка, на которую Юна без ключа ответила бы «не поняла», хуже, чем
+ * никакой. */
 export function suggestionChips(state: SuggestionState): string[] {
   if (!state.hasProject) return [];
   if (!state.hasPlan) return ["Сгенерируй план", "Что ты умеешь?"];

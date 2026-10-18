@@ -56,6 +56,14 @@ export interface PlanOut {
   scoring_mode: ScoringMode;
   features: GeoJSONFeatureCollection;
   area_budget?: AreaBudget[];
+  // Остальной рецепт плана (backend Plan хранит его целиком). Необязательные:
+  // бэкенд может их и не прислать — тогда рецепт берётся из того, что
+  // запомнил этот браузер при генерации (lib/planRecipes.ts).
+  planting_types?: PlantingType[];
+  tree_spacing_m?: number | null;
+  shrub_spacing_m?: number | null;
+  tree_rows?: number;
+  trees_in_paving?: boolean;
 }
 
 export interface PlanSummary {
@@ -84,11 +92,50 @@ export interface ItemsRetypeResult {
 export class ApiError extends Error {
   constructor(
     message: string,
-    readonly status: number
+    readonly status: number,
+    /** У сервера больше нет проекта, к которому был запрос (см. projectGoneError). */
+    readonly projectGone = false
   ) {
     super(message);
     this.name = "ApiError";
   }
+}
+
+/** Проекты живут только в памяти backend (CLAUDE.md, «Нет базы данных
+ * вообще»): после его перезапуска любой запрос по старому id отвечает 404
+ * «Проект не найден — возможно, он был удалён». Пользователь ничего не
+ * удалял — так и говорим, и что делать дальше. */
+export const PROJECT_GONE_MESSAGE =
+  "Сервер перезапускался, а проекты хранятся только в его памяти — этого чертежа на нём больше нет. Загрузите чертёж заново в панели слева и постройте план ещё раз.";
+
+const lostProjects = new Set<string>();
+const projectLostListeners = new Set<(projectId: string) => void>();
+
+/** Тот же 404, что у deps.py::get_project_or_404, — по тексту detail: у
+ * плана и посадки свои 404 («План не найден…»), их с потерей проекта путать
+ * нельзя. GET самого проекта — без сверки текста: там другого 404 нет. */
+function projectGoneError(path: string, error: ApiError): ApiError {
+  const match = /^\/api\/projects\/([0-9a-f-]{8,})(\/|$)/i.exec(path);
+  if (error.status !== 404 || !match) return error;
+  const ownPath = path === `/api/projects/${match[1]}`;
+  if (!ownPath && !error.message.startsWith("Проект не найден")) return error;
+  if (!lostProjects.has(match[1])) {
+    lostProjects.add(match[1]);
+    projectLostListeners.forEach((listener) => listener(match[1]));
+  }
+  return new ApiError(PROJECT_GONE_MESSAGE, 404, true);
+}
+
+/** Сервер уже ответил, что этого проекта у него нет. Синхронно — чтобы
+ * сразу после неудачного запроса выбрать текст ошибки, не дожидаясь рендера. */
+export function isProjectLost(projectId: string | undefined): boolean {
+  return projectId !== undefined && lostProjects.has(projectId);
+}
+
+/** Подписка на «проекта больше нет на сервере» (useProjectSession). */
+export function subscribeProjectLost(listener: (projectId: string) => void): () => void {
+  projectLostListeners.add(listener);
+  return () => projectLostListeners.delete(listener);
 }
 
 function fallbackMessage(status: number): string {
@@ -114,14 +161,21 @@ async function errorFromResponse(res: Response): Promise<ApiError> {
   return new ApiError(fallbackMessage(res.status), res.status);
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/** fetch с теми же текстами ошибок, что у всех запросов, — для ответов,
+ * которые читаются не как JSON (файлы отчётов). */
+async function fetchOk(path: string, init?: RequestInit): Promise<Response> {
   let res: Response;
   try {
     res = await fetch(`${API_URL}${path}`, init);
   } catch {
     throw new ApiError("Нет связи с сервером — проверьте, что backend запущен и доступен.", 0);
   }
-  if (!res.ok) throw await errorFromResponse(res);
+  if (!res.ok) throw projectGoneError(path, await errorFromResponse(res));
+  return res;
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetchOk(path, init);
   if (res.status === 204) return undefined as T;
   return res.json() as Promise<T>;
 }
@@ -523,11 +577,14 @@ export async function getItemsCompliance(projectId: string, planId: string, ids:
   return items;
 }
 
-/** Прямая ссылка на скачивание полного отчёта по плану -- вызывающий код
- * просто кликает по ней (тот же приём, что и у exportDxf), файл льётся из
- * ответа сервера напрямую в браузер, не через JS. */
-export function complianceReportUrl(projectId: string, planId: string, format: "json" | "csv"): string {
-  return `${API_URL}/api/projects/${projectId}/plans/${planId}/compliance-report.${format}`;
+/** Полный отчёт обоснований по плану — файлом в памяти, а не прямой ссылкой
+ * (как у exportDxf): по ссылке ошибка сервера уводила браузер со страницы
+ * приложения вместе с разговором Юны, а JSON без Content-Disposition
+ * браузер вовсе открывал вместо скачивания. Это обоснования посадок, а не
+ * многосотмегабайтный чертёж, — в памяти вкладки он помещается. */
+export async function fetchComplianceReport(projectId: string, planId: string, format: "json" | "csv"): Promise<Blob> {
+  const res = await fetchOk(`/api/projects/${projectId}/plans/${planId}/compliance-report.${format}`);
+  return res.blob();
 }
 
 // Юна -- the in-app chat assistant (components/AssistantChat.tsx). The

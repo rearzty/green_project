@@ -89,7 +89,12 @@ export function InspectorCard({
   const speciesRule = checks.find((c) => c.species_rule)?.species_rule;
 
   return (
-    <div className="pointer-events-auto flex max-h-full w-72 flex-col overflow-hidden rounded-xl border border-stone-700/80 bg-stone-900/95 text-stone-100 shadow-lg backdrop-blur">
+    // data-map-overlay: лежит поверх карты — MapView.tsx::freeMapRects не
+    // кладёт под карточку рамку «выдели …».
+    <div
+      data-map-overlay
+      className="pointer-events-auto flex max-h-full w-72 flex-col overflow-hidden rounded-xl border border-stone-700/80 bg-stone-900/95 text-stone-100 shadow-lg backdrop-blur"
+    >
       <div className="flex items-start justify-between gap-2 border-b border-stone-800 p-3">
         <div className="flex min-w-0 items-center gap-2">
           {Icon && single ? (
