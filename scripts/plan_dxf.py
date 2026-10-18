@@ -46,6 +46,7 @@ from geo_engine.io.result_package import copy_references, missing_references, pl
 from geo_engine.species import load_catalogue
 from geo_engine.territory import MissingTerritoryError, territory_polygon
 from ml_scoring.heuristic_scorer import HeuristicScorer
+from ml_scoring.designer_model import DEFAULT_ARTIFACT as DESIGNER_ARTIFACT, DesignerScorer
 from ml_scoring.ml_scorer import MLScorer, ModelNotTrainedError
 
 PLANTING_TYPES = ("tree", "shrub", "lawn")
@@ -184,7 +185,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="tree,shrub",
         help="Типы посадок через запятую: tree,shrub,lawn (по умолчанию tree,shrub)",
     )
-    parser.add_argument("--scoring", choices=("heuristic", "ml"), default="heuristic", help="Способ ранжирования")
+    parser.add_argument(
+        "--scoring",
+        choices=("heuristic", "ml"),
+        default="heuristic",
+        help=(
+            "Способ ранжирования допустимых мест: heuristic — формула; ml — модель, обученная на посадочных "
+            "чертежах проектировщиков пилота (ml_scoring/designer_model.py): места деревьев, непохожие на их "
+            "выбор, она отклоняет"
+        ),
+    )
     parser.add_argument("--tree-spacing", type=float, help="Интервал между деревьями, м (по умолчанию из нормативов)")
     parser.add_argument("--shrub-spacing", type=float, help="Интервал между кустами, м")
     parser.add_argument("--prefix", default=RESULT_LAYER_PREFIX, help="Префикс слоёв результата")
@@ -383,12 +393,19 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         existing_greenery = [z.geometry for z in zones if z.zone_type == "existing_greenery"]
-        if args.scoring == "ml":
+        scorer = None
+        if args.scoring == "ml" and DESIGNER_ARTIFACT.is_file():
+            # Модель по реальным проектным решениям пилота, см. ml_scoring/designer_model.py.
+            try:
+                scorer = DesignerScorer(norms, utilities, zones, territory)
+            except Exception as error:  # noqa: BLE001 — артефакт другой версии scikit-learn
+                print(f"  ! модель проектировщика не загрузилась ({error}) — ранжирую синтетической", file=sys.stderr)
+        if scorer is None and args.scoring == "ml":
             try:
                 scorer = MLScorer(norms, existing_greenery=existing_greenery)
             except ModelNotTrainedError as error:
                 raise SystemExit(f"\nОШИБКА: {error}") from error
-        else:
+        elif scorer is None:
             scorer = HeuristicScorer(norms, existing_greenery=existing_greenery)
 
         clock.begin(f"3/5 Генерация ({args.scoring}, схема: {args.pattern}, типы: {', '.join(planting_types)})...")

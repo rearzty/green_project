@@ -106,6 +106,12 @@ def greedy_select(
     grid: dict[tuple[int, int], list[int]] = {}
 
     for candidate, score, rationale in scored:
+        # Отрицательная оценка — скоринг отклонил место целиком (так модель
+        # по проектным решениям, ml_scoring/designer_model.py, отсеивает
+        # допустимые, но непохожие на выбор проектировщика места). Эвристика
+        # и MLScorer дают оценки в [0, 1] и сюда не попадают.
+        if score < 0:
+            continue
         spacing = norms.spacing_for(candidate.planting_type)
         footprint = (
             candidate.geometry.buffer(
