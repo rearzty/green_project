@@ -119,7 +119,11 @@ def repaired_for_buffering(geometries: list[BaseGeometry]) -> list[BaseGeometry]
     и два куста изгороди встали в 0,53 и 0,59 м при требуемом метре. На улице
     таких сетей 850 из 62 427 линий, у 78 буфер выходил урезанным.
     `unary_union` разрезает линию в местах наложения и склеивает совпадающие
-    участки — буфер получается полным.
+    участки — буфер получается полным. Обязательно с `line_merge` после:
+    разрезанная линия — это тысячи коротких кусков (на той улице 17 945 из
+    873 линий), и буфер по ним строился 26,8 с вместо 0,2 — генерация
+    улицы выросла на треть. Склеенные обратно в длинные линии (1 801 кусок)
+    дают ту же площадь буфера за 0,7 с.
     """
     if not geometries:
         return []
@@ -131,7 +135,7 @@ def repaired_for_buffering(geometries: list[BaseGeometry]) -> list[BaseGeometry]
         return geometries
     repaired = np.where(healthy, array, shapely.make_valid(array))
     if overlapping.any():
-        repaired[overlapping] = shapely.union_all(array[overlapping][:, None], axis=1)
+        repaired[overlapping] = shapely.line_merge(shapely.union_all(array[overlapping][:, None], axis=1))
     return list(repaired)
 
 
