@@ -44,7 +44,15 @@ from geo_engine.planner import (
 from geo_engine.area_budget import area_budget
 from geo_engine.io.result_package import copy_references, missing_references, place_by_saved_paths, xref_paths
 from geo_engine.species import load_catalogue
-from geo_engine.territory import MissingTerritoryError, territory_polygon
+from geo_engine.territory import (
+    ORDER_BOUNDARY_NOTE,
+    ORDER_BOUNDARY_QUESTION,
+    ORDER_BOUNDARY_ZONE_TYPE,
+    MissingTerritoryError,
+    OrderBoundaryOnlyError,
+    territory_polygon,
+    territory_source,
+)
 from ml_scoring.heuristic_scorer import HeuristicScorer
 from ml_scoring.designer_model import DEFAULT_ARTIFACT as DESIGNER_ARTIFACT, DesignerScorer
 from ml_scoring.ml_scorer import MLScorer, ModelNotTrainedError
@@ -228,6 +236,12 @@ def build_parser() -> argparse.ArgumentParser:
         "группы деревьев и солитеры",
     )
     parser.add_argument(
+        "--use-order-boundary",
+        action="store_true",
+        help="Если границы работ в поставке нет, строить план по границе заказа на съёмку "
+        "без вопроса. Она шире участка работ — результат предварительный",
+    )
+    parser.add_argument(
         "--trees-in-paving",
         action="store_true",
         help="Разрешить деревья в покрытии тротуара с приствольной решёткой: околоствольное "
@@ -293,6 +307,21 @@ def _parse_densities(raw: list[str] | None) -> dict[str, float]:
             raise SystemExit(f"Плотность не может быть отрицательной, получено: {entry!r}")
         out[planting_type.strip()] = density
     return out
+
+
+def _confirm_order_boundary() -> bool:
+    """Спросить в терминале, строить ли план по границе заказа. Без терминала
+    (пакетный запуск, CI) не спрашивает — ответ «нет», чтобы скрипт не завис
+    на вводе; согласие тогда даётся флагом --use-order-boundary."""
+    if not sys.stdin.isatty():
+        return False
+    try:
+        answer = input(
+            f"\n{ORDER_BOUNDARY_QUESTION}\n(граница заказа шире участка работ, результат предварительный) [y/N]: "
+        )
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes", "д", "да")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -368,9 +397,19 @@ def main(argv: list[str] | None = None) -> int:
 
         try:
             territory = territory_polygon(zones, utilities)
+        except OrderBoundaryOnlyError as error:
+            if not (args.use_order_boundary or _confirm_order_boundary()):
+                raise SystemExit(
+                    f"\nОШИБКА: {ORDER_BOUNDARY_QUESTION} Чтобы построить план по ней, "
+                    "запустите с --use-order-boundary (результат будет предварительным)."
+                ) from error
+            territory = territory_polygon(zones, utilities, allow_order_boundary=True)
         except MissingTerritoryError as error:
             raise SystemExit(f"\nОШИБКА: {error}") from error
         clock.begin(f"2/5 Граница участка: {territory.geom_type}, площадь {territory.area:,.0f} м²".replace(",", " "))
+        territory_from = territory_source(zones)
+        if territory_from == ORDER_BOUNDARY_ZONE_TYPE:
+            print(f"  ! ВНИМАНИЕ: {ORDER_BOUNDARY_NOTE}", file=sys.stderr)
         if unreadable:
             # Found live, «10. Старый Гай ул»: the file carrying the real
             # boundary failed to parse (DXFStructureError), a different,
@@ -539,6 +578,8 @@ def main(argv: list[str] | None = None) -> int:
         scoring_mode=args.scoring,
         planting_types=planting_types,
         territory_area_m2=round(float(territory.area), 2),
+        territory_source=territory_from,
+        territory_note=ORDER_BOUNDARY_NOTE if territory_from == ORDER_BOUNDARY_ZONE_TYPE else None,
         area_budget=[budget.to_dict() for budget in budgets],
     )
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -552,6 +593,8 @@ def main(argv: list[str] | None = None) -> int:
 
     clock.finish()
     print(f"\nГотово за {time.perf_counter() - clock.total_started:.1f} с.\n  DXF:   {args.output}\n  отчёт: {report_path}{csv_line}")
+    if territory_from == ORDER_BOUNDARY_ZONE_TYPE:
+        print(f"\n! ВНИМАНИЕ: {ORDER_BOUNDARY_NOTE}")
     if unverified:
         print("\nНесверенные ссылки на нормативы (значение применено, но с текстом акта не сверялось):")
         for citation, count in sorted(unverified.items(), key=lambda kv: -kv[1]):

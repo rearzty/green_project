@@ -33,6 +33,12 @@ export interface ProjectOut {
   /** Problems the upload survived but the user should know about -- unread
    * bundle files, no territory boundary found. Ready-to-show Russian text. */
   warnings?: string[];
+  /** Where the site outline comes from: "territory" (work-area boundary),
+   * "order_boundary" (only the survey order boundary is in the delivery) or
+   * null -- see backend geo_engine/territory.py::territory_source. */
+  territory_source?: string | null;
+  /** The user already agreed to plan by the survey order boundary. */
+  use_order_boundary?: boolean;
 }
 
 /** How much of the territory is left for one planting type and what took
@@ -248,7 +254,8 @@ function startGenerate(
   treeSpacingM?: number,
   shrubSpacingM?: number,
   treeRows?: number,
-  treesInPaving?: boolean
+  treesInPaving?: boolean,
+  useOrderBoundary?: boolean
 ): Promise<{ job_id: string }> {
   // tree_spacing_m/shrub_spacing_m left undefined when not overridden --
   // JSON.stringify drops undefined object properties, so the field is simply
@@ -261,6 +268,7 @@ function startGenerate(
     shrub_spacing_m: shrubSpacingM,
     tree_rows: treeRows,
     trees_in_paving: treesInPaving,
+    use_order_boundary: useOrderBoundary,
   });
 }
 
@@ -290,6 +298,7 @@ export async function generatePlan(
     shrubSpacingM?: number;
     treeRows?: number;
     treesInPaving?: boolean;
+    useOrderBoundary?: boolean;
   }
 ): Promise<PlanOut> {
   const { job_id } = await startGenerate(
@@ -299,7 +308,8 @@ export async function generatePlan(
     options?.treeSpacingM,
     options?.shrubSpacingM,
     options?.treeRows,
-    options?.treesInPaving
+    options?.treesInPaving,
+    options?.useOrderBoundary
   );
   for (;;) {
     if (options?.signal?.aborted) throw new ApiError("Генерация отменена.", 0);

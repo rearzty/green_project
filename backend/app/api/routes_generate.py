@@ -73,6 +73,8 @@ async def generate(request: GenerateRequest, project: ProjectDep) -> GenerateJob
     seconds on a real-scale territory (see CLAUDE.md). The frontend polls
     GET .../generate/{job_id} for completion, then fetches the plan through
     the existing GET .../plans/{plan_id}."""
+    if request.use_order_boundary:
+        project.use_order_boundary = True
     job_id = generation_jobs.create_job()
     task = asyncio.create_task(
         _run_generate_job(

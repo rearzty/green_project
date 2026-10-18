@@ -52,6 +52,9 @@ class ProjectOut(BaseModel):
     crs_verified: bool
     created_at: datetime
     warnings: list[str] = []
+    # См. Project.territory_source / Project.use_order_boundary.
+    territory_source: str | None = None
+    use_order_boundary: bool = False
 
 
 class LayersRasterGroupOut(BaseModel):

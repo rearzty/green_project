@@ -168,7 +168,7 @@ def _get_or_build_territory_locked(project: Project) -> BaseGeometry:
             return _territory_cache[key]
 
     utilities, zones = layers_to_domain(project.layers)
-    territory = territory_polygon(zones, utilities)
+    territory = territory_polygon(zones, utilities, allow_order_boundary=project.use_order_boundary)
     shapely.prepare(territory)
 
     with _struct_lock:

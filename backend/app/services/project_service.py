@@ -55,7 +55,7 @@ from geo_engine.io.dxf_reader import (
 from geo_engine.io.dwg_convert import available_backend
 from geo_engine.io.shp_geojson_reader import read_vector_file
 from geo_engine.model import Utility, Zone
-from geo_engine.territory import MissingTerritoryError, territory_polygon
+from geo_engine.territory import ORDER_BOUNDARY_ZONE_TYPE, MissingTerritoryError, territory_polygon, territory_source
 
 SUPPORTED_SUFFIXES = {".dxf", ".dwg", ".zip", ".geojson", ".json", ".shp"}
 
@@ -334,9 +334,14 @@ def _territory_warnings(utilities: list[Utility], zones: list[Zone]) -> list[str
     Сама загрузка не отклоняется: чертёж всё равно можно посмотреть на карте.
     """
     try:
-        territory_polygon(zones, utilities)
+        territory_polygon(zones, utilities, allow_order_boundary=True)
     except MissingTerritoryError as error:
         return [f"Граница участка не найдена — план построить не получится. {error}"]
+    if territory_source(zones) == ORDER_BOUNDARY_ZONE_TYPE:
+        return [
+            "Границы работ в поставке нет, есть только граница заказа на съёмку. "
+            "При генерации можно построить план по ней — результат будет предварительным."
+        ]
     return []
 
 
@@ -376,6 +381,7 @@ async def create_project_from_file(
         source_crs=source_crs or detected_crs,
         crs_verified=source_crs is None and detected_crs is not None,
         warnings=warnings,
+        territory_source=territory_source(zones),
     )
     project.source_file = await run_in_threadpool(_keep_source, project.id, upload_path)
     project.layers = [

@@ -126,6 +126,14 @@ class Project:
     # положить план поверх ИСХОДНОГО чертежа со ссылками, как делает CLI
     # (см. export_service.py). None для проектов из GeoJSON.
     source_file: str | None = None
+    # Откуда граница участка: "territory" (граница работ), "order_boundary"
+    # (в поставке только граница заказа на съёмку) или None — см.
+    # geo_engine.territory.territory_source. Считается при загрузке.
+    territory_source: str | None = None
+    # Пользователь согласился строить план по границе заказа (вопрос задаёт
+    # фронт перед генерацией). Действует на весь проект — и на генерацию, и на
+    # проверку правок, чтобы граница участка у них была одна и та же.
+    use_order_boundary: bool = False
 
     layers: list[Layer] = field(default_factory=list)
     plans: list[Plan] = field(default_factory=list)

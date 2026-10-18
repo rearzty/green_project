@@ -28,6 +28,7 @@ from backend.app.services import compliance_service
 from backend.app.services.pipeline_service import plan_norms
 from geo_engine.compliance import OBJECT_LABELS_RU
 from geo_engine.norms import PlantingNorms
+from geo_engine.territory import ORDER_BOUNDARY_NOTE, ORDER_BOUNDARY_ZONE_TYPE
 
 router = APIRouter(prefix="/api/projects/{project_id}/plans/{plan_id}", tags=["compliance"])
 
@@ -84,6 +85,8 @@ async def compliance_report_json(plan: PlanDep) -> JSONResponse:
         norms,
         project_id=plan.project_id,
         plan_id=plan.id,
+        territory_source=ORDER_BOUNDARY_ZONE_TYPE if plan.project.use_order_boundary else "territory",
+        territory_note=ORDER_BOUNDARY_NOTE if plan.project.use_order_boundary else None,
     )
     return JSONResponse(content=report)
 

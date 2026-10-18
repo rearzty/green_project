@@ -107,6 +107,8 @@ async def get_project(project: ProjectMetaDep) -> ProjectOut:
         crs_verified=project.crs_verified,
         created_at=project.created_at,
         warnings=project.warnings,
+        territory_source=project.territory_source,
+        use_order_boundary=project.use_order_boundary,
     )
 
 
