@@ -56,6 +56,14 @@ export interface PlanOut {
   scoring_mode: ScoringMode;
   features: GeoJSONFeatureCollection;
   area_budget?: AreaBudget[];
+  // Остальной рецепт плана (backend Plan хранит его целиком). Необязательные:
+  // бэкенд может их и не прислать — тогда рецепт берётся из того, что
+  // запомнил этот браузер при генерации (lib/planRecipes.ts).
+  planting_types?: PlantingType[];
+  tree_spacing_m?: number | null;
+  shrub_spacing_m?: number | null;
+  tree_rows?: number;
+  trees_in_paving?: boolean;
 }
 
 export interface PlanSummary {
@@ -84,11 +92,50 @@ export interface ItemsRetypeResult {
 export class ApiError extends Error {
   constructor(
     message: string,
-    readonly status: number
+    readonly status: number,
+    /** У сервера больше нет проекта, к которому был запрос (см. projectGoneError). */
+    readonly projectGone = false
   ) {
     super(message);
     this.name = "ApiError";
   }
+}
+
+/** Проекты живут только в памяти backend (CLAUDE.md, «Нет базы данных
+ * вообще»): после его перезапуска любой запрос по старому id отвечает 404
+ * «Проект не найден — возможно, он был удалён». Пользователь ничего не
+ * удалял — так и говорим, и что делать дальше. */
+export const PROJECT_GONE_MESSAGE =
+  "Сервер перезапускался, а проекты хранятся только в его памяти — этого чертежа на нём больше нет. Загрузите чертёж заново в панели слева и постройте план ещё раз.";
+
+const lostProjects = new Set<string>();
+const projectLostListeners = new Set<(projectId: string) => void>();
+
+/** Тот же 404, что у deps.py::get_project_or_404, — по тексту detail: у
+ * плана и посадки свои 404 («План не найден…»), их с потерей проекта путать
+ * нельзя. GET самого проекта — без сверки текста: там другого 404 нет. */
+function projectGoneError(path: string, error: ApiError): ApiError {
+  const match = /^\/api\/projects\/([0-9a-f-]{8,})(\/|$)/i.exec(path);
+  if (error.status !== 404 || !match) return error;
+  const ownPath = path === `/api/projects/${match[1]}`;
+  if (!ownPath && !error.message.startsWith("Проект не найден")) return error;
+  if (!lostProjects.has(match[1])) {
+    lostProjects.add(match[1]);
+    projectLostListeners.forEach((listener) => listener(match[1]));
+  }
+  return new ApiError(PROJECT_GONE_MESSAGE, 404, true);
+}
+
+/** Сервер уже ответил, что этого проекта у него нет. Синхронно — чтобы
+ * сразу после неудачного запроса выбрать текст ошибки, не дожидаясь рендера. */
+export function isProjectLost(projectId: string | undefined): boolean {
+  return projectId !== undefined && lostProjects.has(projectId);
+}
+
+/** Подписка на «проекта больше нет на сервере» (useProjectSession). */
+export function subscribeProjectLost(listener: (projectId: string) => void): () => void {
+  projectLostListeners.add(listener);
+  return () => projectLostListeners.delete(listener);
 }
 
 function fallbackMessage(status: number): string {
@@ -114,14 +161,21 @@ async function errorFromResponse(res: Response): Promise<ApiError> {
   return new ApiError(fallbackMessage(res.status), res.status);
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/** fetch с теми же текстами ошибок, что у всех запросов, — для ответов,
+ * которые читаются не как JSON (файлы отчётов). */
+async function fetchOk(path: string, init?: RequestInit): Promise<Response> {
   let res: Response;
   try {
     res = await fetch(`${API_URL}${path}`, init);
   } catch {
     throw new ApiError("Нет связи с сервером — проверьте, что backend запущен и доступен.", 0);
   }
-  if (!res.ok) throw await errorFromResponse(res);
+  if (!res.ok) throw projectGoneError(path, await errorFromResponse(res));
+  return res;
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetchOk(path, init);
   if (res.status === 204) return undefined as T;
   return res.json() as Promise<T>;
 }
@@ -497,6 +551,10 @@ export interface ComplianceCheck {
   citation: string;
   table_row: string;
   verified: boolean;
+  /** Подпись объекта по-русски (geo_engine/compliance.py::OBJECT_LABELS_RU). */
+  object_label: string;
+  /** Поправка по породе, если она увеличила табличный отступ. */
+  species_rule: string;
 }
 
 export interface ItemCompliance {
@@ -519,15 +577,19 @@ export async function getItemsCompliance(projectId: string, planId: string, ids:
   return items;
 }
 
-/** Прямая ссылка на скачивание полного отчёта по плану -- вызывающий код
- * просто кликает по ней (тот же приём, что и у exportDxf), файл льётся из
- * ответа сервера напрямую в браузер, не через JS. */
-export function complianceReportUrl(projectId: string, planId: string, format: "json" | "csv"): string {
-  return `${API_URL}/api/projects/${projectId}/plans/${planId}/compliance-report.${format}`;
+/** Полный отчёт обоснований по плану — файлом в памяти, а не прямой ссылкой
+ * (как у exportDxf): по ссылке ошибка сервера уводила браузер со страницы
+ * приложения вместе с разговором Юны, а JSON без Content-Disposition
+ * браузер вовсе открывал вместо скачивания. Это обоснования посадок, а не
+ * многосотмегабайтный чертёж, — в памяти вкладки он помещается. */
+export async function fetchComplianceReport(projectId: string, planId: string, format: "json" | "csv"): Promise<Blob> {
+  const res = await fetchOk(`/api/projects/${projectId}/plans/${planId}/compliance-report.${format}`);
+  return res.blob();
 }
 
 // Юна -- the in-app chat assistant (components/AssistantChat.tsx). The
-// backend is a stateless proxy to an LLM (see assistant_service.py): it
+// backend is stateless -- an LLM when a key is configured, built-in command
+// parsing otherwise (see assistant_service.py): it
 // holds no conversation of its own, so the full chat log travels on every
 // message, same as `settings` (the panel's current generation recipe) --
 // Юна reasons about new absolute values relative to what's actually set,
@@ -556,9 +618,35 @@ export interface AssistantAction {
   trees_in_paving: boolean;
 }
 
+export interface AssistantSelection {
+  count: number;
+  trees: number;
+  shrubs: number;
+  lawns: number;
+}
+
+/** Действия, которые Юна просит выполнить, — фронт делает их тем же кодом,
+ * что кнопки панели и карточки. Контракт: backend/app/schemas/assistant.py. */
+export type AssistantCommand =
+  | { type: "settings"; settings: AssistantAction }
+  | { type: "edit_selection"; operation: "delete" | "to_tree" | "to_shrub" }
+  | { type: "select"; target: "violations" | "trees" | "shrubs" | "lawn" | "all" | "none"; species?: string | null }
+  | { type: "ui"; command: "export_dxf" | "report_json" | "report_csv" | "show_3d" | "show_2d" };
+
 export interface AssistantMessageResult {
   reply: string;
+  actions: AssistantCommand[];
+  /** Устаревшее: рецепт первой settings-команды. */
   action: AssistantAction | null;
+  /** "llm" — ответила языковая модель, "rules" — встроенный разбор команд без ИИ. */
+  mode: "llm" | "rules";
+  notice?: string | null;
+}
+
+export interface AssistantStatus {
+  llm_configured: boolean;
+  provider: string;
+  model?: string | null;
 }
 
 export async function askAssistant(
@@ -566,15 +654,33 @@ export async function askAssistant(
   message: string,
   history: AssistantChatMessage[],
   currentSettings: AssistantGenerationSettings,
-  // Какой план на экране и какая посадка выделена: по ним бэкенд собирает
-  // для Юны сводку плана и обоснование посадки (assistant_context.py).
-  context?: { planId?: string; selectedItemId?: string }
+  // Что сейчас на экране. По плану и выделенной посадке бэкенд собирает Юне
+  // сводку и обоснование (assistant_context.py); по выделению, нарушениям и
+  // виду решает, какие команды вообще имеют смысл («удали выделенные» без
+  // выделения — нет).
+  context: {
+    planId?: string;
+    selectedItemId?: string;
+    selection?: AssistantSelection;
+    /** null — план ещё не проверен на нормативы. */
+    violationsCount?: number | null;
+    view?: "2d" | "3d";
+  } = {}
 ): Promise<AssistantMessageResult> {
   return postJson(`/api/projects/${projectId}/assistant/message`, {
     message,
     history,
     settings: currentSettings,
-    plan_id: context?.planId,
-    selected_item_id: context?.selectedItemId,
+    plan_id: context.planId,
+    selected_item_id: context.selectedItemId,
+    selection: context.selection,
+    violations_count: context.violationsCount,
+    view: context.view,
   });
+}
+
+/** Подключена ли языковая модель — для значка режима в шапке чата. Без неё
+ * Юна не молчит, а отвечает встроенным разбором команд (mode "rules"). */
+export async function getAssistantStatus(): Promise<AssistantStatus> {
+  return request("/api/config/assistant");
 }

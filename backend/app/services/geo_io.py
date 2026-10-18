@@ -138,6 +138,17 @@ def _crown_of(item: PlantingItemRow) -> str | None:
     return species.crown if species is not None else None
 
 
+def _crown_diameter_of(item: PlantingItemRow) -> float | None:
+    """Диаметр кроны дерева, м (geo_engine/config/species.yaml) — сводка плана
+    на фронте считает по нему, какую долю допустимой площади заняли кроны."""
+    if item.planting_type != "tree":
+        return None
+    from geo_engine.species import load_catalogue
+
+    species = load_catalogue().get(item.species)
+    return species.crown_diameter_m if species is not None else None
+
+
 def planting_item_to_geojson_feature(item: PlantingItemRow, source_crs: str | None = None) -> GeoJSONFeature:
     geometry = _to_wgs84(db_to_shape(item.geometry), source_crs)
     return GeoJSONFeature(
@@ -147,6 +158,7 @@ def planting_item_to_geojson_feature(item: PlantingItemRow, source_crs: str | No
             "planting_type": item.planting_type,
             "species": item.species,
             "crown": _crown_of(item),
+            "crown_m": _crown_diameter_of(item),
             "score": item.score,
             "rationale": item.rationale,
             "is_manual_edit": item.is_manual_edit,
@@ -180,6 +192,7 @@ def _item_properties(item: PlantingItemRow) -> dict:
         "planting_type": item.planting_type,
         "species": item.species,
         "crown": _crown_of(item),
+        "crown_m": _crown_diameter_of(item),
         "score": item.score,
         "rationale": item.rationale,
         "is_manual_edit": item.is_manual_edit,

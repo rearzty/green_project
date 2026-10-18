@@ -87,6 +87,13 @@ FROM python:3.11-slim
 # страницы, запасной список известных имён, а итог — громкая строка в логе
 # сборки в любую сторону. Сборку провал загрузки по-прежнему не роняет —
 # LibreDWG остаётся рабочим, хоть и худшим путём.
+#
+# Сайт ODA закрыт для России: из РФ guestfiles отдаёт 403 «Access restricted»
+# (OFAC — страна под санкциями), и сборка у организаторов в Москве всегда
+# откатывалась бы на LibreDWG. Поэтому сначала берётся установщик, положенный
+# в infra/vendor/ (ODAFileConverter_QT6_lnxX64_*.deb — см. infra/vendor/README.md),
+# и только если его нет — сеть.
+COPY infra/vendor/ /tmp/vendor/
 RUN set -eu; \
     if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
         apt-get update; \
@@ -98,7 +105,14 @@ RUN set -eu; \
             libasound2t64 libdbus-1-3 libopengl0 libegl1 libglx0 libglib2.0-0t64; \
         current="$(wget -qO- https://www.opendesign.com/guestfiles/oda_file_converter 2>/dev/null \
             | grep -o 'ODAFileConverter_QT6_lnxX64_[^"&<> ]*\.deb' | head -n1 || true)"; \
+        vendored="$(ls /tmp/vendor/ODAFileConverter*lnxX64*.deb 2>/dev/null | head -n1 || true)"; \
+        if [ -n "$vendored" ]; then \
+            cp "$vendored" /tmp/oda_converter.deb; \
+            echo "ODA File Converter: взят из infra/vendor ($(basename "$vendored"))"; \
+            current=""; \
+        fi; \
         for name in $current ODAFileConverter_QT6_lnxX64_11dll.deb ODAFileConverter_QT6_lnxX64_8.3dll_27.1.deb; do \
+            [ -s /tmp/oda_converter.deb ] && break; \
             if wget -q "https://www.opendesign.com/guestfiles/get?filename=$name" -O /tmp/oda_converter.deb; then \
                 echo "ODA File Converter: скачан $name"; break; \
             fi; \
@@ -108,7 +122,7 @@ RUN set -eu; \
             apt-get install -y --no-install-recommends /tmp/oda_converter.deb \
                 || echo "!!! ODA File Converter: установка не удалась"; \
         fi; \
-        rm -rf /tmp/oda_converter.deb /var/lib/apt/lists/*; \
+        rm -rf /tmp/oda_converter.deb /tmp/vendor /var/lib/apt/lists/*; \
         oda_bin="$(ls /usr/bin/ODAFileConverter_*/ODAFileConverter 2>/dev/null | head -n1 || true)"; \
         oda_missing="$( [ -n "$oda_bin" ] && ldd "$oda_bin" | grep "not found" || true)"; \
         if [ -n "$oda_missing" ]; then \

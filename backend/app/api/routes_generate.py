@@ -30,6 +30,11 @@ def _to_plan_out(plan: Plan) -> PlanOut:
         scoring_mode=plan.scoring_mode,
         features=planting_items_to_feature_collection(plan.items, display_crs(plan.project)),
         area_budget=plan.area_budget,
+        planting_types=plan.planting_types,
+        tree_spacing_m=plan.tree_spacing_m,
+        shrub_spacing_m=plan.shrub_spacing_m,
+        tree_rows=plan.tree_rows,
+        trees_in_paving=plan.trees_in_paving,
     )
 
 

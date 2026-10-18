@@ -5,6 +5,9 @@ __pycache__/
 *.egg-info/
 
 ml_scoring/artifacts/*.joblib
+# Модель по проектным решениям пилота поставляется готовой: обучить её в образе
+# нельзя — датасет организаторов в репозиторий не входит (ml_scoring/train_designer.py).
+!ml_scoring/artifacts/designer_model.joblib
 
 data/synthetic/*.geojson
 data/synthetic/*.dxf
@@ -41,3 +44,9 @@ preview/
 # удаляются в течение сессии; забытый один раз без .gitignore разово нагнал
 # 1.1 ГБ конвертированных DXF, которые PR-просмотрщик посчитал «новым кодом».
 .scratch_*/
+
+# Кэш scripts/evaluate.py: сконвертированные DWG, прочитанный вход улиц, эталон, результаты
+data/eval_cache*/
+
+# Установщики ODA для сборки образа — локально, не в git (см. infra/vendor/README.md)
+infra/vendor/*.deb

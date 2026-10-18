@@ -220,6 +220,8 @@ def _group_color(key: str) -> str:
 def _group_label(key: str) -> str:
     if key.startswith(_ZONING_PREFIX):
         category = key[len(_ZONING_PREFIX) :]
+        if category == "unknown":
+            return "Зонирование"
         return _ZONING_CATEGORY_LABELS.get(category, f"Зонирование: {category}")
     # Запасной вариант не отдаёт сырой ключ наружу: латиница в русской
     # легенде читается как сбой, а не как «тип без подписи».

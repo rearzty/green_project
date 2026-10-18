@@ -6,6 +6,8 @@ imports the other.
 
 from __future__ import annotations
 
+import logging
+
 from collections import Counter
 from collections.abc import Callable
 
@@ -22,6 +24,8 @@ from geo_engine.species import load_catalogue
 from geo_engine.territory import MissingTerritoryError, territory_polygon  # noqa: F401  (re-exported by name for existing callers)
 from ml_scoring.heuristic_scorer import HeuristicScorer
 from ml_scoring.ml_scorer import MLScorer
+
+logger = logging.getLogger(__name__)
 from ml_scoring.scoring_strategy import ScoringStrategy
 
 
@@ -36,8 +40,22 @@ def _existing_greenery(zones):
     return [z.geometry for z in zones if z.zone_type == "existing_greenery"]
 
 
-def build_scorer(scoring_mode: str, norms, existing_greenery) -> ScoringStrategy:
+def build_scorer(scoring_mode: str, norms, utilities, zones, territory) -> ScoringStrategy:
+    existing_greenery = _existing_greenery(zones)
     if scoring_mode == "ml":
+        # «ML» — модель по реальным проектным решениям пилота
+        # (ml_scoring/designer_model.py), если её артефакт есть; иначе прежняя
+        # модель на синтетике.
+        if settings.designer_artifact_path.is_file():
+            from ml_scoring.designer_model import DesignerScorer
+
+            try:
+                return DesignerScorer(norms, utilities, zones, territory, artifact_path=settings.designer_artifact_path)
+            except Exception:  # noqa: BLE001
+                # Артефакт сохранён joblib-ом конкретной версии scikit-learn;
+                # в образе с другой версией он может не открыться — режим ML
+                # тогда не падает, а работает на прежней модели.
+                logger.exception("Не удалось загрузить модель проектировщика — режим ML на синтетической модели")
         return MLScorer(norms, existing_greenery=existing_greenery, artifact_path=settings.ml_artifact_path)
     return HeuristicScorer(norms, existing_greenery=existing_greenery)
 
@@ -185,8 +203,7 @@ async def ensure_materialized(plan: Plan) -> Plan:
     norms = plan_norms(plan)
     utilities, zones = layers_to_domain(plan.project.layers)
     territory = territory_polygon(zones, utilities, allow_order_boundary=plan.project.use_order_boundary)
-    existing_greenery = _existing_greenery(zones)
-    scorer = build_scorer(plan.scoring_mode, norms, existing_greenery)
+    scorer = build_scorer(plan.scoring_mode, norms, utilities, zones, territory)
 
     items = await run_in_threadpool(
         _compute_planting_rows,
@@ -256,8 +273,7 @@ async def generate_plan(
         norms = norms.with_trees_in_paving()
     utilities, zones = layers_to_domain(project.layers)
     territory = territory_polygon(zones, utilities, allow_order_boundary=project.use_order_boundary)
-    existing_greenery = _existing_greenery(zones)
-    scorer = build_scorer(scoring_mode, norms, existing_greenery)
+    scorer = build_scorer(scoring_mode, norms, utilities, zones, territory)
 
     for existing_plan in project.plans:
         existing_plan.is_current = False

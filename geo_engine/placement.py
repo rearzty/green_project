@@ -11,6 +11,8 @@ from __future__ import annotations
 import math
 from typing import Callable
 
+from shapely.geometry import Point
+
 from geo_engine.model import PlantingCandidate, PlantingItem
 from geo_engine.norms import PlantingNorms
 
@@ -61,6 +63,61 @@ _CANOPY_BUFFER_QUAD_SEGS = 32
 # get accepted next to each other.
 _CANOPY_BUFFER_INFLATION = 1.0 / math.cos(math.pi / (4 * _CANOPY_BUFFER_QUAD_SEGS))
 
+# ...а две ТОЧКИ сравниваются точно — расстоянием между центрами, без
+# многоугольников вовсе. Раздутые буферы выше гарантировали «не ближе нормы»,
+# но ценой обратной ошибки: два кандидата ровно на нормативном расстоянии
+# (ряд и живая изгородь ставят точки именно так — с шагом, равным интервалу)
+# давали буферы, перекрытые на волосок (2·r·(раздувание − 1)), и второй
+# отклонялся. Отбор брал ровно каждую вторую точку ряда — замерено: 200 из 400
+# при любом шаге и направлении; на реальной изгороди с шагом 0,5 м — 349 из
+# 577, а при 0,6 м — 478 из 480 (там шаг ряда выходил чуть больше номинала
+# из-за раскладки остатка), так что «кусты пореже» давали больше кустов, чем
+# по умолчанию. Допуск — микрон: на три порядка строже миллиметра, который
+# прощает проверка норм (compliance._TOLERANCE_M), так что принятая пара её
+# всегда проходит. Буферы остаются для пары точка–многоугольник (газон).
+_SPACING_EPS_M = 1e-6
+
+
+class _Footprint:
+    """Что занимает принятая посадка: круг кроны точки или сам многоугольник.
+
+    Многоугольник для точки строится лениво — только если её сравнивают с
+    площадным объектом; для пары точек он не нужен вовсе."""
+
+    __slots__ = ("x", "y", "radius", "_polygon")
+
+    def __init__(self, geometry, radius: float):
+        if geometry.geom_type == "Point":
+            self.x, self.y, self.radius = geometry.x, geometry.y, radius
+            self._polygon = None
+        else:
+            self.x = self.y = self.radius = None
+            self._polygon = geometry
+
+    @property
+    def is_point(self) -> bool:
+        return self.radius is not None
+
+    @property
+    def polygon(self):
+        if self._polygon is None:
+            self._polygon = Point(self.x, self.y).buffer(
+                self.radius * _CANOPY_BUFFER_INFLATION, quad_segs=_CANOPY_BUFFER_QUAD_SEGS
+            )
+        return self._polygon
+
+    @property
+    def bounds(self) -> tuple[float, float, float, float]:
+        if self.is_point:
+            r = self.radius
+            return self.x - r, self.y - r, self.x + r, self.y + r
+        return self._polygon.bounds
+
+    def conflicts(self, other: "_Footprint") -> bool:
+        if self.is_point and other.is_point:
+            return math.hypot(self.x - other.x, self.y - other.y) < self.radius + other.radius - _SPACING_EPS_M
+        return self.polygon.intersects(other.polygon)
+
 
 def _cell_index(x: float, y: float, cell_size: float) -> tuple[int, int]:
     return int(x // cell_size), int(y // cell_size)
@@ -80,8 +137,9 @@ def greedy_select(
     species_by_type: dict[str, str] | None = None,
 ) -> list[PlantingItem]:
     """Score every candidate, then greedily accept highest-scoring ones first,
-    skipping any candidate whose canopy/spacing buffer would overlap an
-    already-accepted item.
+    skipping any candidate whose canopy/spacing footprint would overlap an
+    already-accepted item (for two points: centres closer than the sum of the
+    two canopy radii, see `_SPACING_EPS_M`).
 
     Overlap checks go through a uniform spatial hash grid keyed by each
     footprint's bounding box, so a candidate is only compared against
@@ -101,31 +159,31 @@ def greedy_select(
     scored.sort(key=lambda t: t[1], reverse=True)
 
     selected: list[PlantingItem] = []
-    indexed_footprints: list = []  # footprints small enough to live in the grid
-    large_footprints: list = []  # footprints too large to bucket usefully (rare)
+    indexed_footprints: list[_Footprint] = []  # footprints small enough to live in the grid
+    large_footprints: list[_Footprint] = []  # footprints too large to bucket usefully (rare)
     grid: dict[tuple[int, int], list[int]] = {}
 
     for candidate, score, rationale in scored:
+        # Отрицательная оценка — скоринг отклонил место целиком (так модель
+        # по проектным решениям, ml_scoring/designer_model.py, отсеивает
+        # допустимые, но непохожие на выбор проектировщика места). Эвристика
+        # и MLScorer дают оценки в [0, 1] и сюда не попадают.
+        if score < 0:
+            continue
         spacing = norms.spacing_for(candidate.planting_type)
-        footprint = (
-            candidate.geometry.buffer(
-                spacing.canopy_radius_m * _CANOPY_BUFFER_INFLATION, quad_segs=_CANOPY_BUFFER_QUAD_SEGS
-            )
-            if candidate.geometry.geom_type == "Point"
-            else candidate.geometry
-        )
+        footprint = _Footprint(candidate.geometry, spacing.canopy_radius_m)
 
         cell_size = max(spacing.canopy_radius_m * 2, 1.0)
         cells = _cells_for_bounds(footprint.bounds, cell_size)
         fits_grid = len(cells) <= _MAX_CELLS_PER_FOOTPRINT
 
-        if any(footprint.intersects(existing) for existing in large_footprints):
+        if any(footprint.conflicts(existing) for existing in large_footprints):
             continue
         if fits_grid:
             nearby = {idx for cell in cells for idx in grid.get(cell, ())}
-            if any(footprint.intersects(indexed_footprints[idx]) for idx in nearby):
+            if any(footprint.conflicts(indexed_footprints[idx]) for idx in nearby):
                 continue
-        elif any(footprint.intersects(existing) for existing in indexed_footprints):
+        elif any(footprint.conflicts(existing) for existing in indexed_footprints):
             continue
 
         selected.append(

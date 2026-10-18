@@ -9,9 +9,15 @@ services:
       # Юна (assistant_service.py) -- read from the host's own environment
       # (docker compose substitutes ${VAR} from the shell/.env next to this
       # file), not hardcoded, so the key never lives in version control.
-      # Unset on the host -> empty string here -> settings.groq_api_key is
-      # falsy -> the assistant endpoint returns a clear "not configured"
-      # error instead of the feature silently misbehaving.
+      # All optional (three setups in infra/.env.example): unset on the host
+      # -> empty string here -> config.py ignores empty values and keeps its
+      # defaults -> no model configured -> Юна answers with the built-in
+      # command parser instead, so a plain `up --build` still has a chat.
+      GREENPROJECT_LLM_BASE_URL: ${GREENPROJECT_LLM_BASE_URL:-}
+      GREENPROJECT_LLM_MODEL: ${GREENPROJECT_LLM_MODEL:-}
+      GREENPROJECT_LLM_API_KEY: ${GREENPROJECT_LLM_API_KEY:-}
+      GREENPROJECT_LLM_TIMEOUT_S: ${GREENPROJECT_LLM_TIMEOUT_S:-}
+      GREENPROJECT_LLM_REASONING_EFFORT: ${GREENPROJECT_LLM_REASONING_EFFORT:-}
       GREENPROJECT_GROQ_API_KEY: ${GREENPROJECT_GROQ_API_KEY:-}
     ports:
       - "8000:8000"

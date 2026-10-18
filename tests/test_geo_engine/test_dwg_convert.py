@@ -239,3 +239,47 @@ class TestOdaBatchConversion:
             convert_with_oda_batch([source], output_dir, oda_executable="fake-oda")
 
         assert captured["cmd"][-1] == "*.dwg"
+
+
+class TestConversionCache:
+    """Кэш конвертаций (GREENPROJECT_DWG_CACHE_DIR) — только для повторных
+    прогонов по тем же чертежам, см. scripts/evaluate.py."""
+
+    def test_a_cache_hit_creates_the_output_dir_and_skips_the_converter(self, tmp_path, monkeypatch):
+        from geo_engine.io import dwg_convert
+
+        monkeypatch.setenv(dwg_convert.DWG_CACHE_ENV, str(tmp_path / "cache"))
+        dwg = tmp_path / "plan.dwg"
+        dwg.write_bytes(b"dwg")
+        calls = []
+
+        def fake_libredwg(path, output_dir, executable=None):
+            calls.append(path)
+            out = Path(output_dir) / "plan.dxf"
+            out.write_text("dxf")
+            return out
+
+        monkeypatch.setattr(dwg_convert, "convert_with_libredwg", fake_libredwg)
+        first = dwg_convert.convert_dwg_to_dxf(dwg, tmp_path, backend="libredwg")
+        second = dwg_convert.convert_dwg_to_dxf(dwg, tmp_path / "missing" / "dir", backend="libredwg")
+        assert len(calls) == 1
+        assert first.read_text() == second.read_text() == "dxf"
+
+    def test_without_the_variable_nothing_is_cached(self, tmp_path, monkeypatch):
+        from geo_engine.io import dwg_convert
+
+        monkeypatch.delenv(dwg_convert.DWG_CACHE_ENV, raising=False)
+        dwg = tmp_path / "plan.dwg"
+        dwg.write_bytes(b"dwg")
+        calls = []
+
+        def fake_libredwg(path, output_dir, executable=None):
+            calls.append(path)
+            out = Path(output_dir) / "plan.dxf"
+            out.write_text("dxf")
+            return out
+
+        monkeypatch.setattr(dwg_convert, "convert_with_libredwg", fake_libredwg)
+        dwg_convert.convert_dwg_to_dxf(dwg, tmp_path, backend="libredwg")
+        dwg_convert.convert_dwg_to_dxf(dwg, tmp_path, backend="libredwg")
+        assert len(calls) == 2

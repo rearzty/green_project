@@ -104,6 +104,8 @@ OBJECT_LABELS_RU = {
     "retaining_wall": "подпорная стенка",
     "tram_track": "трамвайное полотно",
     "neighbour_tree": "соседнее дерево",
+    "school_kindergarten": "здание школы/детского сада",
+    "slope_toe": "подошва откоса",
 }
 
 # Расстояние между стволами — МГСН 1.02-02, п. 4.2.9.2 (8-10 м широкая крона,
@@ -356,7 +358,7 @@ def _record(index: int, item: PlantingItem, checks: list[ConstraintCheck]) -> Co
         else:
             slack = binding.actual_m - binding.required_m
             summary = (
-                f"{label.capitalize()} допустим: все нормативные отступы соблюдены. "
+                f"{label.capitalize()}: посадка допустима, все нормативные отступы соблюдены. "
                 f"Определяющее ограничение — {OBJECT_LABELS_RU.get(binding.object_type, binding.object_type)}, "
                 f"требуется {binding.required_m:.2f} м, фактически {binding.actual_m:.2f} м "
                 f"(запас {slack:.2f} м). Основание: {binding.citation}"
@@ -367,7 +369,7 @@ def _record(index: int, item: PlantingItem, checks: list[ConstraintCheck]) -> Co
     else:
         worst = min(violations, key=lambda c: c.actual_m - c.required_m)
         summary = (
-            f"{label.capitalize()} НЕ допустим: нарушен отступ от "
+            f"{label.capitalize()}: посадка НЕ допустима, нарушен отступ от "
             f"{OBJECT_LABELS_RU.get(worst.object_type, worst.object_type)} — "
             f"требуется {worst.required_m:.2f} м, фактически {worst.actual_m:.2f} м. "
             f"Основание: {worst.citation}"

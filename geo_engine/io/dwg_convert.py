@@ -67,6 +67,7 @@ obscurely deep in ezdxf.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -366,8 +367,60 @@ def convert_dwg_to_dxf(
                 )
             backend = resolved
 
+    if backend not in ("libredwg", "oda"):
+        raise ValueError(f"Unknown DWG conversion backend: {backend!r}")
+    # Ключ кэша — всё, от чего зависит результат: конвертер, его исполняемый
+    # файл и версия формата DXF на выходе.
+    # LibreDWG от версии формата не зависит — его ключ просто имя конвертера.
+    variant = backend if backend == "libredwg" else f"oda:{oda_executable or ''}:{output_version}"
+    cached = _cached_conversion(Path(dwg_path), Path(output_dir), variant)
+    if cached is not None:
+        return cached
     if backend == "libredwg":
-        return convert_with_libredwg(dwg_path, output_dir)
-    if backend == "oda":
-        return convert_with_oda(dwg_path, output_dir, oda_executable, output_version)
-    raise ValueError(f"Unknown DWG conversion backend: {backend!r}")
+        result = convert_with_libredwg(dwg_path, output_dir)
+    else:
+        result = convert_with_oda(dwg_path, output_dir, oda_executable, output_version)
+    _store_conversion(Path(dwg_path), result, variant)
+    return result
+
+
+# Opt-in conversion cache for repeated runs over the same drawings (the
+# evaluation script re-reads all pilot streets on every run; conversion is a
+# large share of each run). Off unless the variable is set -- a web upload
+# lands in a fresh temp file every time, caching it would only fill the disk.
+# Covers convert_dwg_to_dxf (LibreDWG, single-file ODA); the batched ODA path
+# (convert_with_oda_batch) is not cached.
+DWG_CACHE_ENV = "GREENPROJECT_DWG_CACHE_DIR"
+
+
+def _cache_path(dwg_path: Path, variant: str) -> Path | None:
+    cache_dir = os.environ.get(DWG_CACHE_ENV)
+    if not cache_dir:
+        return None
+    stat = dwg_path.stat()
+    key = hashlib.sha1(f"{variant}:{dwg_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode()).hexdigest()
+    return Path(cache_dir) / f"{key}.dxf"
+
+
+def _cached_conversion(dwg_path: Path, output_dir: Path, variant: str) -> Path | None:
+    cached = _cache_path(dwg_path, variant)
+    if cached is None or not cached.is_file():
+        return None
+    output_dir.mkdir(parents=True, exist_ok=True)
+    target = output_dir / f"{dwg_path.stem}.dxf"
+    target.unlink(missing_ok=True)
+    try:
+        os.link(cached, target)
+    except OSError:
+        shutil.copyfile(cached, target)
+    return target
+
+
+def _store_conversion(dwg_path: Path, converted: Path, variant: str) -> None:
+    cached = _cache_path(dwg_path, variant)
+    if cached is None:
+        return
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cached.with_suffix(f".{os.getpid()}.tmp")
+    shutil.copyfile(converted, tmp)
+    os.replace(tmp, cached)

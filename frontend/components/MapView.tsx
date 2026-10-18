@@ -118,13 +118,16 @@ function FitBounds({
   dataRef.current = { layersBounds, plan };
 
   useEffect(() => {
+    // With a plan, fit the plan itself: the raster canvas carries a fixed
+    // 150 m context margin around the territory (layer_raster.py), which on
+    // a small site shrank the actual planting to a speck in the middle.
     const bounds = L.latLngBounds([]);
-    if (dataRef.current.layersBounds) bounds.extend(dataRef.current.layersBounds);
     if (dataRef.current.plan) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const planBounds = L.geoJSON(dataRef.current.plan as any).getBounds();
       if (planBounds.isValid()) bounds.extend(planBounds);
     }
+    if (!bounds.isValid() && dataRef.current.layersBounds) bounds.extend(dataRef.current.layersBounds);
     if (bounds.isValid()) map.fitBounds(bounds, { padding: [20, 20] });
     // `layersBounds` itself isn't a dep (an edit shouldn't yank the view --
     // see this function's own doc comment), but its *presence* has to be:
@@ -139,6 +142,196 @@ function FitBounds({
     // from "not there" without measuring. Same reasoning for `plan`.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fitKey, map, Boolean(layersBounds), Boolean(plan)]);
+
+  return null;
+}
+
+/** «Покажи эти объекты» — рамка группы, которую выделила Юна (app/page.tsx).
+ * Каждый запрос — новый объект: повтор с той же рамкой тоже срабатывает.
+ * `ids` — сами объекты: по ним видно, насколько тесно они стоят. */
+export interface MapFitRequest {
+  box: LatLngBox;
+  ids?: readonly string[];
+}
+
+// Модульная, а не ref: карта размонтируется в 3D, и запрос, уже показанный
+// до этого, не должен срабатывать заново при возврате на 2D (тогда вид
+// подгоняет FitBounds под весь план, как всегда при монтировании).
+let appliedFitRequest: MapFitRequest | null = null;
+
+/** Отступ рамки от краёв свободной части карты, px. */
+const FIT_MARGIN_PX = 24;
+/** Свободный кусок меньше этого — не место для рамки: тогда поверх-лежащее
+ * не учитываем вовсе, рамка ляжет по всей карте. */
+const MIN_FREE_W_PX = 200;
+const MIN_FREE_H_PX = 160;
+
+type PixelRect = { left: number; top: number; right: number; bottom: number };
+
+/** Части карты, не закрытые тем, что лежит поверх неё (атрибут
+ * data-map-overlay: открытый чат Юны, сводка плана, карточка выделения), —
+ * в пикселях контейнера карты. Меряется по DOM в момент подгонки, а не
+ * задаётся числами: ширина чата зависит от окна и панели, карточки есть не
+ * всегда, чат может быть закрыт. Кандидаты — прямоугольники по краям помех
+ * (их единицы, кандидатов — сотни), не меньше MIN_FREE_*_PX; помех нет или
+ * свободного места не осталось — вся карта. */
+function freeMapRects(map: L.Map): PixelRect[] {
+  const container = map.getContainer().getBoundingClientRect();
+  const width = container.width;
+  const height = container.height;
+  const blocks: PixelRect[] = [];
+  document.querySelectorAll<HTMLElement>("[data-map-overlay]").forEach((el) => {
+    const r = el.getBoundingClientRect();
+    const left = Math.max(0, r.left - container.left);
+    const right = Math.min(width, r.right - container.left);
+    const top = Math.max(0, r.top - container.top);
+    const bottom = Math.min(height, r.bottom - container.top);
+    if (right > left && bottom > top) blocks.push({ left, top, right, bottom });
+  });
+  const whole = { left: 0, top: 0, right: width, bottom: height };
+  if (blocks.length === 0) return [whole];
+  const xs = [...new Set([0, width, ...blocks.flatMap((b) => [b.left, b.right])])].sort((a, b) => a - b);
+  const ys = [...new Set([0, height, ...blocks.flatMap((b) => [b.top, b.bottom])])].sort((a, b) => a - b);
+  const rects: PixelRect[] = [];
+  for (let i = 0; i < xs.length; i++) {
+    for (let j = i + 1; j < xs.length; j++) {
+      if (xs[j] - xs[i] < MIN_FREE_W_PX) continue;
+      for (let k = 0; k < ys.length; k++) {
+        for (let m = k + 1; m < ys.length; m++) {
+          if (ys[m] - ys[k] < MIN_FREE_H_PX) continue;
+          const rect = { left: xs[i], right: xs[j], top: ys[k], bottom: ys[m] };
+          if (blocks.every((b) => b.left >= rect.right || b.right <= rect.left || b.top >= rect.bottom || b.bottom <= rect.top)) rects.push(rect);
+        }
+      }
+    }
+  }
+  return rects.length > 0 ? rects : [whole];
+}
+
+/** Отступы fitBounds, при которых рамка ложится в свободную часть карты
+ * крупнее всего: высокую узкую группу — в высокий свободный кусок, широкую —
+ * в широкий (при равном зуме — в больший кусок). */
+function fitPadding(map: L.Map, bounds: L.LatLngBounds): { paddingTopLeft: L.Point; paddingBottomRight: L.Point; fitZoom: number } {
+  const size = map.getSize();
+  let best: { paddingTopLeft: L.Point; paddingBottomRight: L.Point; fitZoom: number; area: number } | null = null;
+  for (const rect of freeMapRects(map)) {
+    const paddingTopLeft = L.point(rect.left + FIT_MARGIN_PX, rect.top + FIT_MARGIN_PX);
+    const paddingBottomRight = L.point(size.x - rect.right + FIT_MARGIN_PX, size.y - rect.bottom + FIT_MARGIN_PX);
+    const fitZoom = map.getBoundsZoom(bounds, false, paddingTopLeft.add(paddingBottomRight));
+    const area = (rect.right - rect.left) * (rect.bottom - rect.top);
+    if (!best || fitZoom > best.fitZoom || (fitZoom === best.fitZoom && area > best.area)) best = { paddingTopLeft, paddingBottomRight, fitZoom, area };
+  }
+  // freeMapRects никогда не пуст — запасной вариант только для типов.
+  return best ?? { paddingTopLeft: L.point(FIT_MARGIN_PX, FIT_MARGIN_PX), paddingBottomRight: L.point(FIT_MARGIN_PX, FIT_MARGIN_PX), fitZoom: map.getBoundsZoom(bounds) };
+}
+
+/** На таком расстоянии, px, соседние точки уже не сливаются в одну (точка
+ * 7-16 px, кольцо выделения — ещё по 3 px). */
+const SEPARATE_PX = 14;
+/** Медиана ближайших соседей — попарно, O(n²): дальше этого числа точек
+ * группа и так велика, раздвигать её зумом незачем. */
+const SEPARATION_MAX_POINTS = 400;
+
+/** Зум, на котором выделенные точки расходятся на экране: медиана
+ * расстояния до ближайшей выделенной соседки — не меньше SEPARATE_PX. Три
+ * барбариса в метре друг от друга на «близком» зуме — одна точка в 3 px.
+ * null — точка одна, их слишком много или они совпадают. map.project даёт
+ * пиксели обеих CRS карты, и в обеих шаг зума — ровно вдвое. */
+function separationZoom(map: L.Map, planIndex: PlanIndex, ids: readonly string[]): number | null {
+  const zoom = map.getZoom();
+  const points: L.Point[] = [];
+  for (const id of ids) {
+    const item = planIndex.get(id);
+    if (item?.isPoint) points.push(map.project([item.minLat, item.minLng], zoom));
+    if (points.length > SEPARATION_MAX_POINTS) return null;
+  }
+  if (points.length < 2) return null;
+  const nearest = points.map((p, i) => {
+    let best = Infinity;
+    points.forEach((q, j) => {
+      if (i !== j) best = Math.min(best, p.distanceTo(q));
+    });
+    return best;
+  });
+  nearest.sort((a, b) => a - b);
+  const median = nearest[Math.floor(nearest.length / 2)];
+  return median > 0 ? zoom + Math.ceil(Math.log2(SEPARATE_PX / median)) : null;
+}
+
+/** Сколько точек плана попадёт в ту же зону, что ClusteredMarkers
+ * пересчитывает (кадр с запасом VIEWPORT_PADDING_RATIO), при таком центре и
+ * зуме: больше MAX_UNCLUSTERED_VISIBLE_POINTS — точки слились бы в пузыри. */
+function pointsAround(map: L.Map, planIndex: PlanIndex, center: L.LatLng, zoom: number): number {
+  const half = map.getSize().divideBy(2);
+  const middle = map.project(center, zoom);
+  const view = L.latLngBounds(map.unproject(middle.subtract(half), zoom), map.unproject(middle.add(half), zoom)).pad(VIEWPORT_PADDING_RATIO);
+  let n = 0;
+  planIndex.forEach((item) => {
+    if (item.isPoint && view.contains([item.minLat, item.minLng])) n += 1;
+  });
+  return n;
+}
+
+/** Подгоняет вид под рамку запроса в свободной части карты (fitPadding):
+ * рамка не уходит под чат Юны, откуда такой запрос обычно и приходит, и под
+ * карточки справа. Зум — обычно не ближе «близкого» (closeZoom), но
+ * небольшую тесную группу приближаем дальше, пока она целиком помещается и
+ * не глубже deepZoom: пока её точки не разойдутся на экране
+ * (separationZoom) и пока точки вокруг не перестанут слипаться в пузыри
+ * (плотная живая изгородь рядом). Большая группа во весь участок так и
+ * остаётся во весь участок: её выделенные точки видны и среди пузырей
+ * (ClusteredMarkers не прячет выделенное в пузыри). */
+function FitToRequest({ request, crsVerified, planIndex }: { request?: MapFitRequest | null; crsVerified: boolean; planIndex?: PlanIndex }) {
+  const map = useMap();
+  const planIndexRef = useRef(planIndex);
+  planIndexRef.current = planIndex;
+
+  useEffect(() => {
+    if (!request || request === appliedFitRequest) return;
+    let cancelled = false;
+    const fit = () => {
+      if (cancelled) return;
+      // Leaflet молча отбрасывает новый вид, пока идёт анимация зума, — а
+      // она как раз идёт, если план только что перегенерирован или карта
+      // только что вернулась из 3D и FitBounds подгоняет её под весь план.
+      if ((map as unknown as { _animatingZoom?: boolean })._animatingZoom) {
+        map.once("zoomend", fit);
+        return;
+      }
+      appliedFitRequest = request;
+      const { box } = request;
+      // Зум 18 Web Mercator — около 0,35 м/px на широте Москвы; в CRS.Simple
+      // (метры чертежа, 2^zoom px на метр) тот же масштаб — зум 2. deepZoom
+      // — ещё в 8 раз ближе (у Web Mercator это и есть предел карты, 21):
+      // полметра живой изгороди там уже ~16 px.
+      const closeZoom = crsVerified ? 18 : 2;
+      const deepZoom = closeZoom + 3;
+      const bounds = L.latLngBounds([box.minLat, box.minLng], [box.maxLat, box.maxLng]);
+      const isPoint = box.minLat === box.maxLat && box.minLng === box.maxLng;
+      const { paddingTopLeft, paddingBottomRight, fitZoom } = fitPadding(map, bounds);
+      // Одна точка: не отдаляем, если пользователь уже ближе.
+      let zoom = isPoint ? Math.max(map.getZoom(), closeZoom) : Math.min(fitZoom, closeZoom);
+      const index = planIndexRef.current;
+      if (!isPoint && index) {
+        const reach = Math.min(fitZoom, deepZoom);
+        const separate = request.ids ? separationZoom(map, index, request.ids) : null;
+        if (separate !== null) zoom = Math.max(zoom, Math.min(separate, reach));
+        while (zoom < reach && pointsAround(map, index, bounds.getCenter(), zoom) > MAX_UNCLUSTERED_VISIBLE_POINTS) zoom += 1;
+      }
+      // fitBounds и для одной точки: он, в отличие от setView, ставит её в
+      // середину свободной части, а не под чат.
+      map.fitBounds(bounds, { paddingTopLeft, paddingBottomRight, maxZoom: zoom });
+    };
+    // Два кадра: FitBounds при смене плана или монтировании запускает зум
+    // в requestAnimationFrame, и наш вид должен лечь после него, а не быть
+    // им перезаписан.
+    const frame = requestAnimationFrame(() => requestAnimationFrame(fit));
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(frame);
+      map.off("zoomend", fit);
+    };
+  }, [request, map, crsVerified]);
 
   return null;
 }
@@ -213,6 +406,9 @@ interface SelectionControllerProps {
   onContextMenu: (clientX: number, clientY: number) => void;
   onViewChange?: () => void;
   focusRequest?: { id: string; seq: number } | null;
+  /** Под CRS.Simple (чертёж без проверенной СК) зум — это 2^zoom пикселей на
+   * метр, и «близкий» зум 18 геодезической карты там означал бы 260 тыс. px/м. */
+  crsVerified?: boolean;
 }
 
 /** All pointer handling for plan items: click-select, box-select, drag-move,
@@ -528,15 +724,17 @@ function SelectionController(props: SelectionControllerProps) {
     if (!focusRequest) return;
     const item = latest.current.planIndex?.get(focusRequest.id);
     if (!item) return;
+    // Тот же «близкий» зум, что у FitToRequest.
+    const closeZoom = (latest.current.crsVerified ?? true) ? 18 : 2;
     if (item.isPoint) {
-      map.setView([item.minLat, item.minLng], Math.max(map.getZoom(), 18));
+      map.setView([item.minLat, item.minLng], Math.max(map.getZoom(), closeZoom));
     } else {
       map.fitBounds(
         [
           [item.minLat, item.minLng],
           [item.maxLat, item.maxLng],
         ],
-        { padding: [40, 40], maxZoom: 18 }
+        { padding: [40, 40], maxZoom: closeZoom }
       );
     }
   }, [focusRequest, map]);
@@ -610,6 +808,14 @@ const CLUSTER_CELL_PX = 56;
 // threshold (MAX_VISIBLE_MARKERS) this component replaced.
 const MAX_UNCLUSTERED_VISIBLE_POINTS = 4000;
 
+// Выделенные точки в пузыри не прячутся: «выдели липы» на настоящей улице —
+// шесть деревьев вдоль всей улицы, и в кадре, где они помещаются все, вокруг
+// тысячи кустов — без этого Юна выделяла бы то, чего не видно. До этого
+// предела — так же, как живое превью переноса (LIVE_MOVE_PREVIEW_LIMIT):
+// больше маркеров разом карта тянет плохо, а такое выделение и так видно —
+// рамкой выделения и синими пузырями.
+const MAX_SELECTED_UNCLUSTERED = 2000;
+
 /** Screen pixels per one unit of `latlng` space at a given zoom -- degrees
  * of longitude under the default WGS84/Mercator CRS (256*2^zoom pixels
  * span 360°, exact for longitude, off by cos(latitude) for latitude, see
@@ -649,6 +855,14 @@ function clusterDivIcon(count: number): L.DivIcon {
 interface MountedCluster {
   marker: L.Marker;
   count: number;
+  hasSelected: boolean;
+}
+
+/** Синяя обводка у пузыря, в котором есть выделенное. Класс — на элементе
+ * маркера, а setIcon переписывает его className целиком (DivIcon →
+ * Icon._setIconStyles), поэтому — заново после каждого setIcon. */
+function markClusterSelected(cluster: MountedCluster) {
+  cluster.marker.getElement()?.classList.toggle("gp-cluster-selected", cluster.hasSelected);
 }
 
 /** Renders point plan items (tree/shrub) as real Leaflet markers when
@@ -683,17 +897,30 @@ function ClusteredMarkers({
   planIndex,
   planRevision,
   registerLayer,
+  onIconReplaced,
+  selectedIds,
   crsVerified,
 }: {
   planIndex?: PlanIndex;
   planRevision: number;
   registerLayer: (id: string, type: string, layer: Layer) => void;
+  /** A real marker's icon was swapped (retype, undo of one): setIcon
+   * rewrites the element's className, dropping gp-selected/gp-violation, and
+   * no "add" event fires to re-apply them -- MapView re-decorates the id. */
+  onIconReplaced: (id: string) => void;
+  /** Kept out of cluster bubbles, see MAX_SELECTED_UNCLUSTERED. */
+  selectedIds: ReadonlySet<string>;
   crsVerified?: boolean;
 }) {
   const map = useMap();
   const groupRef = useRef<L.LayerGroup | null>(null);
   const markersRef = useRef(new Map<string, L.Marker>());
   const clustersRef = useRef(new Map<string, MountedCluster>());
+  const selectedRef = useRef(selectedIds);
+  selectedRef.current = selectedIds;
+  // Whether the last recompute bucketed anything -- only then does a
+  // selection change move points in or out of bubbles (see below).
+  const clusteringRef = useRef(false);
 
   if (!groupRef.current) groupRef.current = L.layerGroup();
 
@@ -702,7 +929,17 @@ function ClusteredMarkers({
     if (!group) return;
     group.addTo(map);
     return () => {
+      // clearLayers, not just group.remove(): removing the group takes its
+      // markers off the map but leaves them *in* the group, and React
+      // StrictMode's dev-only unmount/remount re-added the group -- every
+      // stale marker came back on top of the fresh set recompute() then
+      // mounted (each plan point drawn twice after 3D -> 2D, a deleted tree
+      // still visible). Marker bookkeeping is reset in the same place, so a
+      // remount always starts from an empty group and empty maps.
+      group.clearLayers();
       group.remove();
+      markersRef.current.clear();
+      clustersRef.current.clear();
     };
   }, [map]);
 
@@ -712,15 +949,16 @@ function ClusteredMarkers({
     const clusters = clustersRef.current;
     if (!group) return;
     if (!planIndex) {
-      markers.forEach((marker) => marker.remove());
+      group.clearLayers();
       markers.clear();
-      clusters.forEach(({ marker }) => marker.remove());
       clusters.clear();
+      clusteringRef.current = false;
       return;
     }
 
     const bounds = map.getBounds().pad(VIEWPORT_PADDING_RATIO);
     const cellDeg = clusterCellSizeDeg(map.getZoom(), crsVerified ?? true);
+    const selected = selectedRef.current;
 
     const visibleIds: string[] = [];
     planIndex.forEach((item) => {
@@ -730,12 +968,23 @@ function ClusteredMarkers({
     // cellKey -> ids of every visible point that lands in that cell. Below
     // the threshold, every point gets its own one-item "cell" (its own id as
     // the key) so nothing clusters regardless of how tightly packed it is on
-    // screen -- see MAX_UNCLUSTERED_VISIBLE_POINTS.
+    // screen -- see MAX_UNCLUSTERED_VISIBLE_POINTS. Above it, selected
+    // points still get their own cell while there are few enough of them in
+    // view -- see MAX_SELECTED_UNCLUSTERED.
     const buckets = new Map<string, string[]>();
-    if (visibleIds.length > MAX_UNCLUSTERED_VISIBLE_POINTS) {
+    const clustering = visibleIds.length > MAX_UNCLUSTERED_VISIBLE_POINTS;
+    clusteringRef.current = clustering;
+    if (clustering) {
+      let selectedInView = 0;
+      if (selected.size > 0) for (const id of visibleIds) if (selected.has(id)) selectedInView += 1;
+      const keepSelected = selectedInView > 0 && selectedInView <= MAX_SELECTED_UNCLUSTERED;
       for (const id of visibleIds) {
         const item = planIndex.get(id);
         if (!item) continue;
+        if (keepSelected && selected.has(id)) {
+          buckets.set(id, [id]);
+          continue;
+        }
         const key = `${Math.floor(item.minLat / cellDeg)}:${Math.floor(item.minLng / cellDeg)}`;
         const bucket = buckets.get(key);
         if (bucket) bucket.push(id);
@@ -753,9 +1002,11 @@ function ClusteredMarkers({
     });
 
     // Real markers -- same resync logic this had before clustering existed.
+    // group.removeLayer, not marker.remove(): the latter only takes a marker
+    // off the map and leaves it referenced by the group forever.
     markers.forEach((marker, id) => {
       if (!nextSingles.has(id)) {
-        marker.remove();
+        group.removeLayer(marker);
         markers.delete(id);
       }
     });
@@ -776,7 +1027,10 @@ function ClusteredMarkers({
         // and otherwise never revisited once mounted.
         const target = L.latLng(item.minLat, item.minLng);
         if (!existing.getLatLng().equals(target)) existing.setLatLng(target);
-        if (existing.options.icon !== iconCache.get(iconKey(item.type, item.crown))) existing.setIcon(planItemIcon(item.type, item.crown));
+        if (existing.options.icon !== iconCache.get(iconKey(item.type, item.crown))) {
+          existing.setIcon(planItemIcon(item.type, item.crown));
+          onIconReplaced(id);
+        }
         return;
       }
       const marker = L.marker([item.minLat, item.minLng], { icon: planItemIcon(item.type, item.crown), keyboard: false });
@@ -790,11 +1044,12 @@ function ClusteredMarkers({
     // old bubble and mints fresh ones; a plain pan re-keys nothing.
     clusters.forEach(({ marker }, key) => {
       if (!nextClusters.has(key)) {
-        marker.remove();
+        group.removeLayer(marker);
         clusters.delete(key);
       }
     });
     nextClusters.forEach((ids, key) => {
+      const hasSelected = selected.size > 0 && ids.some((id) => selected.has(id));
       const existing = clusters.get(key);
       if (existing) {
         // An edit (delete/move into or out of this cell) can change the
@@ -805,6 +1060,8 @@ function ClusteredMarkers({
           existing.marker.setIcon(clusterDivIcon(ids.length));
           existing.count = ids.length;
         }
+        existing.hasSelected = hasSelected;
+        markClusterSelected(existing);
         return;
       }
       const [cellLat, cellLng] = key.split(":").map(Number);
@@ -818,9 +1075,11 @@ function ClusteredMarkers({
         if (box) map.fitBounds([[box.minLat, box.minLng], [box.maxLat, box.maxLng]], { padding: [40, 40] });
       });
       marker.addTo(group);
-      clusters.set(key, { marker, count: ids.length });
+      const cluster = { marker, count: ids.length, hasSelected };
+      markClusterSelected(cluster);
+      clusters.set(key, cluster);
     });
-  }, [map, planIndex, registerLayer, crsVerified]);
+  }, [map, planIndex, registerLayer, onIconReplaced, crsVerified]);
 
   useEffect(() => {
     recompute();
@@ -834,14 +1093,14 @@ function ClusteredMarkers({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [planIndex, planRevision, recompute]);
 
+  // A selection change matters here only while bubbles are on screen: a
+  // newly selected point leaves its bubble, a deselected one rejoins it.
+  // Unclustered, every point already is its own marker and MapView's
+  // decorate() restyles just the changed ids -- no full recompute per click.
   useEffect(() => {
-    return () => {
-      markersRef.current.forEach((marker) => marker.remove());
-      markersRef.current.clear();
-      clustersRef.current.forEach(({ marker }) => marker.remove());
-      clustersRef.current.clear();
-    };
-  }, []);
+    if (clusteringRef.current) recompute();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedIds]);
 
   useMapEvents({ moveend: recompute, zoomend: recompute });
 
@@ -898,6 +1157,8 @@ export interface MapViewProps {
   onViewChange?: () => void;
   /** Pan/zoom to this item; `seq` makes a repeat request for the same id re-fire. */
   focusRequest?: { id: string; seq: number } | null;
+  /** Fit the view to a group's bounds (Юна's «выдели …»), see FitToRequest. */
+  fitRequest?: MapFitRequest | null;
   /** Whether the control panel is currently shown -- purely to know when its
    * CSS width transition finishes, so the map's container size can be
    * recomputed (see InvalidateSizeOnChange below). Not otherwise used. */
@@ -925,6 +1186,7 @@ export default function MapView({
   onContextMenu,
   onViewChange,
   focusRequest,
+  fitRequest,
   sidebarOpen,
 }: MapViewProps) {
   // item id -> its Leaflet layer while on the map, so selection/violation
@@ -961,6 +1223,13 @@ export default function MapView({
     layer.on("remove", () => {
       if (registryRef.current.get(id) === entry) registryRef.current.delete(id);
     });
+    // decorate only reads refs
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const redecorate = useCallback((id: string) => {
+    const entry = registryRef.current.get(id);
+    if (entry) decorate(id, entry);
     // decorate only reads refs
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1063,6 +1332,7 @@ export default function MapView({
         />
       )}
       <FitBounds fitKey={`${layersKey ?? ""}:${planId ?? ""}`} layersBounds={extentBounds} plan={plan} />
+      <FitToRequest request={fitRequest} crsVerified={Boolean(crsVerified)} planIndex={showPlan ? planIndex : undefined} />
       <InvalidateSizeOnChange trigger={sidebarOpen} />
       {extentBounds && (
         <Rectangle
@@ -1090,7 +1360,14 @@ export default function MapView({
         />
       )}
       {showPlan && (
-        <ClusteredMarkers planIndex={planIndex} planRevision={planRevision} registerLayer={registerLayer} crsVerified={crsVerified} />
+        <ClusteredMarkers
+          planIndex={planIndex}
+          planRevision={planRevision}
+          registerLayer={registerLayer}
+          onIconReplaced={redecorate}
+          selectedIds={selectedIds}
+          crsVerified={crsVerified}
+        />
       )}
       <SelectionController
         selectMode={selectMode}
@@ -1105,6 +1382,7 @@ export default function MapView({
         onContextMenu={onContextMenu}
         onViewChange={onViewChange}
         focusRequest={focusRequest}
+        crsVerified={crsVerified}
       />
     </MapContainer>
   );

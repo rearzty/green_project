@@ -11,10 +11,12 @@ const buttonVariants = cva(
         default: "bg-greenery-600 text-white hover:bg-greenery-700",
         outline: "border border-greenery-500 text-greenery-300 hover:bg-stone-800",
         ghost: "hover:bg-stone-800 text-greenery-300",
+        secondary: "border border-stone-700 bg-stone-800/60 text-stone-200 hover:bg-stone-800 hover:border-stone-600",
       },
       size: {
         default: "h-9 px-4 py-2",
         sm: "h-8 px-3 text-xs",
+        icon: "h-8 w-8",
       },
     },
     defaultVariants: { variant: "default", size: "default" },

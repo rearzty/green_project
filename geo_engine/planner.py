@@ -268,14 +268,18 @@ def _fit_row_species(
     """
     if planting_type not in CROWN_SPACING_TYPES:
         palette = palette[:1]
+    user_interval = _user_interval(norms, planting_type, keep_spacing_for)
+
     def evaluate(candidate_species, territory=territory):
         type_norms = norms
-        if candidate_species is not None and planting_type not in keep_spacing_for:
-            type_norms = norms_for_species(norms, planting_type, candidate_species, catalogue)
+        if candidate_species is not None:
+            type_norms = norms_for_species(norms, planting_type, candidate_species, catalogue, user_interval)
         if row_pitch_override_m is not None and planting_type not in keep_spacing_for:
             type_norms = type_norms.with_spacing_override(planting_type, row_pitch_override_m)
         row_count = tree_rows if planting_type == "tree" else 1
-        if row_count >= 2 and planting_type not in keep_spacing_for:
+        if row_count >= 2:
+            # Норма двухрядной посадки — и при интервале пользователя: он может
+            # раздвинуть ряды, но не свести их ближе 743-ПП табл. 3.6.2.
             # Интервал двухрядной посадки — на весь отбор, а не только на шаг
             # точек вдоль линии: greedy_select держит расстояние по радиусу
             # кроны из норм, и с прежними 5 м (средняя крона) пропускал
@@ -596,11 +600,20 @@ def norms_for_species(
     planting_type: str,
     species: Species | None,
     catalogue: SpeciesCatalogue,
+    user_interval_m: float | None = None,
 ) -> PlantingNorms:
     """Нормы с интервалом, выведенным из класса кроны выбранной породы.
 
     МГСН 1.02-02, п. 4.2.9.2: 8-10 м широкая крона, 5-6 м средняя, 3-4 м узкая
     (берётся нижняя граница — это минимум, см. species.yaml).
+
+    `user_interval_m` — интервал, который задал пользователь (панель, Юна). Он
+    раздвигает посадки, но не сдвигает их ближе нормы класса кроны: берётся
+    больший из двух. Раньше пользовательская цифра подменяла норму целиком,
+    и план не проходил собственную проверку сервиса (`compliance._neighbour_checks`
+    держит каждое дерево по интервалу его класса): живьём «деревья почаще»
+    (3,5 м) дали 46 нарушений из 47 деревьев, «интервал деревьев 6 м» — 19.
+    Гуще нормы класса в любом случае нельзя, а реже — можно и нужно уметь.
 
     Радиус кроны для отбора берётся как половина интервала, а НЕ как половина
     реального диаметра кроны породы. Это разные вопросы: `min_distance_m`
@@ -615,7 +628,18 @@ def norms_for_species(
     spacing = catalogue.spacing_for_crown(species.crown)
     if not spacing:
         return norms
+    if user_interval_m is not None:
+        spacing = max(spacing, user_interval_m)
     return norms.with_spacing_override(planting_type, spacing)
+
+
+def _user_interval(norms: PlantingNorms, planting_type: str, keep_spacing_for: Collection[str]) -> float | None:
+    """Интервал пользователя для типа, если он задан (см. norms_for_species):
+    pipeline_service кладёт его в те же нормы, `keep_spacing_for` говорит, что
+    это он, а не значение из planting_norms.yaml."""
+    if planting_type not in keep_spacing_for:
+        return None
+    return norms.spacing_for(planting_type).min_distance_m
 
 
 CROWN_CASCADE_NOTE = "Крупнейшая крона, которой здесь хватает места по нормам."
@@ -699,10 +723,10 @@ def _tree_cascade(
         classes, planting_type, zones, territory, utilities, norms, keep_spacing_for, catalogue,
         tree_rows=tree_rows, evaluated_out=evaluated,
     )
+    user_interval = _user_interval(norms, planting_type, keep_spacing_for)
+
     def class_norms(species: Species) -> PlantingNorms:
-        if planting_type in keep_spacing_for:
-            return norms
-        return norms_for_species(norms, planting_type, species, catalogue)
+        return norms_for_species(norms, planting_type, species, catalogue, user_interval)
 
     if not evaluated:
         return []
@@ -841,9 +865,8 @@ def _plan_type_items(
     # Породу ряда берём первой из палитры: в ряду однородность и есть
     # смысл, а остальные породы уходят по куртинам.
     species = catalogue.get(override) if override else (palette[0] if palette else None)
-    type_norms = norms
-    if planting_type not in keep_spacing_for:
-        type_norms = norms_for_species(norms, planting_type, species, catalogue)
+    user_interval = _user_interval(norms, planting_type, keep_spacing_for)
+    type_norms = norms_for_species(norms, planting_type, species, catalogue, user_interval)
 
     selected: list[PlantingItem] = []
     area_cache: dict[str, tuple] = {}
@@ -1026,8 +1049,7 @@ def _plan_type_items(
             # Живьём это дало 52 нарушения из 1262 — план, который
             # отвергает собственная проверка сервиса, ровно тот же класс
             # ошибки, что уже ловили на буферах.
-            if planting_type not in keep_spacing_for:
-                loose_norms = norms_for_species(norms, planting_type, loose_species, catalogue)
+            loose_norms = norms_for_species(norms, planting_type, loose_species, catalogue, user_interval)
             cached = area_cache.get(loose_species.name)
             if cached is not None:
                 loose_exclusion, loose_buildable = cached
@@ -1314,10 +1336,11 @@ def plan_items(
     функцию чистой от рецепта плана: пересчёт схлопнутого плана обязан вернуть
     ту же раскладку, а не свежую случайную.
 
-    `keep_spacing_for` — типы, у которых интервал задан пользователем явно и не
-    должен подменяться выведенным из класса кроны. Без этого параметра
-    пользовательская настройка молча терялась бы: и она, и породное правило
-    приходят в одну и ту же `min_distance_m`, и снаружи их уже не различить.
+    `keep_spacing_for` — типы, у которых интервал задан пользователем явно.
+    Без этого параметра пользовательская настройка молча терялась бы: и она,
+    и породное правило приходят в одну и ту же `min_distance_m`, и снаружи их
+    уже не различить. У деревьев она — нижняя граница поверх нормы класса
+    кроны, а не замена ей (см. `norms_for_species`).
 
     `pattern` — схема расстановки: "auto" (ряд вдоль линейных ориентиров плюс
     россыпь в остатке), "scatter" (только россыпь, прежнее поведение) или "row"

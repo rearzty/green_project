@@ -29,6 +29,7 @@ import sys
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from geo_engine.parallel import process_pool
 from concurrent.futures.process import BrokenProcessPool
+import re
 from pathlib import Path
 from collections.abc import Callable
 from typing import Iterable, Iterator, Literal
@@ -41,6 +42,7 @@ import ezdxf.layouts.layouts
 import ezdxf.lldxf.const
 import ezdxf.acis.api
 import ezdxf.sections.acdsdata
+import shapely
 from shapely.geometry import LineString, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
@@ -171,7 +173,7 @@ from geo_engine.io.geometry_cleanup import (
     reconstruct_closed_footprints,
     reconstruct_closed_road_polygons,
 )
-from geo_engine.io.layer_rules import classify_layer, is_symbol_layer
+from geo_engine.io.layer_rules import classify_layer, is_symbol_layer, normalize_name
 from geo_engine.model import Utility, Zone
 
 Kind = Literal["utility", "zone"]
@@ -1504,11 +1506,11 @@ def _add_closed_road_polygons(zones: list[Zone]) -> list[Zone]:
     Вызывается дважды, не один раз: изнутри `read_dxf()` (замыкает петли
     борта, целиком лежащие в одном файле) и ещё раз изнутри
     `read_dxf_bundle()` на уже объединённом списке зон всех файлов пачки
-    (замыкает петли, разрезанные по границе файлов съёмки). Дублирования
-    не возникает: то, что уже замкнулось на первом проходе, стало
-    Polygon и не попадает в `targeted` фильтр по `geom_type` второго
-    прохода -- обрабатываются только оставшиеся LineString/
-    MultiLineString. Живой результат на Песчаном: 23 полигона (4583 м²)
+    (замыкает петли, разрезанные по границе файлов съёмки). Линии борта
+    остаются LineString и на втором проходе замыкаются ещё раз — дубли
+    схлопывает `_drop_non_carriageway_kerb_loops` в конце; он же решает,
+    какой контур — проезжая часть, а какой — газон или островок (см. её
+    докстринг). Живой результат на Песчаном: 23 полигона (4583 м²)
     только внутрифайловым проходом -> 49 полигонов (8460 м²) после
     добавления прохода на объединённом бандле -- почти половина реальных
     петель борта разрезана по границам xref-файлов съёмки.
@@ -1522,9 +1524,117 @@ def _add_closed_road_polygons(zones: list[Zone]) -> list[Zone]:
             continue
         extra_polygons = reconstruct_closed_road_polygons([z.geometry for z in targeted])
         if extra_polygons:
-            layer_note = targeted[0].attrs or {}
+            # Слой у восстановленного контура условный (берётся у первой линии
+            # списка, а контур мог замкнуться из линий разных слоёв), поэтому
+            # контур помечается как восстановленный: это гипотеза, которую
+            # _drop_non_carriageway_kerb_loops проверяет, а не нарисованная
+            # в чертеже площадь.
+            layer_note = {**(targeted[0].attrs or {}), RECONSTRUCTED_LOOP_ATTR: True}
             zones.extend(Zone(geometry=g, zone_type=road_type, attrs=layer_note) for g in extra_polygons)
-    return zones
+    return _drop_non_carriageway_kerb_loops(zones)
+
+
+RECONSTRUCTED_LOOP_ATTR = "reconstructed_loop"
+
+
+# Слой бортового камня — те же образцы, что относят его к "road" в
+# layer_rules.LAYER_RULES, плюс дословное «Бортовой камень» из
+# MOSGEOTREST_LAYER_MAP.
+_KERB_LAYER_RE = re.compile(r"\bбр\b.*\d+.*\d+|\bгп[123]\b|бортов\w* камен|\bборт\w*|бордюр|\bkerb\b")
+
+# Чего не бывает на проезжей части: если это внутри замкнутого контура
+# борта, контур — газон, островок, разделительная полоса или квартал.
+_NOT_CARRIAGEWAY_ZONE_TYPES = ("building", "existing_greenery", "existing_lawn", "sidewalk", "sidewalk_kerb", "lighting_pole")
+
+# Проезжая часть уже полосы движения не бывает; замкнутая полоса уже этого —
+# разделительная или газонная.
+_MIN_CARRIAGEWAY_WIDTH_M = 3.0
+
+# Какая доля контура должна быть покрыта заливкой проезжей части, чтобы
+# считать его дорогой, когда заливки на улице есть.
+_MIN_FILL_COVERAGE = 0.5
+
+
+def _is_kerb_polygon(zone: Zone) -> bool:
+    """Полигон «дороги», которому нужно подтверждение: восстановлен из линий
+    (`_add_closed_road_polygons`) или нарисован замкнутой линией на слое
+    борта. Подтверждением служат только площади, нарисованные в чертеже как
+    площади (заливки, регионы, замкнутые контуры покрытия)."""
+    if zone.zone_type != "road" or zone.geometry.geom_type not in ("Polygon", "MultiPolygon"):
+        return False
+    attrs = zone.attrs or {}
+    return bool(attrs.get(RECONSTRUCTED_LOOP_ATTR)) or bool(_KERB_LAYER_RE.search(normalize_name(attrs.get("layer", ""))))
+
+
+def _drop_non_carriageway_kerb_loops(zones: list[Zone]) -> list[Zone]:
+    """Замкнутый контур бортового камня — не обязательно проезжая часть.
+
+    Борт отделяет проезжую часть от всего остального, и проезжая часть лежит
+    МЕЖДУ линиями борта, уходя за границу съёмки, — сама она замыкается
+    редко. Замыкаются как раз островки, разделительные и газонные полосы,
+    кварталы. Найдено сверкой с посадочными чертежами проектировщиков
+    (scripts/evaluate.py): на «1. Олимпийской деревне» 68 % его деревьев
+    стояли внутри таких «дорог», на «14. Куликовской» — 60 %, на «15.
+    Академика Понтрягина» — 51 %; в среднем 3-5 м от самой линии борта. Для
+    генератора это было твёрдое препятствие плюс 2 м отступа — деревьям на
+    газонных полосах места не оставалось, и план выходил из одних кустов.
+
+    Контур борта остаётся дорогой, только если это подтверждено:
+    * на улице есть заливки проезжей части («ПЧ», асфальт и т. п.) — контур
+      должен быть покрыт ими хотя бы на _MIN_FILL_COVERAGE (а сами заливки
+      и так уже дорога);
+    * заливок нет — внутри контура нет зданий, существующей зелени и газона,
+      тротуаров, опор освещения, и он не уже полосы движения.
+    Линии борта не трогаются: отступ от края проезжей части по-прежнему
+    считается от них. Заодно убираются дубли контуров, которые даёт второй,
+    бандловый проход `_add_closed_road_polygons` по тем же линиям.
+    """
+    loops = [i for i, z in enumerate(zones) if _is_kerb_polygon(z)]
+    if not loops:
+        return zones
+
+    drop: set[int] = set()
+    seen: set[tuple] = set()
+    for i in loops:
+        g = zones[i].geometry
+        key = (round(g.area, 1), *(round(v, 1) for v in g.bounds))
+        if key in seen:
+            drop.add(i)
+        seen.add(key)
+
+    fills = [
+        z.geometry
+        for z in zones
+        if z.zone_type == "road" and z.geometry.geom_type in ("Polygon", "MultiPolygon") and not _is_kerb_polygon(z)
+    ]
+    if fills:
+        fill_tree = shapely.STRtree(fills)
+        for i in loops:
+            if i in drop:
+                continue
+            g = zones[i].geometry
+            covered = sum(g.intersection(fills[j]).area for j in fill_tree.query(g, predicate="intersects"))
+            if g.area <= 0 or covered / g.area < _MIN_FILL_COVERAGE:
+                drop.add(i)
+    else:
+        evidence = [
+            z.geometry.representative_point()
+            for z in zones
+            if z.zone_type in _NOT_CARRIAGEWAY_ZONE_TYPES and not z.geometry.is_empty
+        ]
+        evidence_tree = shapely.STRtree(evidence) if evidence else None
+        for i in loops:
+            if i in drop:
+                continue
+            g = zones[i].geometry
+            width = 2 * g.area / g.length if g.length > 0 else 0.0
+            inner = g.buffer(-0.3)
+            occupied = evidence_tree is not None and not inner.is_empty and len(evidence_tree.query(inner, predicate="contains")) > 0
+            if width < _MIN_CARRIAGEWAY_WIDTH_M or occupied:
+                drop.add(i)
+    if not drop:
+        return zones
+    return [z for i, z in enumerate(zones) if i not in drop]
 
 
 def resolve_and_read_bundle(
