@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import re
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -41,17 +42,27 @@ from backend.app.schemas.assistant import (
 )
 from backend.app.services.assistant_context import PlanFacts, render_plan_facts
 from backend.app.services.assistant_rules import (
+    CROWN_NORMS,
+    EDIT_OPERATIONS,
     FALLBACK_SPACING,
     FALLBACK_TEXT,
     HELP_TEXT,
     SPACING_LIMITS,
-    answer_with_rules,
+    SPARSER_FACTOR,
+    TREE_NORM_MIN,
+    Dropped,
+    RulesAnswer,
     describe_actions,
     guard_commands,
+    is_question,
     resolve_species,
+    rules_answer,
+    select_refusal,
+    spacing_moves,
     species_absent,
+    tree_denser_text,
+    tree_floor,
 )
-from geo_engine.norms import load_norms
 
 logger = logging.getLogger(__name__)
 
@@ -97,17 +108,34 @@ _SYSTEM_PROMPT = """\
 2D-карту.
 
 Правила:
-- Никогда не вызывай select_items и удаление (edit_selection delete) в одном \
-ответе: удалять можно только то, что пользователь уже видит выделенным. На \
-«удали все кусты с карты» — выдели их и попроси подтвердить словами «удали \
-выделенные». «Убери кусты из плана», «без газона» — это типы посадок \
+- Никогда не вызывай select_items и edit_selection (удаление или смену типа) \
+в одном ответе — даже если выделить не получится: править можно только то, \
+что пользователь уже видит выделенным. На «удали все кусты», «удали липы», \
+«сделай все кусты деревьями» — выдели их и попроси подтвердить словами \
+(«удали выделенные», «сделай их деревьями»). «Убери кусты», «без газона», \
+«убери кусты из плана», «только деревья» — это типы посадок \
 (update_generation_settings), а не правка выделения.
-- Интервалы — новые АБСОЛЮТНЫЕ значения от текущих настроек ниже. \
-Ориентиры: интервал деревьев по умолчанию {tree_default} м (допустимо 0.5-15), \
-кустарников — {shrub_default} м (0.3-10). «Погуще/почаще» — уменьши примерно \
-на 30 %, «пореже/подальше друг от друга» — увеличь примерно на 40 %. \
-«Вообще без промежутков»/«максимально часто» — минимальное значение, а не \
-отказ от типа посадки. В вызове указывай только поля, которые меняются.
+- Вопрос или условие — не просьба. На «можно удалить выделенные?», «что \
+будет, если сделать их кустами?», «а если удалить их?» edit_selection не \
+вызывай: скажи, что произойдёт, и какой просьбой это сделать.
+- Интервалы — новые АБСОЛЮТНЫЕ значения от текущих настроек ниже; в вызове \
+указывай только поля, которые меняются. Деревья без заданного интервала \
+стоят каждое с минимальным интервалом по норме своего класса кроны \
+({crown_norms}). tree_spacing_m — нижний предел поверх этой нормы: дерево \
+встаёт не ближе большего из двух, так что гуще нормы деревья не поставить. \
+Поэтому на «погуще», «почаще», «больше деревьев», когда интервал не задан \
+(или задан не больше {tree_min} м), tree_spacing_m не меняй: объясни это и \
+предложи то, что может добавить деревья, если оно ещё не включено, — \
+двухрядную аллею (tree_rows=2) или деревья в покрытии тротуара \
+(trees_in_paving). Заданный интервал больше {tree_min} м на «погуще» \
+уменьши примерно на 30 %; «пореже» — увеличь заданный примерно на 40 %, а \
+если он не задан, поставь {tree_sparser} м. Кустарник: без заданного \
+интервала живая изгородь идёт с шагом {hedge} м (куртины — по плотности \
+породы), shrub_spacing_m заменяет этот шаг. «Погуще» — на 30 % меньше \
+текущего шага, но не меньше 0.3 м (нижняя граница 743-ПП табл. 3.6.2 для \
+низкой изгороди), «пореже» — на 40 % больше. Границы: деревья до 15 м, \
+кустарник 0.3-10 м. «Вообще без промежутков»/«максимально часто» — \
+минимальное значение, а не отказ от типа посадки.
 - Двухрядная посадка (tree_rows=2) — 743-ПП табл. 3.6.2, второй ряд в \
 шахматном порядке. Деревья в покрытии тротуара (trees_in_paving) — 743-ПП \
 п. 9.8, приствольная решётка Ø 2 м: предлагай, если деревьям негде стоять.
@@ -251,19 +279,40 @@ _TOOLS = [
 
 
 def default_spacing() -> dict[str, float]:
-    """Intervals a None in the recipe stands for -- planting_norms.yaml's own
-    tree_default/shrub_default, not a second copy of those numbers here."""
-    try:
-        norms = load_norms(settings.planting_norms_path)
-        return {t: norms.spacing_for(t).min_distance_m for t in ("tree", "shrub")}
-    except Exception:  # an unreadable norms file must not take the chat down with it
-        logger.exception("Could not read default spacing from %s", settings.planting_norms_path)
-        return dict(FALLBACK_SPACING)
+    """Where «пореже/погуще» starts when the recipe has no interval of its
+    own. Not planting_norms.yaml's tree_default/shrub_default (5/3 m) any
+    more -- neither is what a plan actually has: a tree with no user interval
+    stands at its own crown-class norm (3/5/8 m, no single current value;
+    «пореже» starts from the medium 5 m and «погуще» can't go below the norm
+    at all), and most shrubs are a hedge at planner.IN_ROW_PITCH_M (0.5 m).
+    Both modes used to answer «кусты 3 → 2,1 м» about a 0.5 m hedge -- a
+    «denser» that made it four times sparser. See assistant_rules.tree_floor."""
+    return dict(FALLBACK_SPACING)
+
+
+def _system_prompt(defaults: dict[str, float]) -> str:
+    return (
+        _SYSTEM_PROMPT.replace("{crown_norms}", CROWN_NORMS)
+        .replace("{tree_min}", f"{TREE_NORM_MIN:g}")
+        .replace("{tree_sparser}", f"{defaults['tree'] * SPARSER_FACTOR:g}")
+        .replace("{hedge}", f"{defaults['shrub']:g}")
+    )
 
 
 def _settings_context(current: AssistantGenerationSettings, defaults: dict[str, float]) -> str:
-    tree = f"{current.tree_spacing_m} м" if current.tree_spacing_m is not None else f"по умолчанию ({defaults['tree']} м)"
-    shrub = f"{current.shrub_spacing_m} м" if current.shrub_spacing_m is not None else f"по умолчанию ({defaults['shrub']} м)"
+    # What the model computes «погуще/пореже» from -- the truth, not a default
+    # the plan doesn't have (see default_spacing).
+    floor = tree_floor(current.tree_spacing_m)
+    tree = (
+        f"не меньше {floor} м (нижний предел поверх нормы класса кроны)"
+        if floor is not None
+        else f"не задан — по норме класса кроны ({CROWN_NORMS})"
+    )
+    shrub = (
+        f"{current.shrub_spacing_m} м (шаг живой изгороди)"
+        if current.shrub_spacing_m is not None
+        else f"не задан — живая изгородь {defaults['shrub']:g} м, куртины по плотности породы"
+    )
     return (
         f"Текущие настройки генерации: типы посадок = {current.planting_types}, интервал деревьев = {tree}, "
         f"интервал кустарников = {shrub}, рядов деревьев = {current.tree_rows}, "
@@ -347,11 +396,20 @@ def _safe_planting_types(raw: object, current_value: list[str]) -> list[str]:
     return valid or current_value
 
 
+def _tree_spacing(raw: object, baseline: float | None) -> float | None:
+    """A tree interval at or below the narrow-crown norm moves no tree (it is a
+    floor over each tree's crown-class norm, geo_engine.planner.norms_for_species)
+    -- stored as None, «по норме», the same as rules mode does. Only for a
+    value the model actually sent: the panel's own number is left alone."""
+    value = _safe_spacing(raw, baseline, *SPACING_LIMITS["tree"])
+    return value if value == baseline else tree_floor(value)
+
+
 def _settings_from_args(args: dict, baseline: AssistantGenerationSettings | AssistantAction) -> AssistantAction | None:
     try:
         return AssistantAction(
             planting_types=_safe_planting_types(args.get("planting_types"), baseline.planting_types),
-            tree_spacing_m=_safe_spacing(args.get("tree_spacing_m"), baseline.tree_spacing_m, *SPACING_LIMITS["tree"]),
+            tree_spacing_m=_tree_spacing(args.get("tree_spacing_m"), baseline.tree_spacing_m),
             shrub_spacing_m=_safe_spacing(args.get("shrub_spacing_m"), baseline.shrub_spacing_m, *SPACING_LIMITS["shrub"]),
             scoring_mode=_safe_mode(args.get("scoring_mode"), baseline.scoring_mode),
             tree_rows=_safe_rows(args.get("tree_rows"), baseline.tree_rows),
@@ -386,14 +444,32 @@ def _tool_calls(message: dict) -> list[tuple[str, dict]]:
     return calls
 
 
+@dataclass
+class _Calls:
+    """What the model's tool calls amount to."""
+
+    commands: list[AssistantCommand]
+    # Drops the user must hear about (a species not in the plan, nothing to select).
+    notes: list[str] = field(default_factory=list)
+    # A select_items call was made but dropped: the edits of the same answer
+    # must not fall back on the current selection (guard_commands, rule (b)).
+    select_attempted: bool = False
+    # The model asked for a tree interval at or below the narrow-crown norm
+    # where none was set -- «погуще» the norm doesn't allow; nothing changes.
+    trees_at_norm: bool = False
+
+
 def _commands_from_calls(
-    calls: list[tuple[str, dict]], current: AssistantGenerationSettings, facts: PlanFacts | None
-) -> tuple[list[AssistantCommand], list[str]]:
+    calls: list[tuple[str, dict]],
+    current: AssistantGenerationSettings,
+    facts: PlanFacts | None,
+    violations_count: int | None = None,
+) -> _Calls:
     """Every call, in order; several settings calls merge into one command at
-    the first one's position. Invalid calls are dropped (and logged) --
-    returned notes are only for drops the user must hear about."""
-    commands: list[AssistantCommand] = []
-    notes: list[str] = []
+    the first one's position. Invalid calls are dropped (and logged) -- notes
+    are only for drops the user must hear about."""
+    result = _Calls(commands=[])
+    commands = result.commands
     settings_command: SettingsCommand | None = None
     for name, args in calls:
         if name == "update_generation_settings":
@@ -401,6 +477,9 @@ def _commands_from_calls(
             action = _settings_from_args(args, baseline)
             if action is None:
                 continue
+            asked_tree = _safe_spacing(args.get("tree_spacing_m"), None, *SPACING_LIMITS["tree"])
+            if asked_tree is not None and tree_floor(asked_tree) is None and tree_floor(baseline.tree_spacing_m) is None:
+                result.trees_at_norm = True
             if settings_command is None:
                 settings_command = SettingsCommand(settings=action)
                 commands.append(settings_command)
@@ -416,13 +495,23 @@ def _commands_from_calls(
             target = args.get("target")
             if target not in _SELECT_TARGETS:
                 logger.warning("Dropping select_items with target=%r", target)
+                result.select_attempted = True
                 continue
             species = args.get("species") if isinstance(args.get("species"), str) else None
             resolved = resolve_species(species, target, facts)
             if resolved is None:
-                notes.append(species_absent(species, "tree" if target == "trees" else "shrub", facts))
+                result.notes.append(species_absent(species, "tree" if target == "trees" else "shrub", facts))
+                result.select_attempted = True
                 continue
             target, species = resolved
+            # «Выделила посадки с нарушениями» при нуле нарушений — неправда:
+            # то, что выделять заведомо нечего, не выделяется, и ответ
+            # собирается из фактов, а не из текста модели.
+            refusal = select_refusal(target, facts, violations_count)
+            if refusal:
+                result.notes.append(refusal)
+                result.select_attempted = True
+                continue
             commands.append(SelectCommand(target=target, species=species))
         elif name == "ui_action":
             command = args.get("command")
@@ -432,11 +521,92 @@ def _commands_from_calls(
             commands.append(UiCommand(command=command))
         else:
             logger.warning("Dropping a call to an unknown tool %r", name)
+    result.commands = _dedup(commands)
+    result.notes = list(dict.fromkeys(result.notes))
+    return result
+
+
+def _dedup(commands: list[AssistantCommand]) -> list[AssistantCommand]:
     deduped: list[AssistantCommand] = []
     for command in commands:
         if command not in deduped:
             deduped.append(command)
-    return deduped, notes
+    return deduped
+
+
+def _respect_spacing(
+    result: _Calls, current: AssistantGenerationSettings, parsed: RulesAnswer | None, defaults: dict[str, float]
+) -> None:
+    """The interval semantics are held by code, not only by the prompt. For an
+    interval the message changes relatively («кусты погуще», «деревья
+    пореже») the model's number must move it that way from what the plan
+    really has; one that doesn't (computed from the old 3 m shrub default,
+    or a 3.5 m tree floor for «погуще», which only thins the narrow crowns
+    out) is replaced by the built-in parser's. Trees denser than their norm
+    -- nothing changes, and the reply says why."""
+    command = next((c for c in result.commands if isinstance(c, SettingsCommand)), None)
+    if command is None:
+        return
+    recipe = command.settings
+    relative = parsed.relative if parsed else {}
+    at_norm = result.trees_at_norm
+    for planting_type, (direction, value) in relative.items():
+        field_name = f"{planting_type}_spacing_m"
+        old, new = getattr(current, field_name), getattr(recipe, field_name)
+        if new == old or spacing_moves(planting_type, old, new, direction, defaults):
+            continue
+        logger.info(
+            "The model moved the %s interval the wrong way (%r -> %r) -- the parser's %r stands", planting_type, old, new, value
+        )
+        setattr(recipe, field_name, value)
+        if planting_type == "tree" and direction < 0 and tree_floor(value) == tree_floor(old):
+            at_norm = True
+    tree_wish = relative.get("tree")
+    if tree_wish and tree_wish[0] < 0 and tree_floor(tree_wish[1]) == tree_floor(current.tree_spacing_m):
+        at_norm = True
+        # Asked «погуще» at the norm, the model sometimes switches the offered
+        # schemes on by itself (seen live: two rows and trees in paving, 1 in
+        # 4) -- an offer is made in words; only what the message itself asked
+        # for (the parser's own recipe) is applied.
+        asked = next((c.settings for c in parsed.commands if isinstance(c, SettingsCommand)), None) or current
+        recipe.tree_rows, recipe.trees_in_paving = asked.tree_rows, asked.trees_in_paving
+    if at_norm:
+        result.notes.append(tree_denser_text(recipe))
+        if recipe == AssistantAction(**current.model_dump()):
+            result.commands.remove(command)  # nothing left to regenerate for
+
+
+def _two_steps(result: _Calls, parsed: RulesAnswer | None) -> list[Dropped] | None:
+    """«Удали все кусты», «сделай все кусты деревьями», «удали деревья с
+    нарушениями» mean one thing in both modes: select the group, show it,
+    edit on the second request. The model doesn't always comply -- seen live
+    on «удали все кусты»: the shrubs removed from the recipe instead, or
+    selected with no word about confirming. When the parser reads the message
+    as such a mass edit, the model's answer must select the same group (else
+    None: the parser's answer stands), and the reply always asks. Same when
+    the message names a group the parser couldn't select («удали дубы»
+    without oaks) and the model answered with a bare edit_selection: it would
+    have hit the current selection, and the parser's «дубов нет» is the answer."""
+    if parsed is None:
+        return []
+    model_selects = result.select_attempted or any(isinstance(c, SelectCommand) for c in result.commands)
+    if parsed.select_attempted and not model_selects and any(isinstance(c, EditSelectionCommand) for c in result.commands):
+        return None
+    if not parsed.confirms:
+        return []
+    picks = [c for c in parsed.commands if isinstance(c, SelectCommand)]
+    if not picks or not all(pick in result.commands for pick in picks):
+        return None
+    # Selected, and the same answer drops the type from the recipe -- the
+    # regenerated plan has none of what was just selected.
+    recipe = next((c.settings for c in result.commands if isinstance(c, SettingsCommand)), None)
+    picked_types = {_PICKED_TYPE[p.target] for p in picks if p.target in _PICKED_TYPE}
+    if recipe is not None and not picked_types <= set(recipe.planting_types):
+        return None
+    return [Dropped(operation, "after_select") for operation in parsed.confirms]
+
+
+_PICKED_TYPE = {"trees": "tree", "shrubs": "shrub", "lawn": "lawn"}
 
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S | re.I)
@@ -519,12 +689,24 @@ def _parser_answer(
     violations_count: int | None,
     view: str,
     defaults: dict[str, float],
-) -> tuple[str, list[AssistantCommand]] | None:
+) -> RulesAnswer | None:
     try:
-        return answer_with_rules(message, current, facts, selection, violations_count, view, defaults)
+        return rules_answer(message, current, facts, selection, violations_count, view, defaults)
     except Exception:  # a hint, never a reason to lose the model's answer
         logger.exception("Built-in parser failed on %r", message)
         return None
+
+
+def _asked_operations(message: str, parsed: RulesAnswer | None) -> tuple[str, ...]:
+    """Edits the message only asked about («можно удалить выделенные?», «а если
+    сделать их кустами?») -- a model may obey the question literally. Which
+    sentence a call came from is unknown, so any question or condition in
+    the message counts, except for an edit the parser itself found asked
+    plainly in another sentence («удали выделенные. А сколько кустов?»)."""
+    if not is_question(message):
+        return ()
+    said = {c.operation for c in (parsed.commands if parsed else []) if isinstance(c, EditSelectionCommand)}
+    return tuple(op for op in EDIT_OPERATIONS if op not in said)
 
 
 def _more_commands(parsed: list[AssistantCommand], commands: list[AssistantCommand]) -> bool:
@@ -542,14 +724,13 @@ _ACTION_CLAIM = re.compile(
 )
 
 
-def _parser_knows_better(parsed: tuple[str, list[AssistantCommand]], reply: str) -> bool:
+def _parser_knows_better(parsed: RulesAnswer, reply: str) -> bool:
     """The model called nothing. The parser's answer is the true one when it
     finds something to do, or when the model claims it did something and the
     parser understood the message (it never says "сделала" without a command)."""
-    parsed_reply, parsed_commands = parsed
-    if parsed_commands:
+    if parsed.commands:
         return True
-    understood = FALLBACK_TEXT not in parsed_reply and HELP_TEXT not in parsed_reply
+    understood = FALLBACK_TEXT not in parsed.reply and HELP_TEXT not in parsed.reply
     return bool(_ACTION_CLAIM.search(reply)) and understood
 
 
@@ -632,13 +813,12 @@ async def ask_yuna(
 ) -> tuple[str, list[AssistantCommand]]:
     if not settings.llm_configured:
         raise AssistantNotConfiguredError("Языковая модель не подключена — Юна отвечает в базовом режиме.")
-    defaults = default_spacing_m or default_spacing()
+    defaults = {**FALLBACK_SPACING, **(default_spacing_m or default_spacing())}
 
     # One system message, not several: some chat templates (and providers)
     # reject a system message anywhere but first.
-    prompt = _SYSTEM_PROMPT.replace("{tree_default}", str(defaults["tree"])).replace("{shrub_default}", str(defaults["shrub"]))
     system = [
-        prompt,
+        _system_prompt(defaults),
         _settings_context(current, defaults) + " " + _state_context(selection, violations_count, view, facts is not None),
     ]
     if facts is not None:
@@ -651,30 +831,54 @@ async def ask_yuna(
     choice = await _chat(messages)
     reply = _strip_think(_content_text(choice.get("content")))
     calls = _tool_calls(choice)
-    commands, notes = _commands_from_calls(calls, current, facts)
+    result = _commands_from_calls(calls, current, facts, violations_count)
     parsed = _parser_answer(message, current, facts, selection, violations_count, view, defaults)
-    if not commands and not notes and parsed is not None and _parser_knows_better(parsed, reply):
+    if not result.commands and not result.notes and parsed is not None and _parser_knows_better(parsed, reply):
         logger.info("The model called nothing for %r (%r) -- the built-in parser answers", message, reply[:80])
-        return parsed
-    if commands and parsed is not None and _more_commands(parsed[1], commands):
+        return parsed.reply, parsed.commands
+    if result.commands and parsed is not None and _more_commands(parsed.commands, result.commands):
         try:
             more = _tool_calls(await _chat([*messages, *_answered_calls(choice)]))
         except AssistantUpstreamError:
             more = []  # the first answer still stands
         if more:
-            combined, combined_notes = _commands_from_calls(calls + more, current, facts)
-            if len(combined) > len(commands):
+            combined = _commands_from_calls(calls + more, current, facts, violations_count)
+            if len(combined.commands) > len(result.commands):
                 # The first turn's text announced only part of it ("сначала
                 # перестрою план, потом выделю") -- describe_actions below
                 # says what is actually going to happen.
-                commands, notes, reply = combined, combined_notes, ""
-    commands, dropped = guard_commands(commands, selection)
-    if dropped or notes or (commands and not reply):
+                result, reply = combined, ""
+    deferred = _two_steps(result, parsed)
+    if deferred is None:
+        logger.info("The model didn't select the group %r is about first -- the parser's two steps stand", message)
+        return parsed.reply, parsed.commands
+    _respect_spacing(result, current, parsed, defaults)
+    commands, dropped = guard_commands(
+        result.commands,
+        selection,
+        # The parser saw a select in the message too: «удали дубы» without
+        # oaks, answered by the model with a bare edit_selection, must not
+        # delete what is selected now.
+        select_attempted=result.select_attempted or bool(parsed and parsed.select_attempted),
+        asked=_asked_operations(message, parsed),
+    )
+    dropped += [d for d in deferred if d.operation not in {x.operation for x in dropped}]
+    if deferred and not result.notes and commands == parsed.commands:
+        # Exactly the parser's two steps: its reply also answers what was asked
+        # alongside («сколько кустов? удали их» -- the count), which a reply
+        # rebuilt from the commands alone would drop.
+        return parsed.reply, commands
+    # «Выделяю все кусты на карте:» -- a lead-in to the calls, not an answer.
+    lead_in = reply.rstrip().endswith(":")
+    if dropped or result.notes or (commands and (not reply or lead_in)):
         # The model's own text may claim exactly what was just refused ("удаляю
-        # выделенные"), so it's replaced, not appended to.
+        # выделенные", "выделила нарушения" at zero violations), so it's
+        # replaced, not appended to. Refusals first -- as in rules mode, where
+        # «породы нет» comes before «удалять ничего не стала».
         reply = " ".join(
             part
             for part in (
+                *result.notes,
                 describe_actions(
                     commands,
                     dropped,
@@ -684,7 +888,6 @@ async def ask_yuna(
                     facts=facts,
                     default_spacing=defaults,
                 ),
-                *notes,
             )
             if part
         )

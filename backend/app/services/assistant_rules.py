@@ -16,15 +16,17 @@
 перечисляет, что умеет.
 
 Здесь же — общее для обоих режимов: правила безопасности для команд
-(guard_commands) и описание сделанного по-русски (describe_actions). Модель
-часто вызывает инструмент молча, без текста, и ответ ей собирается тем же
-кодом, что и здесь.
+(guard_commands), что значат интервалы посадок (tree_floor, HEDGE_PITCH_M) и
+описание сделанного по-русски (describe_actions). Модель часто вызывает
+инструмент молча, без текста, и ответ ей собирается тем же кодом, что и здесь.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Collection
 from dataclasses import dataclass, field
+from decimal import ROUND_HALF_UP, Decimal
 
 from backend.app.schemas.assistant import (
     AssistantAction,
@@ -37,13 +39,46 @@ from backend.app.schemas.assistant import (
     UiCommand,
 )
 from backend.app.services.assistant_context import PlanFacts
-from geo_engine.species import load_species
+from geo_engine.planner import IN_ROW_PITCH_M
+from geo_engine.species import load_catalogue, load_species
 
 # Те же границы, что валидирует GenerateRequest (schemas/plan.py): выйти за
 # них команда не может, даже если бы разбор ошибся.
 SPACING_LIMITS = {"tree": (0.5, 15.0), "shrub": (0.3, 10.0)}
-# species_spacing из planting_norms.yaml — если вызывающий не передал свои.
-FALLBACK_SPACING = {"tree": 5.0, "shrub": 3.0}
+
+# Класс кроны: «широкая крона», «широким кронам».
+_CROWN_NAMES = {"wide": ("широкая", "широким"), "medium": ("средняя", "средним"), "narrow": ("узкая", "узким")}
+
+
+def _crown_intervals() -> dict[str, float]:
+    """Норма интервала по классу кроны, м: МГСН 1.02-02 п. 4.2.9.2 из
+    species.yaml (нижние границы диапазонов 8-10/5-6/3-4 — это минимумы)."""
+    try:
+        found = {c: float(m) for c, m in load_catalogue().crown_spacing_m.items() if c in _CROWN_NAMES}
+    except Exception:  # справка для ответа — не повод ронять чат
+        found = {}
+    return found or {"wide": 8.0, "medium": 5.0, "narrow": 3.0}
+
+
+CROWN_INTERVALS = _crown_intervals()
+# Интервал деревьев пользователя — нижний предел ПОВЕРХ нормы класса кроны, а
+# не замена ей (geo_engine.planner.norms_for_species): каждое дерево стоит не
+# ближе большего из двух. Гуще нормы деревья не поставить вовсе, а интервал не
+# больше нормы самой узкой кроны не раздвигает ни одного дерева — это то же,
+# что «по норме» (None), см. tree_floor. Раньше Юна считала «текущим»
+# tree_default из planting_norms.yaml (5 м) и на «деревья погуще» отвечала
+# «5 → 3,5 м» — замерено на трёх синтетических участках: число деревьев не
+# менялось (27/31/28 → 27/30/28), ответ был неправдой.
+TREE_NORM_MIN = min(CROWN_INTERVALS.values())
+# Большая часть кустарника — живая изгородь с этим шагом (planner.IN_ROW_PITCH_M,
+# а не shrub_default 3 м из planting_norms.yaml — тот для россыпи). Интервал
+# пользователя заменяет шаг изгороди; куртины идут по плотности породы
+# (515-ПП) и от него не зависят.
+HEDGE_PITCH_M = IN_ROW_PITCH_M.get("shrub", 0.5)
+# Откуда считать «пореже/погуще», когда своего интервала в рецепте нет. У
+# деревьев одного текущего числа нет (по классу кроны), «пореже» начинается
+# от нормы средней кроны; «погуще» без своего интервала невозможно.
+FALLBACK_SPACING = {"tree": CROWN_INTERVALS.get("medium", 5.0), "shrub": HEDGE_PITCH_M}
 SPARSER_FACTOR = 1.4
 DENSER_FACTOR = 0.7
 _SLIGHTLY_SPARSER = 1.2
@@ -164,6 +199,97 @@ def _first_sentence(text: str, limit: int = 160) -> str:
     return sentence if sentence.endswith((".", "…", ")")) else sentence + "."
 
 
+def _lower_first(text: str) -> str:
+    """«Рядовая посадка…» после двоеточия — со строчной; аббревиатуру («МГСН…») не трогает."""
+    return text[:1].lower() + text[1:] if text[:2].istitle() else text
+
+
+def fmt_m(value: float) -> str:
+    """Метры так же, как их показывает карточка посадки (InspectorCard.tsx,
+    `meters`: до 10 м — два знака, дальше — один): иначе Юна говорит
+    «14,16 м», а в карточке рядом — «14,2 м». Intl.NumberFormat округляет
+    кратчайшую десятичную запись числа половиной вверх (1.005 -> «1,01»), а не
+    его точное двоичное значение, как round() — отсюда Decimal(str(...))."""
+    digits = Decimal("0.01") if value < 10 else Decimal("0.1")
+    return fmt_num(float(Decimal(str(value)).quantize(digits, rounding=ROUND_HALF_UP)))
+
+
+# --- Интервалы ----------------------------------------------------------------
+
+
+def _crown_norms() -> str:
+    ordered = sorted(CROWN_INTERVALS.items(), key=lambda kv: -kv[1])
+    parts = [f"{_CROWN_NAMES[c][0]}{' крона' if i == 0 else ''} — {fmt_num(m)} м" for i, (c, m) in enumerate(ordered)]
+    return "МГСН 1.02-02 п. 4.2.9.2: " + ", ".join(parts)
+
+
+# «МГСН 1.02-02 п. 4.2.9.2: широкая крона — 8 м, средняя — 5 м, узкая — 3 м».
+CROWN_NORMS = _crown_norms()
+TREE_NORM_RANGE = f"{fmt_num(TREE_NORM_MIN)}–{fmt_num(max(CROWN_INTERVALS.values()))} м"
+SHRUB_MIN_NOTE = "нижняя граница 743-ПП табл. 3.6.2 для низкой живой изгороди"
+
+
+def tree_floor(value: float | None) -> float | None:
+    """Интервал деревьев, который хоть что-то меняет, или None — «по норме
+    класса кроны»: не больше нормы самой узкой кроны он не раздвигает ни одно
+    дерево. Оба режима хранят такой интервал как None — и из «погуще» от 4 м,
+    и из «интервал деревьев 2 м», и из 2,45 м, присланных моделью."""
+    if value is None or value <= TREE_NORM_MIN + 1e-9:
+        return None
+    return value
+
+
+def _tree_floor_text(value: float, old: float | None = None) -> str:
+    """«не меньше 7 м (широким кронам норма — 8 м)». Где норма класса больше
+    предела, дерево стоит по норме, — без этой оговорки «7 м» читалось бы как
+    интервал всех деревьев."""
+    text = f"не меньше {fmt_num(value)} м" + (f" вместо {fmt_num(old)}" if old is not None else "")
+    wider = sorted((m, c) for c, m in CROWN_INTERVALS.items() if m > value + 1e-9)
+    if wider:
+        text += " (" + ", ".join(
+            f"{_CROWN_NAMES[c][1]}{' кронам норма' if i == 0 else ''} — {fmt_num(m)} м" for i, (m, c) in enumerate(wider)
+        ) + ")"
+    return text
+
+
+def _tree_offers(settings: AssistantGenerationSettings | AssistantAction) -> list[str]:
+    """Что действительно может добавить деревья, если оно ещё не включено.
+    «Может», а не «добавит»: интервал двухрядной аллеи — не меньше 7 м (743-ПП
+    табл. 3.6.2), и там, где второй ряд не помещается, она узкие кроны даже
+    прореживает (замерено на синтетических участках: 27 → 26, 31 → 29)."""
+    offers = []
+    if settings.tree_rows != 2:
+        offers.append("двухрядная аллея на достаточно широкой полосе («деревья двумя рядами»)")
+    if not settings.trees_in_paving:
+        offers.append("посадка в покрытии тротуара с решёткой («разреши деревья в тротуаре»)")
+    return offers
+
+
+def tree_denser_text(settings: AssistantGenerationSettings | AssistantAction) -> str:
+    """Ответ на «деревья погуще», когда своего интервала нет (или он не больше
+    нормы узкой кроны): менять нечего, и это надо сказать прямо."""
+    text = f"Гуще нормы деревья не поставить: каждое уже стоит с минимальным интервалом для своего класса кроны ({CROWN_NORMS})."
+    offers = _tree_offers(settings)
+    if offers:
+        return text + f" Добавить деревья может {' или '.join(offers)}."
+    return text + " Двухрядная аллея и деревья в покрытии тротуара уже включены."
+
+
+def spacing_moves(
+    planting_type: str, old: float | None, new: float | None, direction: int, default_spacing: dict[str, float]
+) -> bool:
+    """Сдвигает ли `new` интервал туда, куда просили (direction: -1 — гуще,
+    +1 — реже), с учётом того, что значит None у каждого типа."""
+    if planting_type == "tree":
+        old_floor, new_floor = tree_floor(old), tree_floor(new)
+        if direction < 0:
+            return old_floor is not None and (new_floor is None or new_floor < old_floor)
+        return new_floor is not None and (old_floor is None or new_floor > old_floor)
+    base = default_spacing.get(planting_type, FALLBACK_SPACING[planting_type])
+    old_value, new_value = (old if old is not None else base), (new if new is not None else base)
+    return new_value < old_value if direction < 0 else new_value > old_value
+
+
 # --- Породы ------------------------------------------------------------------
 
 _ENDINGS = (
@@ -273,7 +399,37 @@ def species_absent(name: str, planting_type: str | None, facts: PlanFacts | None
     return text + (f" — есть: {', '.join(present[:6])}." if present else ".")
 
 
+NO_VIOLATIONS = "Нарушений нет — все посадки проходят по нормам."
+VIOLATIONS_PENDING = "Проверка плана на нормативы ещё не готова — подождите пару секунд и спросите снова."
+NOTHING_TO_SELECT = "Плана пока нет — выделять нечего. Сначала сгенерируйте его («сгенерируй план»)."
+
+
+def select_refusal(target: str, facts: PlanFacts | None, violations_count: int | None) -> str | None:
+    """Почему выделять нечего, или None, если выделение имеет смысл. Общая для
+    обоих режимов: модель «выделяет нарушения» и при нуле нарушений, и её
+    «Выделила посадки с нарушениями» тогда неправда. О плане без посадок по
+    типам (не материализован) молчит — счётчиков у него нет, «нет» было бы
+    догадкой."""
+    if target == "none":
+        return None
+    if facts is None:
+        return NOTHING_TO_SELECT
+    if target == "violations":
+        if violations_count is None:
+            return VIOLATIONS_PENDING
+        return NO_VIOLATIONS if violations_count == 0 else None
+    if not facts.materialized:
+        return None
+    if target == "all":
+        return None if sum(facts.counts.values()) else "План пустой — выделять нечего."
+    planting_type = {"trees": "tree", "shrubs": "shrub", "lawn": "lawn"}[target]
+    return None if facts.count(planting_type) else f"{_cap(_GEN[planting_type])} в плане нет — выделять нечего."
+
+
 # --- Безопасность команд (общая для модели и для разбора) --------------------
+
+
+EDIT_OPERATIONS = ("delete", "to_tree", "to_shrub")
 
 
 @dataclass
@@ -282,46 +438,85 @@ class Dropped:
 
     operation: str
     # nothing_selected — на карте ничего не выделено; after_select — в том же
-    # ответе новое выделение, которого пользователь ещё не видел; lawn_only —
-    # газон тип не меняет; same_type — выделенные уже этого типа.
+    # ответе новое выделение, которого пользователь ещё не видел;
+    # select_failed — выделить в том же ответе пытались, но не вышло (породы
+    # нет, нарушений ноль); with_deselect — в том же ответе «сними
+    # выделение», непонятно, что из двух имелось в виду; lawn_only — газон тип
+    # не меняет; same_type — выделенные уже этого типа; asked — просьба была
+    # вопросом или условием («можно удалить выделенные?»).
     reason: str
 
 
 def guard_commands(
-    commands: list[AssistantCommand], selection: AssistantSelection | None
+    commands: list[AssistantCommand],
+    selection: AssistantSelection | None,
+    *,
+    select_attempted: bool = False,
+    asked: Collection[str] = (),
 ) -> tuple[list[AssistantCommand], list[Dropped]]:
     """Правила, которые держит код, а не промпт: модель можно уговорить, код — нет.
 
     (a) Правка выделения без выделения отбрасывается — пусть сначала выделят.
-    (b) Удаление в одном ответе с выделением отбрасывается: удалять можно
-        только то, что пользователь уже видит выделенным, а не то, что
-        выделится через мгновение по догадке модели.
+    (b) Правка — и удаление, и смена типа — в одном ответе с выделением
+        отбрасывается: править можно только то, что пользователь уже видит
+        выделенным, а не то, что выделится через мгновение по догадке
+        модели. Массовая правка всегда в два шага. Это касается и выделения,
+        которое не удалось (`select_attempted`: породы в плане нет, нарушений
+        ноль, неизвестная цель): «выдели дубы и удали их» без дубов раньше
+        оставляло голое «удали» — и оно удаляло то, что выделено сейчас.
+    (c) Правка из вопроса или условия (`asked` — операции, которые просили
+        только так: «можно удалить выделенные?», «а если сделать их
+        кустами?») не выполняется: модель и разбор выполнили бы вопрос
+        буквально. Юна объясняет, что будет, и ждёт просьбы.
+    «Сними выделение и удали» — ни то ни другое молча: выделение остаётся,
+    чтобы следующей просьбой удалить можно было именно его.
     Ослабить нормы отступов нечем вовсе — такого инструмента нет.
     """
     count = selection.count if selection else 0
-    has_select = any(isinstance(c, SelectCommand) for c in commands)
+    selects = [c for c in commands if isinstance(c, SelectCommand)]
+    picks = [c for c in selects if c.target != "none"]
+    has_edit = any(isinstance(c, EditSelectionCommand) for c in commands)
+    hold_deselect = has_edit and bool(selects) and not picks and not select_attempted and count > 0
     kept: list[AssistantCommand] = []
     dropped: list[Dropped] = []
     for command in commands:
         if isinstance(command, EditSelectionCommand):
-            operation = command.operation
-            if count <= 0:
-                dropped.append(Dropped(operation, "nothing_selected"))
+            reason = _edit_refusal(command.operation, selection, bool(picks), select_attempted, bool(selects), asked)
+            if reason:
+                dropped.append(Dropped(command.operation, reason))
                 continue
-            if operation == "delete" and has_select:
-                dropped.append(Dropped(operation, "after_select"))
-                continue
-            # Состав выделения известен только для текущего, не для нового.
-            if operation != "delete" and selection is not None and not has_select:
-                if selection.lawns >= count:
-                    dropped.append(Dropped(operation, "lawn_only"))
-                    continue
-                same = selection.trees if operation == "to_tree" else selection.shrubs
-                if same >= count:
-                    dropped.append(Dropped(operation, "same_type"))
-                    continue
+        elif hold_deselect and isinstance(command, SelectCommand):
+            continue
         kept.append(command)
     return kept, dropped
+
+
+def _edit_refusal(
+    operation: str,
+    selection: AssistantSelection | None,
+    picks: bool,
+    select_attempted: bool,
+    deselect: bool,
+    asked: Collection[str],
+) -> str | None:
+    count = selection.count if selection else 0
+    if picks:
+        return "after_select"
+    if select_attempted:
+        return "select_failed"
+    if count <= 0:
+        return "nothing_selected"
+    if deselect:
+        return "with_deselect"
+    # Состав выделения известен только для текущего, не для нового — новых здесь уже нет.
+    if operation != "delete" and selection is not None:
+        if selection.lawns >= count:
+            return "lawn_only"
+        if (selection.trees if operation == "to_tree" else selection.shrubs) >= count:
+            return "same_type"
+    if operation in asked:
+        return "asked"
+    return None
 
 
 # --- Описание сделанного -----------------------------------------------------
@@ -340,18 +535,26 @@ def settings_changes(
             parts.append("без " + _join([_GEN[t] for t in removed]))
         if added:
             parts.append("с " + _join([_INS[t] for t in added]))
-    for planting_type in POINT_TYPES:
-        old = getattr(before, f"{planting_type}_spacing_m")
-        new = getattr(after, f"{planting_type}_spacing_m")
-        if old == new:
-            continue
-        default = default_spacing.get(planting_type, FALLBACK_SPACING[planting_type])
-        if new is None:
-            parts.append(f"интервал {_GEN[planting_type]} — по умолчанию, {fmt_num(default)} м")
-        elif (old if old is not None else default) == new:
-            parts.append(f"интервал {_GEN[planting_type]} {fmt_num(new)} м")
+    old_tree, new_tree = tree_floor(before.tree_spacing_m), tree_floor(after.tree_spacing_m)
+    if old_tree != new_tree:
+        # Предел, а не интервал всех деревьев: «не меньше», с нормой тех
+        # классов, у которых она больше (geo_engine.planner.norms_for_species).
+        if new_tree is None:
+            parts.append(f"интервал деревьев — по норме класса кроны ({TREE_NORM_RANGE})")
         else:
-            parts.append(f"интервал {_GEN[planting_type]} {fmt_num(old if old is not None else default)} → {fmt_num(new)} м")
+            parts.append(f"интервал деревьев — {_tree_floor_text(new_tree, old_tree)}")
+    old_shrub, new_shrub = before.shrub_spacing_m, after.shrub_spacing_m
+    if old_shrub != new_shrub:
+        # Интервал кустов — шаг живой изгороди; куртины от него не зависят.
+        hedge = default_spacing.get("shrub", FALLBACK_SPACING["shrub"])
+        if new_shrub is None:
+            parts.append(f"интервал кустов — по умолчанию (живая изгородь {fmt_num(hedge)} м)")
+        elif (old_shrub if old_shrub is not None else hedge) == new_shrub:
+            parts.append(f"интервал кустов в живой изгороди {fmt_num(new_shrub)} м")
+        else:
+            parts.append(
+                f"интервал кустов в живой изгороди {fmt_num(old_shrub if old_shrub is not None else hedge)} → {fmt_num(new_shrub)} м"
+            )
     if after.tree_rows != before.tree_rows:
         parts.append("деревья двумя рядами" if after.tree_rows == 2 else "деревья одним рядом")
     if after.trees_in_paving != before.trees_in_paving:
@@ -384,6 +587,33 @@ _CONFIRM = {
     "to_shrub": "скажите «сделай их кустами», если хотите поменять тип",
 }
 _WILL_DO = {"delete": "удалю", "to_tree": "сделаю деревьями", "to_shrub": "сделаю кустами"}
+_SAY = {"delete": "удали выделенные", "to_tree": "сделай их деревьями", "to_shrub": "сделай их кустами"}
+# Выделить не вышло — правка тоже не выполнена, и это надо сказать: иначе
+# непонятно, тронуто ли то, что выделено сейчас.
+_NOT_DONE = {"delete": "Удалять ничего не стала.", "to_tree": "Тип не меняла.", "to_shrub": "Тип не меняла."}
+_WHICH_ONE = {
+    "delete": "удалить выделенное",
+    "to_tree": "сделать выделенное деревьями",
+    "to_shrub": "сделать выделенное кустами",
+}
+
+
+def _asked_text(operation: str, selection: AssistantSelection | None) -> str:
+    """Ответ на «можно удалить выделенные?», «что будет, если сделать их
+    деревьями?»: что произойдёт и какой просьбой это сделать."""
+    what = f"выделенное ({count_phrase(selection.count, 'object')})" if selection and selection.count else "выделенное"
+    if operation == "delete":
+        return f"Если удалить {what}, оно исчезнет из плана — вернуть можно Ctrl+Z. Чтобы удалить, скажите «удали выделенные»."
+    if operation == "to_tree":
+        return (
+            f"Если сделать {what} деревьями, посадки останутся на местах, но отступы проверятся по нормам для деревьев — "
+            "они больше, чем у кустов, так что могут появиться нарушения; вернуть можно Ctrl+Z. "
+            "Чтобы поменять тип, скажите «сделай их деревьями»."
+        )
+    return (
+        f"Если сделать {what} кустами, посадки останутся на местах, а отступы проверятся по нормам для кустарника; "
+        "вернуть можно Ctrl+Z. Чтобы поменять тип, скажите «сделай их кустами»."
+    )
 
 
 def _describe_select(command: SelectCommand, facts: PlanFacts | None, violations_count: int | None) -> str:
@@ -444,6 +674,16 @@ def describe_actions(
                 "Сейчас на карте ничего не выделено — выделите объекты кликом или рамкой (или скажите, например, "
                 f"«выдели все кусты»), и я их {_WILL_DO[drop.operation]}."
             )
+        elif drop.reason == "select_failed":
+            sentences.append(_NOT_DONE[drop.operation])
+        elif drop.reason == "with_deselect":
+            sentences.append(
+                f"Не поняла: {_WHICH_ONE[drop.operation]} или только снять выделение? Выделено "
+                f"{count_phrase(selection.count if selection else 0, 'object')} — скажите «{_SAY[drop.operation]}» "
+                "или «сними выделение»."
+            )
+        elif drop.reason == "asked":
+            sentences.append(_asked_text(drop.operation, selection))
         elif drop.reason == "lawn_only":
             sentences.append("Газон — это площадь, а не точка: деревом или кустом его не сделать.")
         elif drop.reason == "same_type":
@@ -455,24 +695,30 @@ def describe_actions(
 
 
 # Опечатки в словах, от которых зависит разбор: «кусиы», «дерьвья», «газно»,
-# «сколко», «удоли». Без поправки слово просто не находится, и просьба
-# применяется не к тому («кусиы пореже» разреживало и деревья) или не
-# понимается вовсе. Правится слово от 5 букв, отстоящее от слова ниже на одну
-# правку (замена, пропуск, лишняя буква, перестановка соседних) и с той же
-# первой буквы. Настоящие слова-соседи не трогаются: «деревня» — не «деревья»,
-# «газом» — не «газон», «столько» — не «сколько».
+# «сколко». Без поправки слово просто не находится, и просьба применяется не к
+# тому («кусиы пореже» разреживало и деревья) или не понимается вовсе.
+# Правится слово от 5 букв, отстоящее от слова ниже на одну правку (замена,
+# пропуск, лишняя буква, перестановка соседних) и с той же первой буквы.
+# Настоящие слова-соседи не трогаются: «деревня» — не «деревья», «газом» — не
+# «газон», «столько» — не «сколько».
+#
+# Глаголов удаления здесь нет и быть не должно: поправка не вправе породить
+# разрушительную команду. «Спасибо, удачи!» становилось «спасибо, удали!» и
+# удаляло выделенное — «удачи» от «удали» на одну букву, как и «удалы»,
+# «удила», «удалишь». Удаление — только слово, написанное без ошибки
+# (проверяет тест на всех целях поправки).
 _TYPO_TARGETS = (
     "деревья", "деревьев", "деревьями", "деревьям", "деревьях", "дерево", "дерева", "деревом", "дереву", "деревце",
     "кусты", "кустов", "кустами", "кустам", "кустах", "куста", "кусту", "кустом", "кусте", "кустарник", "кустарники",
     "кустарников", "кустарником", "кустарниками", "кустарника", "кустики", "кустиков",
     "газон", "газона", "газоном", "газону", "газоны", "газоне", "газонов",
     "сколько", "пореже", "погуще", "почаще", "плотнее", "поплотнее", "выдели", "выделите", "выделить", "выбери",
-    "удали", "удалите", "удалить", "покажи", "покажите", "интервал", "расстояние", "нарушения", "нарушений",
+    "покажи", "покажите", "интервал", "расстояние", "нарушения", "нарушений",
     "сгенерируй", "перегенерируй", "пересчитай",
 )
 _TYPO_KNOWN = frozenset(_TYPO_TARGETS) | {
-    "столько", "почище", "порежь", "порежу", "покажу", "выдали", "выделю", "выделил", "выберу", "удаль", "удили",
-    "удало", "удалю", "удалил", "удалит", "удалять", "выделит", "пересчитал", "газом", "плотное", "плотные",
+    "столько", "почище", "порежь", "порежу", "покажу", "выдали", "выделю", "выделил", "выберу", "выделит",
+    "пересчитал", "газом", "плотное", "плотные",
 }
 # Начинается так — уже узнаётся (или это другое слово: «деревня», «газовый», «кусок»).
 _TYPO_KNOWN_PREFIXES = ("дерев", "куст", "газон", "газов", "куск", "кусок", "дешев")
@@ -513,17 +759,54 @@ _CLAUSE_SPLIT = re.compile(r"[,;:!?\n()«»\"]+|\.(?!\d)|\s(?:и|а|но|плю�
 _RELATIVE = re.compile(r"^((у|с|в|на|из|для|под|над|около|возле)\s+)?котор\w*\b")
 
 
-def split_clauses(text: str) -> list[str]:
-    clauses = []
-    for part in _CLAUSE_SPLIT.split(f" {normalize(text)} "):
+# Вопрос или условие, а не просьба: «можно удалить выделенные?», «что будет,
+# если удалить их?», «а если сделать их кустами», «стоит ли их удалить». Правку
+# из такого предложения не выполняет ни один режим (guard_commands, причина
+# asked): разбор срезает «?» вместе с пунктуацией, и «можно удалить
+# выделенные?» удаляло, а модель может послушаться вопроса буквально.
+# Проверяется по предложениям, а не по сообщению: в «удали выделенные. А
+# сколько кустов?» удаление — отдельная просьба.
+_SENTENCE_BREAK = re.compile(r"(?<=[!?\n])|(?<=\.)(?!\d)")
+_ASKING = re.compile(
+    r"^(а\s+|и\s+|ну\s+|так\s+)?(можно|нельзя|что будет|что если|что случится|что произойдет|если|стоит|а вдруг)\b"
+    r"|\bли\b"
+)
+
+
+def _clause_parts(sentence: str) -> list[str]:
+    parts = []
+    for part in _CLAUSE_SPLIT.split(f" {sentence} "):
         part = re.sub(r"[^\w\s.]", " ", part)
         part = re.sub(r"(?<!\d)\.|\.(?!\d)", " ", part)
         part = re.sub(r"\s+", " ", part).strip()
-        if part and clauses and _RELATIVE.match(part):
-            clauses[-1] += " " + part
-        elif part:
-            clauses.append(part)
+        if part:
+            parts.append(part)
+    return parts
+
+
+def _marked_clauses(text: str) -> list[tuple[str, bool]]:
+    """Части сообщения по порядку и для каждой — из вопроса/условия ли она."""
+    clauses: list[tuple[str, bool]] = []
+    for sentence in _SENTENCE_BREAK.split(normalize(text)):
+        parts = _clause_parts(sentence)
+        asked = "?" in sentence or any(_ASKING.search(part) for part in parts)
+        for part in parts:
+            if clauses and _RELATIVE.match(part):
+                previous, previous_asked = clauses[-1]
+                clauses[-1] = (previous + " " + part, previous_asked or asked)
+            else:
+                clauses.append((part, asked))
     return clauses
+
+
+def split_clauses(text: str) -> list[str]:
+    return [clause for clause, _ in _marked_clauses(text)]
+
+
+def is_question(message: str) -> bool:
+    """Есть ли в сообщении вопрос или условие (см. _ASKING) — для модельного
+    пути, где неизвестно, из какого предложения пришёл вызов."""
+    return any(asked for _, asked in _marked_clauses(message))
 
 
 def _rx(pattern: str) -> re.Pattern:
@@ -617,6 +900,11 @@ _DXF = _rx(r"\bdxf\b|\bдхф\b|\bчертеж\w*|\bавтокад\w*|\bautocad\
 _PLAN_FILE = _rx(r"\b(план\w*|файл\w*|результат\w*|проект\w*)\b")
 _VIEW3D = _rx(r"\b3d\b|\bобъем\w*|\bтрехмер\w*")
 _VIEW2D = _rx(r"\b2d\b|\bдвухмер\w*|\bдвумер\w*|\bплоск\w*|\bна карту\b|\bк карте\b|\bкарту\b|\bобычн\w* вид\w*")
+# «Убери 3D», «закрой 3D», «выйди из 3D» — назад на карту, а не открыть 3D.
+_VIEW3D_OFF = _rx(
+    r"\b(убери\w*|убрать|выключи\w*|отключи\w*|закрой\w*|закрыть|скрой\w*|выйди\w*|выйти|хватит|без)\s+(\w+\s+)?3d\b"
+    r"|\bиз\s+3d\b|\bне\s+(надо|нужно)\s+(\w+\s+)?3d\b"
+)
 # Только целиком: «вернись к эвристике» — про режим, а не про карту.
 _BACK = _rx(r"^(давай\s+)?(вернись|вернуться|вернемся|назад)(\s+(назад|обратно))?$")
 
@@ -624,6 +912,12 @@ _BACK = _rx(r"^(давай\s+)?(вернись|вернуться|вернемс
 # и «я выделил деревья, удали их» рассказывают, что сделано, а не просят.
 # (?!т\b) — будущее: «это удалит выделенные?» — вопрос, а не просьба.
 _DELETE = _rx(r"\b(удали(?!л|т\b|тся)\w*|убери|убрать|уберите|сотри|стереть|снеси|снести|выкинь|выбрось|вырежи|удаляй)\b")
+# Глаголы правки карты, а не рецепта: «удали (все) кусты», «сотри липы» —
+# выделить группу и спросить (как у модели в промпте), а не перестроить план
+# без кустов. «Убери кусты», «без кустов», «убери кусты из плана» — рецепт:
+# «убери» — то же, что «без», а пересчёт без типа не трогает остальные типы.
+_ERASE = _rx(r"\b(удали(?!л|т\b|тся)\w*|сотри|стереть|снеси|снести|вырежи|удаляй)\b")
+_FROM_RECIPE = _rx(r"\bиз\s+(плана|рецепта|генераци\w*|настроек)\b")
 # Слова, которые не меняют смысла голого «удали»: «удали пожалуйста», «ну удаляй».
 _FILLER = _rx(
     r"\b(пожалуйста|плиз|пж|пжлст|давай\w*|юна|ну|же|ка|уже|сейчас|теперь|тогда|скорее|быстро|быстрее|можешь|можно|ты"
@@ -648,6 +942,8 @@ _PLACE = _rx(
     r"|\b(слева|справа|севернее|южнее|восточнее|западнее|на\s+(севере|юге|востоке|западе))\b"
 )
 _SEL_REF = _rx(r"\b(выделенн\w*|выбранн\w*|отмеченн\w*|их|это|эти|этот|эту|эта|его|ее|оба|обе)\b")
+# Ссылка именно на выделение, а не местоимение: «их» после «сколько кустов?» — это кусты.
+_SELECTED_REF = _rx(r"\b(выделенн\w*|выбранн\w*|отмеченн\w*)\b")
 _SINGLE_ITEM = _rx(r"\b(дерево|деревце|куст|кустик)\b")
 _RETYPE_VERB = _rx(
     r"\b(сделай\w*|сделать|преврати(?!л)\w*|замени(?!л)\w*|поменяй\w*|переделай\w*|смени(?!л)\w*|переведи\w*"
@@ -756,6 +1052,7 @@ _HELP = _rx(
 )
 _GREETING = _rx(r"\b(привет\w*|здравствуй\w*|здрасьте|хай|hello|hi|салют)\b|\bдобр\w*\s+(день|утро|вечер)\b")
 _THANKS = _rx(r"\b(спасибо|спс|благодарю|мерси|thanks|супер|отлично|класс)\b")
+_BYE = _rx(r"\b(удачи|до свидания|до встречи|всего доброго|всего хорошего)\b|^(ну\s+)?пока$")
 
 
 # --- Разбор частей ------------------------------------------------------------
@@ -884,9 +1181,10 @@ def _ui(text: str, subjects: list[str], ctx: _Ctx) -> list[_Intent]:
         found.append(_Intent("ui", value="report_csv" if _CSV.search(text) else "report_json"))
     elif _DXF.search(text) or (_DOWNLOAD.search(text) and _PLAN_FILE.search(text)):
         found.append(_Intent("ui", value="export_dxf"))
-    if _VIEW3D.search(text):
+    leave_3d = _VIEW3D_OFF.search(text)
+    if _VIEW3D.search(text) and not leave_3d:
         found.append(_Intent("ui", value="show_3d"))
-    elif _VIEW2D.search(text) or (_BACK.search(text) and not subjects):
+    elif leave_3d or _VIEW2D.search(text) or (_BACK.search(text) and not subjects):
         found.append(_Intent("ui", value="show_2d"))
     return found
 
@@ -929,13 +1227,29 @@ def _edit(text: str, subjects: list[str], ctx: _Ctx) -> list[_Intent]:
                 # «Сделай все кусты деревьями» — массовая смена типа в два шага:
                 # выделить и показать, поменять — по второй просьбе.
                 return [_Intent("select", subjects=sources[:1], extra={"confirm": operation})]
-        return [_Intent("edit", value=operation)]
+        return [_Intent("edit", value=operation, extra={"pronoun": not _SELECTED_REF.search(text)})]
     if _DELETE.search(text) and not _DESELECT.search(text):
         if _SEL_REF.search(text) or _SINGLE_ITEM.search(text):
-            return [_Intent("edit", value="delete")]
+            pronoun = bool(_SEL_REF.search(text)) and not _SELECTED_REF.search(text)
+            return [_Intent("edit", value="delete", extra={"pronoun": pronoun})]
         if place and (subjects or _ALL_WORD.search(text) or _OBJECTS.search(text)):
             return [_Intent("spatial", value="delete", extra={"place": place.group(0)})]
-        if subjects or _PAVING.search(text) or _ROWS_TWO.search(text) or _ROWS_ONE.search(text) or _HEURISTIC.search(text):
+        recipe_words = _PAVING.search(text) or _ROWS_TWO.search(text) or _ROWS_ONE.search(text) or _HEURISTIC.search(text)
+        if _ERASE.search(text) and not _FROM_RECIPE.search(text) and not recipe_words:
+            # «Удали (все) кусты», «удали липы» — правка карты в два шага, как
+            # у модели: выделить и показать, удалить — по второй просьбе. Раньше
+            # здесь перестраивался план без кустов: другой смысл, чем в
+            # модельном режиме, и ручные правки остальных типов оставались в
+            # прежней версии плана.
+            named = _mentioned_species(text, ctx.facts)
+            if named:
+                return [_Intent("select", subjects=[named[0]], extra={"species": named[1], "confirm": "delete"})]
+            if subjects:
+                return [_Intent("select", subjects=subjects, extra={"confirm": "delete"}, takes_subjects=True)]
+            absent = _catalogue_species(text)
+            if absent:
+                return [_Intent("species_absent", value=absent, extra={"select": True})]
+        if subjects or recipe_words:
             return []  # «убери кусты», «убери второй ряд» — это рецепт генерации, не правка
         if _NORMS_OFF.search(text):
             return []
@@ -944,7 +1258,7 @@ def _edit(text: str, subjects: list[str], ctx: _Ctx) -> list[_Intent]:
         # Голое «удали (пожалуйста)» — про выделенное. «Убери подсветку»,
         # «удали лишнее» — неизвестно что, и удалять выделенное по догадке нельзя.
         if not _FILLER.sub(" ", _DELETE.sub(" ", text)).strip():
-            return [_Intent("edit", value="delete")]
+            return [_Intent("edit", value="delete", extra={"pronoun": True})]
     return []
 
 
@@ -963,7 +1277,9 @@ def _select(text: str, subjects: list[str], ctx: _Ctx) -> list[_Intent]:
         return [_Intent("select", subjects=[planting_type], extra={"species": names})]
     absent = None if subjects else _catalogue_species(text)
     if absent:
-        return [_Intent("species_absent", value=absent)]
+        # Попытка выделить, хоть и неудачная: «выдели дубы и удали их» без
+        # дубов не должно оставить голое «удали их» (guard_commands, (b)).
+        return [_Intent("species_absent", value=absent, extra={"select": True})]
     if subjects:
         if where and not verb and ctx.facts is not None and all(ctx.facts.count(s) == 0 for s in subjects):
             return [_Intent("why_few", subjects=subjects, takes_subjects=True)]
@@ -1091,6 +1407,8 @@ def _parse_clause(text: str, ctx: _Ctx) -> tuple[list[str], list[_Intent]]:
             intents.append(_Intent("greeting"))
         elif _THANKS.search(text):
             intents.append(_Intent("thanks"))
+        elif _BYE.search(text):
+            intents.append(_Intent("bye"))
     elif _GREETING.search(text):
         intents.insert(0, _Intent("greeting"))
     return subjects, intents
@@ -1102,8 +1420,11 @@ def _parse(message: str, ctx: _Ctx) -> list[_Intent]:
     pending: list[str] = []
     last_taker: _Intent | None = None
     last_subjects: list[str] = []
-    for clause in split_clauses(message):
+    for clause, asked in _marked_clauses(message):
         subjects, found = _parse_clause(clause, ctx)
+        for intent in found:
+            if intent.kind == "edit":
+                intent.extra["asked"] = asked
         if not found and intents and intents[-1].kind.startswith(("spacing", "rows")):
             # «Деревья реже, 8 метров», «интервал деревьев 6 м, кустов 2» —
             # число уточняет предыдущую часть. Без этого «кустов 2» досталось бы
@@ -1133,9 +1454,42 @@ def _parse(message: str, ctx: _Ctx) -> list[_Intent]:
         if subjects:
             last_subjects = subjects
         intents += found
-    if any(not i.extra.get("bare") and i.kind not in ("greeting", "thanks", "help") for i in intents):
+    if any(not i.extra.get("bare") and i.kind not in ("greeting", "thanks", "bye", "help") for i in intents):
         intents = [i for i in intents if not i.extra.get("bare")]
-    return intents
+    return _refer_to_named_group(intents)
+
+
+def _named_group(intent: _Intent) -> _Intent | None:
+    """Выделение группы, о которой спросили («сколько кустов?», «какие породы
+    деревьев?», «сколько нарушений?»), — None, если вопрос о выделенном."""
+    if intent.kind == "count" and intent.value == "violations":
+        return _Intent("violations")
+    if intent.kind == "count" and intent.value == "total":
+        return _Intent("select", value="all")
+    if intent.kind == "count" and intent.value == "species_named":
+        planting_type, names = intent.extra["named"]
+        return _Intent("select", subjects=[planting_type], extra={"species": names})
+    if intent.kind in ("count", "species_list", "why_few", "budget") and intent.value != "selection" and intent.subjects:
+        return _Intent("select", subjects=list(intent.subjects))
+    return None
+
+
+def _refer_to_named_group(intents: list[_Intent]) -> list[_Intent]:
+    """«Сколько кустов? Удали их» — «их» это кусты, а не то, что выделено
+    сейчас: голое «удали их» удаляло текущее выделение. Правка по
+    местоимению после вопроса о группе — та же массовая правка, что «удали
+    все кусты»: выделить группу и спросить. «Удали выделенные» — про
+    выделенное всегда."""
+    resolved: list[_Intent] = []
+    group: _Intent | None = None
+    for intent in intents:
+        if intent.kind == "edit" and intent.extra.get("pronoun") and group is not None:
+            extra = {**group.extra, "confirm": intent.value}
+            resolved.append(_Intent(group.kind, subjects=list(group.subjects), value=group.value, extra=extra))
+            continue
+        group = _named_group(intent) or group
+        resolved.append(intent)
+    return resolved
 
 
 # --- Ответы на вопросы -------------------------------------------------------
@@ -1145,10 +1499,32 @@ def _violations_status(ctx: _Ctx) -> str:
     if ctx.facts is None:
         return NO_PLAN
     if ctx.violations_count is None:
-        return "Проверка плана на нормативы ещё не готова — подождите пару секунд и спросите снова."
+        return VIOLATIONS_PENDING
     if ctx.violations_count == 0:
-        return "Нарушений нет — все посадки проходят по нормам."
+        return NO_VIOLATIONS
     return f"В плане {count_phrase(ctx.violations_count, 'violation')} — скажите «покажи нарушения», и я их выделю."
+
+
+def _why_violations(ctx: _Ctx) -> str:
+    """«Почему нарушения?» — причина, только если она известна. Раньше ответ
+    всегда винил ручную правку, даже в плане, которого никто не трогал.
+    Неизвестна — пусто: число скажет «Выделила …», а причину покажет карточка."""
+    manual = ctx.facts.manual_edits if ctx.facts is not None else None
+    if manual:
+        edited = plural(manual, "изменена", "изменены", "изменены")
+        return (
+            f"Генератор ставит посадки только по нормам, а {count_phrase(manual, 'planting')} в плане {edited} вручную — "
+            "переносом или сменой типа (у дерева отступы больше, чем у куста); нарушения, скорее всего, от этих правок."
+        )
+    if manual == 0:
+        return "Ручных правок в плане нет — значит, нарушения дала сама генерация."
+    return ""
+
+
+def _violations_hint(ctx: _Ctx) -> str:
+    if ctx.violations_count == 1:
+        return "Какой отступ нарушен — в карточке посадки."
+    return "Кликните по любому — в карточке будет, какой отступ нарушен."
 
 
 def _why_few(intent: _Intent, ctx: _Ctx, hints: bool = True) -> list[str]:
@@ -1168,15 +1544,24 @@ def _why_few(intent: _Intent, ctx: _Ctx, hints: bool = True) -> list[str]:
             off = "Газон выключен" if planting_type == "lawn" else f"{_cap(_NOM[planting_type])} выключены"
             texts.append(f"{off} в настройках — скажите «добавь {_NOM[planting_type]}».")
             continue
-        head = f"В плане {count_phrase(n, planting_type)}" if n else f"{_cap(_GEN[planting_type])} в плане нет"
         budget = facts.budget(planting_type)
-        if budget is None:
-            texts.append(head + ".")
-            continue
-        text = (
-            f"{head}: под {_NOM[planting_type]} по нормам остаётся {_area(budget.usable_m2)} из "
-            f"{_area(budget.territory_m2)} ({_share(budget.usable_share)} % участка)"
+        area = (
+            f"под {_NOM[planting_type]} по нормам остаётся {_area(budget.usable_m2)} из {_area(budget.territory_m2)} "
+            f"({_share(budget.usable_share)} % участка)"
+            if budget is not None
+            else ""
         )
+        if not facts.materialized:
+            # Счётчиков по типам у схлопнутого плана нет: «деревьев в плане нет» было бы неправдой.
+            if not area:
+                continue
+            text = _cap(area)
+        else:
+            head = f"В плане {count_phrase(n, planting_type)}" if n else f"{_cap(_GEN[planting_type])} в плане нет"
+            if not area:
+                texts.append(head + ".")
+                continue
+            text = f"{head}: {area}"
         top = budget.blockers[:3]
         if top:
             text += ", больше всего закрывают " + ", ".join(f"{b.label} — {round(100 * b.share)} %" for b in top)
@@ -1185,17 +1570,31 @@ def _why_few(intent: _Intent, ctx: _Ctx, hints: bool = True) -> list[str]:
     if not hints:
         return texts
     # Тесно — дело в нормах, и подсказка про то, что нормы разрешают (покрытие
-    # тротуара). Просторно — дело не в площади, а в интервале.
+    # тротуара). Просторно — дело не в площади: у кустов в шаге изгороди, а
+    # деревья и так стоят по норме класса кроны — «почаще» их не добавит
+    # (tree_floor), добавить может только схема посадки.
     if tight:
         texts.append(f"Отступы — норматив ({NORMS_CITATION}), их не ослабить.")
         if "tree" in tight and not ctx.settings.trees_in_paving:
             texts.append(
                 "Можно разрешить деревья в покрытии тротуара с решёткой (743-ПП п. 9.8) — скажите «разреши деревья в тротуаре»."
             )
-    for planting_type in (t for t in roomy if t in POINT_TYPES):
-        texts.append(
-            f"Места под {_NOM[planting_type]} хватает — гуще станет с меньшим интервалом: скажите «{_NOM[planting_type]} почаще»."
-        )
+    if "tree" in roomy:
+        floor = tree_floor(ctx.settings.tree_spacing_m)
+        offers = _tree_offers(ctx.settings)
+        if floor is not None:
+            texts.append(
+                f"Места под деревья хватает, а интервал сейчас — не меньше {fmt_num(floor)} м: скажите «деревья почаще», "
+                "и он станет меньше (но не меньше нормы класса кроны)."
+            )
+        else:
+            texts.append(
+                "Места под деревья хватает, но гуще нормы класса кроны их не поставить"
+                + (f" — добавить деревья может {' или '.join(offers)}." if offers else ".")
+            )
+    shrub_step = ctx.settings.shrub_spacing_m or ctx.default_spacing.get("shrub", HEDGE_PITCH_M)
+    if "shrub" in roomy and shrub_step > SPACING_LIMITS["shrub"][0]:
+        texts.append("Места под кусты хватает — живая изгородь станет гуще с меньшим шагом: скажите «кусты почаще».")
     if "tree" in types and ctx.settings.scoring_mode == "heuristic" and "tree" in ctx.settings.planting_types:
         texts.append("Ещё вариант — «режим ML»: места выбирает модель, обученная на решениях проектировщиков.")
     return texts
@@ -1241,31 +1640,48 @@ def _why_here(ctx: _Ctx) -> str:
                 "и я расскажу, почему она стоит именно там."
             )
         return "Выделите на карте одну посадку (клик по точке) — расскажу, почему она стоит именно там и какие нормы проверены."
-    what = f"{selected.species} ({_SINGULAR.get(selected.planting_type, selected.planting_type)})"
+    what = _item_name(selected)
     violated = [c for c in selected.checks if not c.satisfied]
+    # Заголовки разделов — как в самой карточке (InspectorCard.tsx): у
+    # нарушения «Нормативные отступы», иначе «Почему здесь можно». Числа — её же
+    # округлением (fmt_m), чтобы ответ и карточка рядом не расходились.
     if violated or not selected.compliant:
         if violated:
             check = violated[0]
             text = (
-                f"{what} нарушает нормы: {check.label} — нужно {fmt_num(check.required_m)} м, а здесь "
-                f"{fmt_num(check.actual_m)} м ({_cite(check.act, check.clause)})."
+                f"{what} нарушает нормы: {check.label} — нужно {fmt_m(check.required_m)} м, а здесь "
+                f"{fmt_m(check.actual_m)} м ({_cite(check.act, check.clause)})."
             )
         else:
             text = f"{what} нарушает нормы. {selected.summary}"
-        text += " Обычно так бывает после ручной правки — перенесите посадку или удалите её («удали выделенные»)."
+        if selected.is_manual_edit:
+            text += " Посадку правили вручную — перенесите её или удалите («удали выделенные»)."
+        else:
+            text += " Перенесите её на карте или удалите («удали выделенные»)."
+        section = "Нормативные отступы"
     else:
         binding = next((c for c in selected.checks if c.required_m > 0), None)
         if binding is None:
             text = f"{what} стоит по нормам: нормируемых препятствий рядом нет."
         else:
             text = (
-                f"{what} стоит по нормам. Ближе всего к пределу — {binding.label}: нужно {fmt_num(binding.required_m)} м, "
-                f"здесь {fmt_num(binding.actual_m)} м ({_cite(binding.act, binding.clause)})."
+                f"{what} стоит по нормам. Ближе всего к пределу — {binding.label}: нужно {fmt_m(binding.required_m)} м, "
+                f"здесь {fmt_m(binding.actual_m)} м ({_cite(binding.act, binding.clause)})."
             )
         reason = _first_sentence(selected.ranking_rationale)
         if reason:
-            text += f" Место выбрано так: {reason}"
-    return text + " Все отступы — в карточке «Почему здесь?»."
+            text += f" Место выбрано так: {_lower_first(reason)}"
+        section = "Почему здесь можно"
+    return text + f" Все отступы — в карточке посадки, раздел «{section}»."
+
+
+def _item_name(selected) -> str:
+    """«Липа мелколистная (дерево)»; у газона породы нет — в плане у него
+    species "default", и ответ звучал «default (газон) стоит по нормам»."""
+    species = (selected.species or "").strip()
+    if species and species.lower() != "default":
+        return f"{species} ({_SINGULAR.get(selected.planting_type, selected.planting_type)})"
+    return {"lawn": "Этот участок газона", "tree": "Это дерево", "shrub": "Этот куст"}.get(selected.planting_type, "Эта посадка")
 
 
 def _type_count(planting_type: str, facts: PlanFacts) -> str:
@@ -1339,14 +1755,16 @@ def _species_list(intent: _Intent, ctx: _Ctx) -> str:
 def _settings_show(ctx: _Ctx) -> str:
     s = ctx.settings
     types = _join([_NOM[t] for t in ALL_TYPES if t in s.planting_types]) or "ничего"
-    spacing = []
-    for planting_type in POINT_TYPES:
-        value = getattr(s, f"{planting_type}_spacing_m")
-        default = ctx.default_spacing.get(planting_type, FALLBACK_SPACING[planting_type])
-        shown = f"{fmt_num(value)} м" if value is not None else f"{fmt_num(default)} м (по умолчанию)"
-        spacing.append(f"{_GEN[planting_type]} {shown}")
+    floor = tree_floor(s.tree_spacing_m)
+    trees = f"не меньше {fmt_num(floor)} м" if floor is not None else f"по норме класса кроны ({CROWN_NORMS})"
+    hedge = ctx.default_spacing.get("shrub", FALLBACK_SPACING["shrub"])
+    shrubs = (
+        f"{fmt_num(s.shrub_spacing_m)} м в живой изгороди"
+        if s.shrub_spacing_m is not None
+        else f"живая изгородь {fmt_num(hedge)} м (по умолчанию), куртины — по плотности породы"
+    )
     return (
-        f"Сейчас в настройках: {types}; интервал {', '.join(spacing)}; деревья "
+        f"Сейчас в настройках: {types}; интервал деревьев — {trees}, кустов — {shrubs}; деревья "
         f"{'двумя рядами' if s.tree_rows == 2 else 'одним рядом'}; деревья в покрытии тротуара — "
         f"{'да' if s.trees_in_paving else 'нет'}; режим {'ML' if s.scoring_mode == 'ml' else 'эвристики'}."
     )
@@ -1386,10 +1804,21 @@ class _Answer:
         self.greeting = False
         self.help = False
         self.thanks = False
+        self.bye = False
         self.declined = False
         # Типы, у которых интервал уже менялся относительно: «слишком густо,
         # разреди» — одна просьба двумя частями, а не ×1,4 дважды.
         self.relative_done: set[str] = set()
+        # Относительная смена интервала: тип -> (направление, -1 гуще / +1 реже;
+        # интервал по правилам). Модельный путь сверяет с этим число модели.
+        self.relative: dict[str, tuple[int, float | None]] = {}
+        # «Деревья погуще» там, где гуще нормы нельзя: объяснение — после всех
+        # настроек сообщения, чтобы не предлагать то, что в нём же и включили.
+        self.trees_at_norm = False
+        # Выделить пытались — удачно или нет (guard_commands, правило (b)).
+        self.select_attempted = False
+        # Операция правки -> была ли она во всех своих частях вопросом.
+        self.edit_asked: dict[str, bool] = {}
 
     def say(self, text: str) -> None:
         if text and text not in self.pre:
@@ -1407,8 +1836,9 @@ class _Answer:
 
 def _select_intent(intent: _Intent, answer: _Answer) -> None:
     ctx = answer.ctx
+    answer.select_attempted = True
     if ctx.facts is None:
-        answer.say("Плана пока нет — выделять нечего. Сначала сгенерируйте его («сгенерируй план»).")
+        answer.say(NOTHING_TO_SELECT)
         return
     if intent.value == "all":
         target, species = "all", None
@@ -1418,8 +1848,9 @@ def _select_intent(intent: _Intent, answer: _Answer) -> None:
             target, species = "all", None
         else:
             planting_type = subjects[0]
-            if ctx.facts.count(planting_type) == 0:
-                answer.say(f"{_cap(_GEN[planting_type])} в плане нет — выделять нечего.")
+            refusal = select_refusal(_TARGET_OF[planting_type], ctx.facts, ctx.violations_count)
+            if refusal:
+                answer.say(refusal)
                 return
             names = intent.extra.get("species") or []
             target, species = _TARGET_OF[planting_type], (names[0] if names else None)
@@ -1485,6 +1916,8 @@ def _apply_settings(answer: _Answer) -> SettingsCommand | None:
                 recipe.scoring_mode = intent.value
         elif kind.startswith("spacing_"):
             _apply_spacing(intent, recipe, answer)
+    if answer.trees_at_norm:
+        answer.say(tree_denser_text(recipe))
     before = AssistantAction(**ctx.settings.model_dump())
     if recipe == before and not regenerate:
         return None
@@ -1535,7 +1968,6 @@ def _apply_types(intent: _Intent, recipe: AssistantAction, answer: _Answer) -> N
 
 
 def _apply_spacing(intent: _Intent, recipe: AssistantAction, answer: _Answer) -> None:
-    ctx = answer.ctx
     targets = [t for t in intent.subjects if t in POINT_TYPES]
     if not targets:
         if intent.subjects:  # просили про газон
@@ -1559,28 +1991,111 @@ def _apply_spacing(intent: _Intent, recipe: AssistantAction, answer: _Answer) ->
                 continue
             answer.say(f"{_cap(_NOM[planting_type])} сейчас выключены — скажите «добавь {_NOM[planting_type]}».")
             continue
-        low, high = SPACING_LIMITS[planting_type]
-        field_name = f"{planting_type}_spacing_m"
-        current = getattr(recipe, field_name)
-        base = current if current is not None else ctx.default_spacing.get(planting_type, FALLBACK_SPACING[planting_type])
-        if intent.kind == "spacing_rel":
-            wanted = round(base * float(intent.value), 1)
-        elif intent.kind == "spacing_delta":
-            wanted = round(base + float(intent.value), 2)
+        if planting_type == "tree":
+            _apply_tree_spacing(intent, recipe, answer)
         else:
-            wanted = float(intent.value)
-        value = min(high, max(low, wanted))
-        if intent.kind != "spacing_abs" and value == base:
-            answer.say(
-                f"Интервал {_GEN[planting_type]} уже {'максимальный' if value >= high else 'минимальный'} — {fmt_num(value)} м."
-            )
-            continue
-        if value != wanted and intent.kind != "spacing_rel":
-            answer.say(f"Интервал {_GEN[planting_type]} можно от {fmt_num(low)} до {fmt_num(high)} м — ставлю {fmt_num(value)}.")
-        setattr(recipe, field_name, value)
+            _apply_shrub_spacing(intent, recipe, answer)
 
 
-def _compose(intents: list[_Intent], ctx: _Ctx) -> tuple[str, list[AssistantCommand]]:
+def _direction(intent: _Intent) -> int:
+    """-1 — гуще, +1 — реже, 0 — интервал задан числом."""
+    if intent.kind == "spacing_rel":
+        return -1 if float(intent.value) < 1 else 1
+    if intent.kind == "spacing_delta":
+        return -1 if float(intent.value) < 0 else 1
+    return 0
+
+
+def _spacing_round(value: float) -> float:
+    # Шаг изгороди — доли метра: 0,5 × 0,7 = 0,35, до одного знака это было бы 0,3.
+    return round(value, 2) if value < 1 else round(value, 1)
+
+
+def _apply_tree_spacing(intent: _Intent, recipe: AssistantAction, answer: _Answer) -> None:
+    """Интервал деревьев пользователя — нижний предел поверх нормы класса
+    кроны (tree_floor). «Погуще» без своего предела — ничего не меняет и
+    говорит почему; со своим — уменьшает его, а дойдя до нормы узкой кроны,
+    снимает совсем. «Пореже» без своего — от нормы средней кроны (5 м -> 7 м)."""
+    ctx = answer.ctx
+    high = SPACING_LIMITS["tree"][1]
+    current = tree_floor(recipe.tree_spacing_m)
+    direction = _direction(intent)
+    if direction < 0 and current is None:
+        answer.trees_at_norm = True
+        answer.relative["tree"] = (direction, recipe.tree_spacing_m)
+        return
+    base = current if current is not None else ctx.default_spacing.get("tree", FALLBACK_SPACING["tree"])
+    if intent.kind == "spacing_rel":
+        wanted = _spacing_round(base * float(intent.value))
+    elif intent.kind == "spacing_delta":
+        wanted = round(base + float(intent.value), 2)
+    else:
+        wanted = float(intent.value)
+    value = tree_floor(min(high, wanted))
+    if direction:
+        answer.relative["tree"] = (direction, value)
+        if value == current:
+            answer.say(f"Интервал деревьев уже максимальный — {fmt_num(high)} м.")
+            return
+    elif value is None:
+        # «Интервал деревьев 2 м»: ближе нормы класса кроны дерево не встанет всё равно.
+        answer.say(
+            f"Чаще нормы своего класса кроны деревья не ставлю ({CROWN_NORMS}), так что {fmt_num(wanted)} м — "
+            "это интервал по норме."
+        )
+        if current is None:
+            return  # и так по норме — перестраивать нечего
+    elif wanted > high:
+        answer.say(f"Интервал деревьев можно до {fmt_num(high)} м — ставлю {fmt_num(high)}.")
+    recipe.tree_spacing_m = value
+
+
+def _apply_shrub_spacing(intent: _Intent, recipe: AssistantAction, answer: _Answer) -> None:
+    """Интервал кустов — шаг живой изгороди: без своего — от шага изгороди
+    по умолчанию (HEDGE_PITCH_M), а не от shrub_default 3 м, которого в плане
+    нет. Нижний предел 0,3 м — граница 743-ПП табл. 3.6.2 для низкой изгороди."""
+    ctx = answer.ctx
+    low, high = SPACING_LIMITS["shrub"]
+    current = recipe.shrub_spacing_m
+    base = current if current is not None else ctx.default_spacing.get("shrub", FALLBACK_SPACING["shrub"])
+    direction = _direction(intent)
+    if intent.kind == "spacing_rel":
+        wanted = _spacing_round(base * float(intent.value))
+    elif intent.kind == "spacing_delta":
+        wanted = round(base + float(intent.value), 2)
+    else:
+        wanted = float(intent.value)
+    value = min(high, max(low, wanted))
+    if direction:
+        answer.relative["shrub"] = (direction, value if value != base else current)
+        if value == base:
+            limit = f"максимальный — {fmt_num(value)} м" if value >= high else f"минимальный — {fmt_num(value)} м: {SHRUB_MIN_NOTE}"
+            answer.say(f"Интервал кустов уже {limit}.")
+            return
+    elif value != wanted:
+        answer.say(f"Интервал кустов можно от {fmt_num(low)} до {fmt_num(high)} м — ставлю {fmt_num(value)}.")
+    recipe.shrub_spacing_m = value
+
+
+@dataclass
+class RulesAnswer:
+    """Ответ встроенного разбора — и то, что модельному пути нужно сверх
+    текста и команд."""
+
+    reply: str
+    commands: list[AssistantCommand]
+    # Интервалы, которые сообщение меняет относительно («кусты пореже»): тип ->
+    # (направление: -1 гуще, +1 реже; интервал по правилам этого модуля).
+    relative: dict[str, tuple[int, float | None]] = field(default_factory=dict)
+    # Массовая правка, отложенная до второй просьбы: группа выделена этим
+    # ответом, правка (delete/to_tree/to_shrub) — после подтверждения словами.
+    confirms: list[str] = field(default_factory=list)
+    # В сообщении пытались выделить группу (удачно или нет): правка того же
+    # ответа не может относиться к текущему выделению (guard_commands, (b)).
+    select_attempted: bool = False
+
+
+def _compose(intents: list[_Intent], ctx: _Ctx) -> RulesAnswer:
     answer = _Answer(ctx)
     for intent in intents:
         kind = intent.kind
@@ -1592,14 +2107,11 @@ def _compose(intents: list[_Intent], ctx: _Ctx) -> tuple[str, list[AssistantComm
         elif kind == "why_here":
             answer.say(_why_here(ctx))
         elif kind == "why_violations":
+            answer.select_attempted = True
             if ctx.facts is not None and ctx.violations_count:
-                answer.say(
-                    f"{_cap(count_phrase(ctx.violations_count, 'violation'))}: генератор ставит посадки только по нормам, "
-                    "так что нарушения обычно появляются после ручной правки — переноса или смены типа (у дерева отступы "
-                    "больше, чем у куста)."
-                )
+                answer.say(_why_violations(ctx))
                 answer.command(SelectCommand(target="violations"))
-                answer.post.append("Кликните по любому — в карточке будет, какой отступ нарушен.")
+                answer.post.append(_violations_hint(ctx))
             else:
                 answer.say(_violations_status(ctx))
         elif kind == "count":
@@ -1611,12 +2123,13 @@ def _compose(intents: list[_Intent], ctx: _Ctx) -> tuple[str, list[AssistantComm
         elif kind == "settings_show":
             answer.say(_settings_show(ctx))
         elif kind == "violations":
+            answer.select_attempted = True
             if ctx.facts is not None and ctx.violations_count:
                 answer.command(SelectCommand(target="violations"))
                 if intent.extra.get("confirm"):
                     answer.dropped.append(Dropped(intent.extra["confirm"], "after_select"))
                 else:
-                    answer.post.append("Кликните по любому — в карточке будет, какой отступ нарушен.")
+                    answer.post.append(_violations_hint(ctx))
             else:
                 answer.say(_violations_status(ctx))
         elif kind == "violations_status":
@@ -1625,6 +2138,8 @@ def _compose(intents: list[_Intent], ctx: _Ctx) -> tuple[str, list[AssistantComm
             for text in _budget(intent, ctx):
                 answer.say(text)
         elif kind == "spatial":
+            if intent.value == "select":
+                answer.select_attempted = True
             answer.say(_spatial(intent))
         elif kind == "undo":
             answer.say(UNDO_TEXT)
@@ -1639,12 +2154,19 @@ def _compose(intents: list[_Intent], ctx: _Ctx) -> tuple[str, list[AssistantComm
             _ui_intent(intent.value, answer)
         elif kind == "edit":
             answer.command(EditSelectionCommand(operation=intent.value))
+            # Вопрос — только если ни в одной части не просили прямо: «можно
+            # удалить их? удали» — это уже просьба.
+            asked = bool(intent.extra.get("asked"))
+            answer.edit_asked[intent.value] = answer.edit_asked.get(intent.value, True) and asked
         elif kind == "select":
             _select_intent(intent, answer)
         elif kind == "species_absent":
+            if intent.extra.get("select"):
+                answer.select_attempted = True
             planting_type, name = intent.value
             answer.say(species_absent(name, planting_type, ctx.facts) if ctx.facts is not None else NO_PLAN)
         elif kind == "select_what":
+            answer.select_attempted = True
             answer.say("Что выделить? Например: «выдели все деревья», «выдели липы» или «покажи нарушения».")
         elif kind == "help":
             answer.help = True
@@ -1652,13 +2174,24 @@ def _compose(intents: list[_Intent], ctx: _Ctx) -> tuple[str, list[AssistantComm
             answer.greeting = True
         elif kind == "thanks":
             answer.thanks = True
+        elif kind == "bye":
+            answer.bye = True
         else:
             answer.settings(intent)
 
     settings_command = _apply_settings(answer) if answer.settings_intents else None
     commands = [c if c is not None else settings_command for c in answer.commands]
     commands = [c for c in commands if c is not None]
-    commands, dropped = guard_commands(commands, ctx.selection)
+    commands, dropped = guard_commands(
+        commands,
+        ctx.selection,
+        select_attempted=answer.select_attempted,
+        asked={op for op, asked in answer.edit_asked.items() if asked},
+    )
+    if any(isinstance(c, SelectCommand) and c.target == "violations" for c in commands):
+        # «Сколько нарушений? Удали их»: «скажите «покажи нарушения»» рядом с
+        # уже выделенными нарушениями — противоречие; число скажет «Выделила …».
+        answer.pre = [text for text in answer.pre if text != _violations_status(ctx)]
     actions = describe_actions(
         commands,
         answer.dropped + dropped,
@@ -1675,15 +2208,18 @@ def _compose(intents: list[_Intent], ctx: _Ctx) -> tuple[str, list[AssistantComm
         parts = [HELP_TEXT] + parts
     elif answer.thanks and not parts:
         parts = ["Пожалуйста! Если нужно что-то ещё — пишите."]
+    elif answer.bye and not parts:
+        parts = ["Спасибо! Если понадобится помощь с планом — пишите."]
     if not parts:
-        return FALLBACK_TEXT, []
+        return RulesAnswer(FALLBACK_TEXT, [])
     reply = " ".join(dict.fromkeys(parts))
     if answer.greeting:
         reply = "Привет! " + reply
-    return reply, commands
+    confirms = list(dict.fromkeys(d.operation for d in answer.dropped + dropped if d.reason == "after_select"))
+    return RulesAnswer(reply, commands, dict(answer.relative), confirms, answer.select_attempted)
 
 
-def answer_with_rules(
+def rules_answer(
     message: str,
     settings: AssistantGenerationSettings,
     facts: PlanFacts | None = None,
@@ -1691,7 +2227,7 @@ def answer_with_rules(
     violations_count: int | None = None,
     view: str = "2d",
     default_spacing: dict[str, float] | None = None,
-) -> tuple[str, list[AssistantCommand]]:
+) -> RulesAnswer:
     """Ответ и команды по тексту — без языковой модели. Никогда не бросает на
     странном вводе: худший случай — «не поняла» со списком того, что умеет."""
     ctx = _Ctx(
@@ -1703,5 +2239,19 @@ def answer_with_rules(
         default_spacing={**FALLBACK_SPACING, **(default_spacing or {})},
     )
     if not split_clauses(message) and "?" in (message or ""):
-        return HELP_TEXT, []  # одинокий «?» — это «что ты умеешь»
+        return RulesAnswer(HELP_TEXT, [])  # одинокий «?» — это «что ты умеешь»
     return _compose(_parse(message, ctx), ctx)
+
+
+def answer_with_rules(
+    message: str,
+    settings: AssistantGenerationSettings,
+    facts: PlanFacts | None = None,
+    selection: AssistantSelection | None = None,
+    violations_count: int | None = None,
+    view: str = "2d",
+    default_spacing: dict[str, float] | None = None,
+) -> tuple[str, list[AssistantCommand]]:
+    """rules_answer без подробностей для модельного пути: (ответ, команды)."""
+    answer = rules_answer(message, settings, facts, selection, violations_count, view, default_spacing)
+    return answer.reply, answer.commands

@@ -16,6 +16,7 @@ from backend.app.services.assistant_service import (
     ask_yuna,
     default_spacing,
 )
+from backend.app.services.pipeline_service import ensure_materialized
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,19 @@ def _response(reply: str, actions: list[AssistantCommand], mode: str, notice: st
 async def send_message(request: AssistantMessageRequest, project: ProjectDep) -> AssistantMessageResponse:
     facts = None
     if request.plan_id:
+        plan = next((p for p in project.plans if p.id == request.plan_id), None)
+        if plan is not None and not plan.materialized:
+            # The plan on screen can be pruned under the chat's feet: a generate
+            # from another tab collapses every other unedited plan
+            # (pipeline_service._prune_stale_plans), and facts built from a plan
+            # with no items said «деревьев в плане нет». Same transparent
+            # recompute get_plan_or_404 does for every other plan route; a
+            # failure leaves the facts without counts rather than the chat
+            # without an answer.
+            try:
+                await ensure_materialized(plan)
+            except Exception:
+                logger.exception("Could not materialize plan %s for the assistant", plan.id)
         facts = await run_in_threadpool(build_plan_facts, project, request.plan_id, request.selected_item_id)
     defaults = default_spacing()
 
