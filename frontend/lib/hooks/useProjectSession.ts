@@ -220,7 +220,7 @@ export function useProjectSession() {
   async function handleGenerate(
     plantingTypes: PlantingType[],
     scoringMode: ScoringMode,
-    spacing?: { treeSpacingM?: number; shrubSpacingM?: number; treeRows?: number; treesInPaving?: boolean }
+    spacing?: { treeSpacingM?: number; shrubSpacingM?: number; treeRows?: number; treesInPaving?: boolean; useOrderBoundary?: boolean }
   ) {
     if (!project) return;
     setGenerating(true);
@@ -231,6 +231,7 @@ export function useProjectSession() {
         onPoll: (status) => setGenerateProgress(progressFromStatus(status)),
       });
       applyPlan(generated);
+      if (spacing?.useOrderBoundary) setProject({ ...project, use_order_boundary: true });
       await refreshPlans(project.id);
       saveStoredSession({ projectId: project.id, planId: generated.plan_id });
     } finally {
