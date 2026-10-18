@@ -398,6 +398,38 @@ class TestPlannerPatterns:
             for group_item in groups:
                 assert row_item.geometry.distance(group_item.geometry) >= IN_ROW_PITCH_M["shrub"] - 1e-3
 
+    def test_curtain_pitch_follows_the_515_density_of_its_species(self, norms, catalogue):
+        """Шаг в куртине — из плотности породы по 515-ПП табл. 5, и так,
+        что плотность нельзя превысить даже гексагональной упаковкой."""
+        import math
+
+        from geo_engine.planner import GROUP_RATIONALE_PREFIX, IN_GROUP_PITCH_M, group_pitch_for, plan_items
+
+        lilac = catalogue.get("Сирень обыкновенная")
+        barberry = catalogue.get("Барбарис Тунберга")
+        juniper = catalogue.get("Можжевельник казацкий")
+        assert group_pitch_for(lilac) > group_pitch_for(barberry)
+        assert group_pitch_for(juniper) == IN_GROUP_PITCH_M
+        for species in (lilac, barberry):
+            pitch = group_pitch_for(species)
+            assert 2 / (math.sqrt(3) * pitch**2) <= species.density_per_m2 + 1e-9
+
+        territory, zones = self._scene()
+        items = plan_items(
+            "shrub-density", [], zones, territory, ["shrub"], self._score, norms,
+            pattern="group", catalogue=catalogue, density_per_ha={"shrub": 0},
+        )
+        groups = [i for i in items if i.rationale.startswith(GROUP_RATIONALE_PREFIX)]
+        assert groups
+        by_species: dict[str, list] = {}
+        for item in groups:
+            by_species.setdefault(item.species, []).append(item.geometry)
+        for name, points in by_species.items():
+            pitch = group_pitch_for(catalogue.get(name))
+            for i, a in enumerate(points):
+                for b in points[i + 1:]:
+                    assert a.distance(b) >= pitch - 1e-3, name
+
 
 class TestDoubleRow:
     """Двухрядная аллея (743-ПП табл. 3.6.2): второй ряд в шахматном порядке,
