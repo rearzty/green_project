@@ -52,6 +52,7 @@ from geo_engine.io.dxf_reader import (
     read_dxf,
     resolve_and_read_bundle,
 )
+from geo_engine.io.dwg_convert import available_backend
 from geo_engine.io.shp_geojson_reader import read_vector_file
 from geo_engine.model import Utility, Zone
 from geo_engine.territory import MissingTerritoryError, territory_polygon
@@ -122,6 +123,16 @@ def _parse_dxf_bundle(
             warnings_out.append(
                 f"Не прочитано файлов чертежа: {len(unreadable)} ({', '.join(unreadable)}). "
                 "Если граница участка лежала в них, участок может оказаться меньше настоящего."
+            )
+        has_dwg = path.suffix.lower() == ".dwg" or (path.is_dir() and any(path.rglob("*.[dD][wW][gG]")))
+        if has_dwg and available_backend() == "libredwg":
+            # ODA File Converter есть только под x86-64: на arm64 (Mac) образ
+            # молча собирается с LibreDWG, и это выглядело как сбой генерации
+            # («одни кусты», план без подосновы), а не как другой конвертер.
+            warnings_out.append(
+                "DWG сконвертированы запасным конвертером LibreDWG (ODA File Converter не найден): "
+                "заливки покрытий теряются, часть файлов может не прочитаться. Для полноценного результата "
+                "запускайте сервис на x86-64 с ODA File Converter."
             )
     return utilities, zones, None
 
