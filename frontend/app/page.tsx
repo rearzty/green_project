@@ -36,6 +36,7 @@ import { InspectorPanel, type InspectedItem } from "@/components/InspectorPanel"
 import { MapToolbar } from "@/components/map/MapToolbar";
 import { SelectionBar } from "@/components/map/SelectionBar";
 import { StatusBar, type LegendItem } from "@/components/map/StatusBar";
+import { CameraControls3D } from "@/components/map/CameraControls3D";
 import { ViewControls } from "@/components/map/ViewControls";
 import { ZoomControls } from "@/components/map/ZoomControls";
 import type { FixPreviewMark, HoverInfo, MapFitRequest } from "@/components/MapView";
@@ -46,7 +47,7 @@ import {
   fetchComplianceReport,
   getItemsCompliance,
   getNearbyConstraints,
-  getNearestAllowed,
+  getAllowedArea,
   getProjectLayers3d,
   PROJECT_GONE_MESSAGE,
   type AssistantAction,
@@ -87,7 +88,8 @@ import { usePlanEdits } from "@/lib/hooks/usePlanEdits";
 import { useProjectSession } from "@/lib/hooks/useProjectSession";
 import { useSelection } from "@/lib/hooks/useSelection";
 import { useZonesLayer } from "@/lib/hooks/useZonesLayer";
-import type { Season } from "@/lib/mapStyle";
+import type { CameraCommand, WalkState } from "@/components/ThreeDView";
+import type { SceneTheme, Season } from "@/lib/mapStyle";
 import { boundsOfItems } from "@/lib/planIndex";
 import { recipeForPlan } from "@/lib/planRecipes";
 import { computePlanStats } from "@/lib/planStats";
@@ -136,6 +138,30 @@ export default function Home() {
   const [showPlan, setShowPlan] = useState(true);
   const [view3d, setView3d] = useState(false);
   const [season, setSeason] = useState<Season>("summer");
+  const [sceneTheme, setSceneTheme] = useState<SceneTheme>("day");
+  const [cameraCommand, setCameraCommand] = useState<CameraCommand | null>(null);
+  const [autoRotate, setAutoRotate] = useState(false);
+  const [walk, setWalk] = useState<WalkState>({ index: 0, total: 0 });
+  const handleCameraPose = useCallback((pose: CameraCommand["pose"]) => {
+    // Перелёт заканчивает облёт: иначе камера тут же поплыла бы дальше.
+    setAutoRotate(false);
+    setCameraCommand((previous) => ({ pose, seq: (previous?.seq ?? 0) + 1 }));
+  }, []);
+  // ← → в 3D — по участкам посадок, как кнопки ‹ ›. В полях ввода стрелки нужны
+  // самому полю (курсор в тексте Юны), с модификаторами — браузеру/системе.
+  useEffect(() => {
+    if (!view3d) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))) return;
+      e.preventDefault();
+      handleCameraPose(e.key === "ArrowRight" ? "walk-next" : "walk-prev");
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [view3d, handleCameraPose]);
   // ThreeDView is the only remaining consumer of the full vector layer
   // geometry (its building extrusion needs real polygons, not a raster) --
   // fetched lazily on the first toggle into 3D rather than unconditionally
@@ -346,11 +372,10 @@ export default function Home() {
     },
     []
   );
-  const loadNearestAllowed = useCallback(async (itemId: string, at: { x: number; y: number }) => {
+  const loadAllowedArea = useCallback(async (itemId: string, at: { x: number; y: number }) => {
     const { project: current, plan: currentPlan } = runtimeRef.current.session;
     if (!current || !currentPlan) return null;
-    const found = await getNearestAllowed(current.id, currentPlan.plan_id, itemId, at);
-    return found ? found.to : null;
+    return getAllowedArea(current.id, currentPlan.plan_id, itemId, at);
   }, []);
 
   /** «Применить» в «Как исправить»: тем же путём, что кнопки панели выделения —
@@ -1485,6 +1510,10 @@ export default function Home() {
                 plan={plan?.features}
                 crsVerified={project?.crs_verified}
                 season={season}
+                sceneTheme={sceneTheme}
+                cameraCommand={cameraCommand}
+                autoRotate={autoRotate}
+                onWalkChange={setWalk}
                 storageKey={project?.id}
               />
             ) : (
@@ -1506,7 +1535,7 @@ export default function Home() {
                 fixPreview={mapFixPreview}
                 partialPlan={session.generatePartial?.features ?? null}
                 loadNearbyConstraints={loadNearbyConstraints}
-                loadNearestAllowed={loadNearestAllowed}
+                loadAllowedArea={loadAllowedArea}
                 zoneLayers={zonesShown ? zones.layers : null}
                 dimPlan={zonesShown || session.generatePartial !== null}
                 onSelectionChange={selection.setSelection}
@@ -1578,7 +1607,17 @@ export default function Home() {
               hasPlan={plan !== null}
               season={season}
               onSeasonChange={setSeason}
+              sceneTheme={sceneTheme}
+              onSceneThemeChange={setSceneTheme}
             />
+            {view3d && (
+              <CameraControls3D
+                onPose={handleCameraPose}
+                walk={walk}
+                autoRotate={autoRotate}
+                onToggleAutoRotate={() => setAutoRotate((on) => !on)}
+              />
+            )}
             {!view3d && <ZoomControls map={leafletMap} />}
             {showSelectionBar && selection.summary && (
               <SelectionBar

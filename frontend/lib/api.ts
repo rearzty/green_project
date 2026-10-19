@@ -627,11 +627,18 @@ export async function getNearbyConstraints(
   return features;
 }
 
-/** Alt при перетаскивании: ближайшая допустимая точка для посадки, если её
- * поставить у (x, y). null — рядом места нет (сервер отвечает 404). */
-export async function getNearestAllowed(projectId: string, planId: string, itemId: string, at: LngLat): Promise<{ to: LngLat; shift_m: number } | null> {
+/** Перенос: где вокруг (x, y) — координаты отображения — эту посадку можно
+ * поставить без нарушений. `geometry` — MultiPolygon, сжатый на 10 см внутрь
+ * (любая его точка допустима по проверке плана); null — в окне радиусом
+ * `radius_m` места нет. null же вернётся для газона: у него нет «точки» (404). */
+export interface AllowedArea {
+  geometry: GeoJSONGeometry | null;
+  radius_m: number;
+}
+
+export async function getAllowedArea(projectId: string, planId: string, itemId: string, at: LngLat): Promise<AllowedArea | null> {
   try {
-    return await request(`/api/projects/${projectId}/plans/${planId}/items/${encodeURIComponent(itemId)}/nearest-allowed?x=${at.x}&y=${at.y}`);
+    return await request<AllowedArea>(`/api/projects/${projectId}/plans/${planId}/items/${encodeURIComponent(itemId)}/allowed-area?x=${at.x}&y=${at.y}`);
   } catch (e) {
     if (e instanceof ApiError && e.status === 404) return null;
     throw e;

@@ -9,6 +9,7 @@ from fastapi.concurrency import run_in_threadpool
 from backend.app.api.deps import PlanDep, get_item_or_404
 from backend.app.schemas.geo import GeoJSONFeature
 from backend.app.schemas.plan import (
+    AllowedAreaOut,
     FixesApplyRequest,
     FixesApplyResult,
     FixOptionOut,
@@ -45,7 +46,7 @@ from backend.app.services.edit_service import (
     validate_items_scoped,
     validate_plan,
 )
-from backend.app.services.fix_service import apply_fixes, item_fixes, nearest_allowed
+from backend.app.services.fix_service import allowed_area, apply_fixes, item_fixes, nearest_allowed
 from backend.app.services.geo_io import display_crs, planting_item_to_geojson_feature
 
 router = APIRouter(prefix="/api/projects/{project_id}/plans/{plan_id}", tags=["edit"])
@@ -135,6 +136,18 @@ async def nearest_allowed_route(item_id: str, x: float, y: float, plan: PlanDep)
     if found is None:
         raise HTTPException(status_code=404, detail="Рядом нет места, где нормы позволяют поставить эту посадку.")
     return NearestAllowedOut(**found)
+
+
+@router.get("/items/{item_id}/allowed-area", response_model=AllowedAreaOut)
+async def allowed_area_route(item_id: str, x: float, y: float, plan: PlanDep) -> AllowedAreaOut:
+    """Перенос: где вокруг (x, y) (координаты отображения) эту посадку можно
+    поставить без нарушений — одним полигоном, чтобы интерфейс закрасил запретное
+    место и оставил чистым допустимое. Газон — 404: у него нет «точки»."""
+    get_item_or_404(plan, item_id)
+    found = await run_in_threadpool(allowed_area, plan, item_id, x, y, display_crs(plan.project))
+    if found is None:
+        raise HTTPException(status_code=404, detail="Для этой посадки допустимую область не считаем.")
+    return AllowedAreaOut(**found)
 
 
 @router.post("/fixes/apply", response_model=FixesApplyResult)

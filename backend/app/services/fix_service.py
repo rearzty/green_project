@@ -437,3 +437,58 @@ def nearest_allowed(plan: Plan, item_id: str, x: float, y: float, source_crs: st
     if move is None:
         return None
     return {"to": _display_point(move.x, move.y, source_crs), "shift_m": round(move.shift_m, 2)}
+
+
+# «Где можно поставить»: пока посадку тянут, интерфейс закрашивает запретное
+# место и оставляет чистым допустимое — вместо россыпи охранных зон и кругов
+# соседей, среди которых допустимое место на глаз не найти.
+ALLOWED_AREA_RADIUS_M = 60.0
+# Граница допустимой области касается зоны отступов, а касание — уже нарушение
+# (compliance: допуск 1 мм). Сжатие на 10 см при упрощении на 4 см оставляет любой
+# точке области, включая её границу, запас не менее 6 см — по границе же интерфейс
+# ищет «ближайшее допустимое».
+ALLOWED_SHRINK_M = 0.10
+ALLOWED_SIMPLIFY_M = 0.04
+_NEIGHBOUR_BUFFER_SEGS = 16
+
+
+def allowed_area(plan: Plan, item_id: str, x: float, y: float, source_crs: str | None, radius_m: float = ALLOWED_AREA_RADIUS_M) -> dict | None:
+    """Где в `radius_m` м от (x, y) эту посадку можно поставить без нарушений:
+    участок минус зона отступов для её типа и породы (`exclusion_cache`) минус
+    круги интервала вокруг соседних деревьев (МГСН 1.02-02 п. 4.2.9.2) — те же
+    условия, что у `_find_move` и у проверки плана. `None` — посадки нет или это
+    газон; `{"geometry": None}` — в окне допустимого места нет."""
+    row = next((r for r in plan.items if r.id == item_id), None)
+    if row is None or row.planting_type == "lawn":
+        return None
+    ctx = _Context(plan)
+    centre = from_wgs84(Point(x, y), source_crs)
+    window = shapely.box(centre.x - radius_m, centre.y - radius_m, centre.x + radius_m, centre.y + radius_m)
+
+    allowed = exclusion_cache.with_territory(ctx.project, lambda territory: shapely.intersection(territory, window))
+    if not allowed.is_empty:
+        allowed = exclusion_cache.with_exclusion_zone(
+            ctx.project,
+            row.planting_type,
+            lambda zone: allowed if zone is None or zone.is_empty else shapely.difference(allowed, shapely.intersection(zone, window)),
+            species=row.species,
+            trees_in_paving=ctx.plan.trees_in_paving,
+        )
+    if not allowed.is_empty and row.planting_type in SPACING_CHECKED_TYPES:
+        own_interval = _crown_interval(_catalogue(), row.species) or 0.0
+        neighbour_xy, neighbour_interval = ctx.trees.around(
+            centre.x, centre.y, radius_m * 1.5 + max(own_interval, float(ctx.trees.interval.max(initial=0.0))), row.id
+        )
+        if len(neighbour_xy):
+            required = np.maximum(own_interval, neighbour_interval) + _SPACING_MARGIN_M
+            circles = shapely.buffer(shapely.points(neighbour_xy), required, quad_segs=_NEIGHBOUR_BUFFER_SEGS)
+            allowed = shapely.difference(allowed, shapely.union_all(circles))
+
+    if not allowed.is_empty:
+        allowed = shapely.buffer(allowed, -ALLOWED_SHRINK_M)
+    polygonal = [g for g in getattr(allowed, "geoms", [allowed]) if g.geom_type == "Polygon" and not g.is_empty]
+    if not polygonal:
+        return {"geometry": None, "radius_m": radius_m}
+    merged = shapely.simplify(shapely.MultiPolygon(polygonal), ALLOWED_SIMPLIFY_M)
+    shown = _to_wgs84(merged, source_crs)
+    return {"geometry": shapely.geometry.mapping(shown), "radius_m": radius_m}
