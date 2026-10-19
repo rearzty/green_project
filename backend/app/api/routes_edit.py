@@ -14,6 +14,8 @@ from backend.app.schemas.plan import (
     ItemsDeleteResult,
     ItemsMoveRequest,
     ItemsMoveResult,
+    ItemsRespaceRequest,
+    ItemsRespaceResult,
     ItemsRestoreRequest,
     ItemsRestoreResult,
     ItemsRetypeRequest,
@@ -27,10 +29,12 @@ from backend.app.services.edit_service import (
     ItemsNotFoundError,
     OutOfTerritoryError,
     PlantingTypeGeometryMismatchError,
+    RespaceError,
     apply_item_patch,
     delete_item,
     delete_items,
     move_items,
+    respace_items,
     restore_items,
     retype_items,
     validate_items_scoped,
@@ -47,7 +51,7 @@ def _edit_errors() -> Iterator[None]:
     already user-facing Russian text, passed through as `detail`."""
     try:
         yield
-    except (PlantingTypeGeometryMismatchError, OutOfTerritoryError) as exc:
+    except (PlantingTypeGeometryMismatchError, OutOfTerritoryError, RespaceError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (ItemsNotFoundError, ItemsAlreadyExistError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -95,6 +99,15 @@ async def move_items_route(request: ItemsMoveRequest, plan: PlanDep) -> ItemsMov
             display_crs(plan.project),
         )
     return ItemsMoveResult(items=moved)
+
+
+@router.post("/items/respace", response_model=ItemsRespaceResult)
+async def respace_items_route(request: ItemsRespaceRequest, plan: PlanDep) -> ItemsRespaceResult:
+    """«Изменить интервал» у ряда: посадки ряда раскладываются заново с
+    `pitch_m` (см. edit_service.respace_items)."""
+    with _edit_errors():
+        previous, created = respace_items(plan, request.ids, request.pitch_m, display_crs(plan.project))
+    return ItemsRespaceResult(previous_items=previous, items=created, item_count=plan.item_count)
 
 
 @router.post("/items/restore", response_model=ItemsRestoreResult)

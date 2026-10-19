@@ -193,6 +193,7 @@ def greedy_select(
                 species=species_by_type.get(candidate.planting_type, "default"),
                 score=score,
                 rationale=rationale,
+                group_id=candidate.group,
             )
         )
 

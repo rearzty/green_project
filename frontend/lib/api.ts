@@ -450,6 +450,21 @@ export async function moveItems(projectId: string, planId: string, ids: string[]
   return result.items;
 }
 
+export interface ItemsRespaceResult {
+  /** Снимки прежних посадок ряда — для отмены (delete + restore). */
+  previous_items: GeoJSONFeature[];
+  /** Новые посадки ряда с другим шагом. */
+  items: GeoJSONFeature[];
+  item_count: number;
+}
+
+/** «Изменить интервал» у ряда: посадки выстраиваются в линию и раскладываются
+ * заново с шагом `pitchM` (метры). Сервер отказывает (400) для шага меньше нормы
+ * по классу кроны и для не-ряда — текст ошибки готов для уведомления. */
+export async function respaceItems(projectId: string, planId: string, ids: string[], pitchM: number): Promise<ItemsRespaceResult> {
+  return postJson(`/api/projects/${projectId}/plans/${planId}/items/respace`, { ids, pitch_m: pitchM });
+}
+
 /** Undo's counterpart to deletion -- recreates the exact items given (same
  * id, geometry, type, species, score, rationale). Returns only the plan's
  * fresh item count: the caller already has the exact features it just asked
@@ -562,6 +577,42 @@ export async function exportDxf(
     if (status.status === "done") return `${API_URL}/api/projects/${projectId}/plans/${planId}/export-dxf/${job_id}/download`;
     await new Promise((resolve) => setTimeout(resolve, EXPORT_POLL_INTERVAL_MS));
   }
+}
+
+// Слой «где нормы разрешают сажать» (backend/app/services/zones_service.py):
+// допустимая площадь и зоны, закрытые каждым ограничением, — растром.
+
+export interface ZoneGroup {
+  /** "allowed" — допустимая площадь; иначе тип ограничения (heat_network, building…). */
+  key: string;
+  kind: "allowed" | "blocker";
+  /** Уже с нормой: «Теплосеть 2 м». */
+  label: string;
+  color: string;
+  /** Доля участка (доли ограничений перекрываются, их сумма может быть больше 1). */
+  share: number;
+  required_m: number | null;
+  /** Площадь, закрытая только этим ограничением, м². */
+  exclusive_m2: number;
+}
+
+export interface PlanZones {
+  planting_type: PlantingType;
+  bounds: [[number, number], [number, number]];
+  territory_m2: number;
+  usable_m2: number;
+  usable_share: number;
+  interval_m: number;
+  groups: ZoneGroup[];
+  advice: { key: string; label: string; exclusive_m2: number; extra_items: number } | null;
+}
+
+export async function getPlanZones(projectId: string, planId: string, plantingType: PlantingType): Promise<PlanZones> {
+  return request(`/api/projects/${projectId}/plans/${planId}/zones?planting_type=${plantingType}`);
+}
+
+export function zoneImageUrl(projectId: string, planId: string, plantingType: PlantingType, group: string): string {
+  return `${API_URL}/api/projects/${projectId}/plans/${planId}/zones/image?planting_type=${plantingType}&group=${encodeURIComponent(group)}`;
 }
 
 export interface SpeciesSpacing {

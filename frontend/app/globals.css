@@ -143,6 +143,14 @@ html {
     0 0 0 4px #eceeea;
 }
 
+/* «Где можно сажать»: посадки плана — под цветными зонами приглушены, чтобы
+   зоны читались, но видно, что и где стоит. Только пан точек и SVG-газон плана;
+   подоснова (ImageOverlay — <img>) и выделение не трогаются. */
+.gp-plan-dim .leaflet-marker-pane,
+.gp-plan-dim .leaflet-overlay-pane svg {
+  opacity: 0.35;
+}
+
 /* Selection mode: the map stops panning under a left-drag, so the cursor says so. */
 .gp-select-mode,
 .gp-select-mode .leaflet-interactive {

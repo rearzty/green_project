@@ -38,6 +38,10 @@ def test_expected_routes_are_registered():
     assert "/api/projects/{project_id}/plans/{plan_id}/items/delete" in paths
     assert "/api/projects/{project_id}/plans/{plan_id}/items/retype" in paths
     assert "/api/projects/{project_id}/plans/{plan_id}/items/move" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/items/respace" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/export-summary" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/zones" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/zones/image" in paths
     assert "/api/projects/{project_id}/plans/{plan_id}/items/restore" in paths
     assert "/api/projects/{project_id}/plans/{plan_id}/validate" in paths
     assert "/api/projects/{project_id}/plans/{plan_id}/validate/items" in paths

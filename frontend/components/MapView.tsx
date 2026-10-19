@@ -398,6 +398,101 @@ function MapBridge({ onReady }: { onReady?: (map: L.Map | null) => void }) {
   return null;
 }
 
+/** Сравнение версий (п. 5): кольцо `gp-accent` у добавленных посадок и
+ * пунктирное оранжевое — на месте убранных. Рисуется на canvas в собственной
+ * панe над точками плана: диф бывает в тысячи отметок, а SVG-слой из тысяч
+ * кружков — ровно то, от чего карта уже уходила (кластеры, виртуализация). Не
+ * интерактивна: клики идут сквозь неё к самим посадкам. */
+export interface CompareMarks {
+  added: [number, number][];
+  removed: [number, number][];
+}
+
+/** Радиус кольца в пикселях: порядка метра на местности, но не крупнее 9 px и
+ * не мельче 3 — иначе при общем плане сотни колец в стрип улицы сливаются в
+ * сплошное пятно, а вблизи кольцо было бы меньше самой кроны. */
+function compareRingRadius(map: L.Map): number {
+  const y = map.getSize().y / 2;
+  const a = map.containerPointToLatLng([0, y]);
+  const b = map.containerPointToLatLng([100, y]);
+  const metersPerPixel = map.distance(a, b) / 100;
+  if (!isFinite(metersPerPixel) || metersPerPixel <= 0) return 9;
+  return Math.max(3, Math.min(9, 1.6 / metersPerPixel));
+}
+
+function CompareOverlay({ marks }: { marks: CompareMarks | null }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!marks) return;
+    const name = "compareOverlay";
+    if (!map.getPane(name)) {
+      const pane = map.createPane(name);
+      pane.style.zIndex = "615";
+      pane.style.pointerEvents = "none";
+    }
+    const renderer = L.canvas({ pane: name, padding: 0.3 });
+    const group = L.layerGroup();
+    const rings: L.CircleMarker[] = [];
+    const radius = compareRingRadius(map);
+    marks.added.forEach((at) => rings.push(L.circleMarker(at, { renderer, radius, color: "#B5E07A", weight: 2.5, fill: false, interactive: false }).addTo(group)));
+    marks.removed.forEach((at) => rings.push(L.circleMarker(at, { renderer, radius, color: "#FF9351", weight: 2, dashArray: "3 3", fill: false, interactive: false }).addTo(group)));
+    group.addTo(map);
+    // Масштаб карты сменился — кольца подгоняются под него (setRadius перерисовывает canvas).
+    const resize = () => {
+      const next = compareRingRadius(map);
+      rings.forEach((ring) => ring.setRadius(next));
+    };
+    map.on("zoomend", resize);
+    return () => {
+      map.off("zoomend", resize);
+      group.remove();
+      renderer.remove();
+    };
+  }, [map, marks]);
+  return null;
+}
+
+/** Приглушает точки и газон плана, пока открыт слой «где можно сажать», чтобы
+ * цветные зоны читались. Класс ставится на контейнер Leaflet руками, а не
+ * через `className` у `<MapContainer>`: react-leaflet читает его один раз при
+ * создании карты (useState), а перезапись атрибута из React стёрла бы и
+ * собственные классы Leaflet (leaflet-container, leaflet-grab…). */
+function PlanDim({ on }: { on: boolean }) {
+  const map = useMap();
+  useEffect(() => {
+    const container = map.getContainer();
+    container.classList.toggle("gp-plan-dim", on);
+    return () => container.classList.remove("gp-plan-dim");
+  }, [map, on]);
+  return null;
+}
+
+/** Слой «где можно сажать» (п. 3): по картинке на каждое включённое
+ * ограничение, все на одной рамке участка. Своя пане между газоном плана (400)
+ * и точками (600): цветные зоны лежат поверх подосновы, но точки плана остаются
+ * над ними. */
+export interface ZoneLayers {
+  bounds: [[number, number], [number, number]];
+  layers: { key: string; url: string }[];
+}
+
+function ZonesOverlay({ zones }: { zones: ZoneLayers | null }) {
+  const map = useMap();
+  if (zones && !map.getPane("zonesOverlay")) {
+    const pane = map.createPane("zonesOverlay");
+    pane.style.zIndex = "450";
+    pane.style.pointerEvents = "none";
+  }
+  if (!zones) return null;
+  return (
+    <>
+      {zones.layers.map((layer) => (
+        <ImageOverlay key={layer.url} url={layer.url} bounds={zones.bounds} pane="zonesOverlay" interactive={false} />
+      ))}
+    </>
+  );
+}
+
 /** Что показывает подсказка при наведении на посадку. */
 export interface HoverInfo {
   title: string;
@@ -1381,6 +1476,12 @@ export interface MapViewProps {
   focusRequest?: { id: string; seq: number } | null;
   /** Fit the view to a group's bounds (Юна's «выдели …»), see FitToRequest. */
   fitRequest?: MapFitRequest | null;
+  /** Сравнение версий: что добавлено и убрано (кольца поверх посадок). */
+  compareMarks?: CompareMarks | null;
+  /** Слой «где можно сажать»: цветные зоны поверх подосновы. */
+  zoneLayers?: ZoneLayers | null;
+  /** Посадки плана приглушены (opacity .35), чтобы зоны читались под ними. */
+  dimPlan?: boolean;
   /** Leaflet-карта наружу (кнопки зума и статус-строка вне контейнера). */
   onMapReady?: (map: L.Map | null) => void;
   /** Подсказка при наведении на посадку (п. 4): включена только на 2D при
@@ -1413,6 +1514,9 @@ export default function MapView({
   onViewChange,
   focusRequest,
   fitRequest,
+  compareMarks = null,
+  zoneLayers = null,
+  dimPlan = false,
   onMapReady,
   hoverEnabled = false,
   loadHoverInfo,
@@ -1588,6 +1692,8 @@ export default function MapView({
         visibleRasterGroups.map((group) => (
           <ImageOverlay key={`${layersKey ?? "layers"}:${group.key}`} url={group.url} bounds={extentBounds} />
         ))}
+      <PlanDim on={dimPlan} />
+        <ZonesOverlay zones={zoneLayers} />
       {areaFeatures && showPlan && (
         <GeoJSON
           key={`${planId ?? "plan"}:${planRevision}`}
@@ -1607,6 +1713,7 @@ export default function MapView({
           crsVerified={crsVerified}
         />
       )}
+      <CompareOverlay marks={compareMarks} />
       <SelectionController
         selectMode={selectMode}
         editsLocked={editsLocked}

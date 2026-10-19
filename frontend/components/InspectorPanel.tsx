@@ -22,6 +22,10 @@ export interface InspectedItem {
   score?: number;
   rationale?: string;
   is_manual_edit?: boolean;
+  /** Ряд / куртина / группа деревьев, к которым относится посадка (planner). */
+  group_id?: string | null;
+  /** row | group | solitaire | curtain | scatter — по приставке обоснования. */
+  scheme?: string;
 }
 
 /** Одна строка отступов: название, «**4,6** из 4 м» и полоса запаса. Полоса

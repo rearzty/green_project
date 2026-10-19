@@ -8,6 +8,8 @@ import {
   CheckCheck,
   Download,
   FileText,
+  HelpCircle,
+  ListChecks,
   Map as MapIcon,
   MousePointer2,
   PanelLeft,
@@ -24,18 +26,21 @@ import type { Map as LeafletMap } from "leaflet";
 import { AssistantChat } from "@/components/AssistantChat";
 import { CheckPanel } from "@/components/CheckPanel";
 import { CommandPalette } from "@/components/CommandPalette";
+import { CompareBar } from "@/components/CompareBar";
 import { ContextMenu, type ContextMenuEntry } from "@/components/ContextMenu";
 import { DraftPanel } from "@/components/DraftPanel";
 import { ExportDialog } from "@/components/ExportDialog";
 import { Header, type Stage } from "@/components/Header";
 import { InspectorPanel, type InspectedItem } from "@/components/InspectorPanel";
 import { MapToolbar } from "@/components/map/MapToolbar";
+import { SelectionBar } from "@/components/map/SelectionBar";
 import { StatusBar, type LegendItem } from "@/components/map/StatusBar";
 import { ViewControls } from "@/components/map/ViewControls";
 import { ZoomControls } from "@/components/map/ZoomControls";
 import type { HoverInfo, MapFitRequest } from "@/components/MapView";
 import { PlanPanel } from "@/components/PlanPanel";
 import { Toaster } from "@/components/Toaster";
+import { ZonesPanel } from "@/components/ZonesPanel";
 import {
   fetchComplianceReport,
   getItemsCompliance,
@@ -70,15 +75,18 @@ import {
   type UiAction,
 } from "@/lib/assistantCommands";
 import { countLabel, CROWN_LABELS, OBJECT_FORMS, PLANTING_TYPE_LABELS } from "@/lib/format";
+import { useCompareVersions } from "@/lib/hooks/useCompareVersions";
 import { useKeyboardShortcuts } from "@/lib/hooks/useKeyboardShortcuts";
 import { usePlanEdits } from "@/lib/hooks/usePlanEdits";
 import { useProjectSession } from "@/lib/hooks/useProjectSession";
 import { useSelection } from "@/lib/hooks/useSelection";
+import { useZonesLayer } from "@/lib/hooks/useZonesLayer";
 import type { Season } from "@/lib/mapStyle";
 import { boundsOfItems } from "@/lib/planIndex";
 import { recipeForPlan } from "@/lib/planRecipes";
 import { computePlanStats } from "@/lib/planStats";
 import type { Command } from "@/lib/commands";
+import { similarOptions, type SimilarOption } from "@/lib/similar";
 import { errorMessage, toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
@@ -91,6 +99,7 @@ const ThreeDView = dynamic(() => import("@/components/ThreeDView"), { ssr: false
 const NO_PLAN = "Плана ещё нет — сначала сгенерируйте его.";
 const NOTHING_SELECTED = "Ничего не выделено — выделите посадки на карте или попросите, например, «выдели все деревья».";
 const EDIT_BUSY = "Ещё сохраняется предыдущая правка — попробуйте через пару секунд.";
+const COMPARING = "Открыто сравнение версий — правки и генерация сейчас выключены. Закройте сравнение (Esc) и повторите просьбу.";
 const OTHER_OPERATION = "Сейчас идёт другая операция — попробуйте через пару секунд.";
 const UNKNOWN_COMMAND = "Эту команду я пока не умею выполнять.";
 const SELECTION_CHANGED = "Выделение изменилось, пока Юна отвечала, — правка не выполнена. Повторите просьбу.";
@@ -191,6 +200,9 @@ export default function Home() {
   }, [plan]);
 
   function handleStageChange(next: Stage) {
+    // Слой ограничений живёт на вкладке «Проверка»; уйдя с неё, забывать его
+    // на карте незачем, но и держать там без панели, которая им управляет, нельзя.
+    if (next !== "check") zones.close();
     setStage(next);
     // Вкладку выбрали — панель должна быть видна (свёрнутая на десктопе,
     // закрытая шторка на телефоне).
@@ -222,6 +234,13 @@ export default function Home() {
     setAssistantUnread(false);
     setAskRequest((prev) => ({ text, seq: (prev?.seq ?? 0) + 1 }));
   }
+
+  // Название выделения, полученного из «Выделить похожие» («Ряд», «Той же
+  // породы · …»). Привязано к САМОМУ множеству выделения (его ссылка меняется
+  // при любом новом выделении), а не к числу объектов: иначе после клика на
+  // другую группу такого же размера показалось бы чужое имя.
+  const pendingSelectionName = useRef<{ name: string; key: SimilarOption["key"] } | null>(null);
+  const [namedSelection, setNamedSelection] = useState<{ set: ReadonlySet<string>; name: string; key: SimilarOption["key"] } | null>(null);
 
   // Leaflet-карта наружу (MapView.tsx::MapBridge): ей пользуются зум и
   // статус-строка вне контейнера карты. В 3D — null.
@@ -265,6 +284,20 @@ export default function Home() {
     selection.setSelection(ids)
   );
   const selection = useSelection(planIndex, planRevision, editing.violationIds);
+
+  // Сравнение версий и слой «Где можно сажать» — режимы просмотра поверх
+  // того же плана: в обоих план только читают, а слева вместо обычной панели
+  // своя. Состояние каждого — в своём хуке (lib/hooks).
+  const geographicCrs = Boolean(project?.crs_verified && project?.source_crs);
+  const compare = useCompareVersions({
+    projectId: project?.id,
+    plan,
+    plans,
+    geographic: geographicCrs,
+    currentViolations: editing.violations ? editing.violationIds.size : null,
+    onSelectPlan: session.handleSelectPlan,
+  });
+  const zones = useZonesLayer(project?.id, plan);
 
   // Обоснование ("Почему здесь?", InspectorPanel.tsx) -- только для ровно одной
   // выделенной точки: geo_engine.compliance.explain_items не зависит от
@@ -333,7 +366,7 @@ export default function Home() {
       setView3d(false);
       return;
     }
-    if (!plan) return;
+    if (!plan || compare.active) return;
     setView3d(true);
   }
 
@@ -355,7 +388,7 @@ export default function Home() {
       setContextMenu(null);
       return;
     }
-    if (!plan) return;
+    if (!plan || compare.active) return;
     if (!showPlan) {
       toast.info("Включите отображение плана, чтобы выделять объекты.");
       return;
@@ -371,16 +404,37 @@ export default function Home() {
 
   function handleEscape() {
     if (contextMenu) setContextMenu(null);
+    else if (compare.active) compare.exit();
     else if (selection.selectedIds.size > 0) selection.clear();
     else if (selection.selectMode) selection.setSelectMode(false);
+  }
+
+  /** «Сравнить версии»: только чтение, поэтому выделение, рамка, меню и 3D сбрасываются. */
+  function startCompare() {
+    if (!plan || plans.length < 2) {
+      toast.info("Для сравнения нужно хотя бы две версии плана.");
+      return;
+    }
+    selection.clear();
+    selection.setSelectMode(false);
+    setContextMenu(null);
+    setView3d(false);
+    setShowPlan(true);
+    zones.close();
+    compare.start();
   }
 
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
   const handleContextMenu = useCallback((x: number, y: number) => setContextMenu({ x, y }), []);
 
   useKeyboardShortcuts({
-    undo: () => editing.undo(),
-    redo: editing.redo,
+    // При сравнении версий план только читают: правки и отмена молчат.
+    undo: () => {
+      if (!compare.active) editing.undo();
+    },
+    redo: () => {
+      if (!compare.active) editing.redo();
+    },
     deleteSelection: () => editing.handleDeleteSelection(selection.selectedIds),
     retype: (type) => editing.handleRetypeSelection(selection.selectedIds, planIndex, type),
     toggleSelectMode,
@@ -389,12 +443,35 @@ export default function Home() {
     escape: handleEscape,
     openPalette: () => setPaletteOpen((open) => !open),
     nextViolation: goToNextViolation,
-    hasPlan: plan !== null,
-    hasSelection: selection.selectedIds.size > 0,
+    hasPlan: plan !== null && !compare.active,
+    hasSelection: selection.selectedIds.size > 0 && !compare.active,
     suspended: exportOpen || paletteOpen,
   });
 
   const hasSelection = selection.selectedIds.size > 0;
+
+  // «Выделить похожие» на одну посадку — считаем только когда это нужно (меню
+  // или палитра открыты): один проход по всему плану, на сотнях тысяч посадок
+  // это десятки миллисекунд, и делать его на каждый рендер незачем.
+  const similarNeeded = (contextMenu !== null || paletteOpen) && singleSelectedId !== undefined;
+  const similar = useMemo<SimilarOption[]>(
+    () => (similarNeeded && plan && singleSelectedId ? similarOptions(plan.features.features, singleSelectedId, editing.violationIds) : []),
+    // planRevision: plan.features правится на месте при локальной правке
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [similarNeeded, plan, planRevision, singleSelectedId, editing.violationIds]
+  );
+
+  function selectSimilar(option: SimilarOption) {
+    pendingSelectionName.current = { name: option.name, key: option.key };
+    showOnMap(option.ids);
+  }
+  // Новое выделение уже в состоянии — привязываем к нему название.
+  useEffect(() => {
+    if (pendingSelectionName.current === null) return;
+    const pending = pendingSelectionName.current;
+    pendingSelectionName.current = null;
+    setNamedSelection({ set: selection.selectedIds, name: pending.name, key: pending.key });
+  }, [selection.selectedIds]);
 
   const planStats = useMemo(
     // Градусы — только если карта и правда в WGS84: та же проверка, что
@@ -478,7 +555,7 @@ export default function Home() {
     tree_rows: treeRows,
     trees_in_paving: treesInPaving,
   };
-  const runtime = { session, editing, selection, planStats, view3d, settings: generationSettings };
+  const runtime = { session, editing, selection, planStats, view3d, settings: generationSettings, comparing: compare.active };
   const runtimeRef = useRef(runtime);
   runtimeRef.current = runtime;
 
@@ -574,8 +651,9 @@ export default function Home() {
    * показывают то, что поставила Юна. Отмена — обратно к плану, который был
    * на экране до команды, и к прежним полям панели. */
   async function applySettingsByAssistant(action: AssistantAction): Promise<CommandResult> {
-    const { session: current, editing: edits, settings: prev } = runtimeRef.current;
+    const { session: current, editing: edits, settings: prev, comparing } = runtimeRef.current;
     if (!current.project) return { ok: false, text: "Сначала загрузите чертёж — план строить не на чем." };
+    if (comparing) return { ok: false, text: COMPARING };
     if (current.generating) return { ok: false, text: "Уже идёт генерация — дождитесь её." };
     if (edits.editBusy) return { ok: false, text: EDIT_BUSY };
     const next = settingsFromAction(action, prev);
@@ -650,9 +728,10 @@ export default function Home() {
   }
 
   async function deleteByAssistant(ids: ReadonlySet<string>): Promise<CommandResult> {
-    const { session: current, editing: edits } = runtimeRef.current;
+    const { session: current, editing: edits, comparing } = runtimeRef.current;
     const index = current.planIndex;
     if (!current.plan || !index) return { ok: false, text: NO_PLAN };
+    if (comparing) return { ok: false, text: COMPARING };
     const targets = [...ids].filter((id) => index.has(id));
     if (targets.length === 0) return { ok: false, text: NOTHING_SELECTED };
     if (edits.editBusy) return { ok: false, text: EDIT_BUSY };
@@ -669,9 +748,10 @@ export default function Home() {
   }
 
   async function retypeByAssistant(ids: ReadonlySet<string>, type: "tree" | "shrub"): Promise<CommandResult> {
-    const { session: current, editing: edits } = runtimeRef.current;
+    const { session: current, editing: edits, comparing } = runtimeRef.current;
     const index = current.planIndex;
     if (!current.plan || !index) return { ok: false, text: NO_PLAN };
+    if (comparing) return { ok: false, text: COMPARING };
     const targets = [...ids].filter((id) => index.has(id));
     if (targets.length === 0) return { ok: false, text: NOTHING_SELECTED };
     const noun = type === "tree" ? "деревья" : "кусты";
@@ -860,6 +940,15 @@ export default function Home() {
     : undefined;
 
   const contextMenuEntries: ContextMenuEntry[] = [
+    ...(singleSelectedId
+      ? [
+          {
+            label: "Почему здесь?",
+            icon: HelpCircle,
+            onSelect: () => askYuna("Почему эта посадка здесь?"),
+          },
+        ]
+      : []),
     {
       label: "Сделать деревом",
       hotkey: "1",
@@ -874,6 +963,20 @@ export default function Home() {
       disabled: !hasSelection || editing.editBusy,
       onSelect: () => editing.handleRetypeSelection(selection.selectedIds, planIndex, "shrub"),
     },
+    ...(similar.length > 0
+      ? [
+          {
+            label: "Выделить похожие",
+            icon: ListChecks,
+            // Число справа — сколько будет выделено, вместе с этой посадкой.
+            submenu: similar.map((option) => ({
+              label: option.label,
+              hotkey: option.ids.length.toLocaleString("ru-RU"),
+              onSelect: () => selectSimilar(option),
+            })),
+          },
+        ]
+      : []),
     {
       label: "Удалить",
       hotkey: "Del",
@@ -897,7 +1000,7 @@ export default function Home() {
     },
   ];
 
-  const canEditPlan = plan !== null && !editing.editBusy;
+  const canEditPlan = plan !== null && !editing.editBusy && !compare.active;
   const violationPlants = editing.violations ? editing.violationIds.size : null;
 
   // --- экспорт: диалог «Перед экспортом» ---
@@ -1023,6 +1126,22 @@ export default function Home() {
       icon: FileText,
       run: () => downloadComplianceReport("csv").catch((e) => toast.error(errorMessage(e))),
     });
+    add(has && !compare.active && plans.length > 1 && {
+      id: "compare-versions",
+      title: "Сравнить версии плана",
+      keywords: ["версии", "разница", "изменения", "сравнение", "было", "стало"],
+      run: startCompare,
+    });
+    add(compare.active && { id: "compare-exit", title: "Выйти из сравнения версий", keywords: ["версии"], meta: "Esc", run: compare.exit });
+    add(has && !compare.active && zones.types.length > 0 && {
+      id: "zones",
+      title: "Где нормы разрешают сажать",
+      keywords: ["зоны", "ограничения", "отступы", "почему мало", "слой"],
+      run: () => {
+        handleStageChange("check");
+        zones.open();
+      },
+    });
     add(has && {
       id: "toggle-3d",
       title: view3d ? "Вернуться на 2D-карту" : "Показать в 3D",
@@ -1030,7 +1149,7 @@ export default function Home() {
       icon: view3d ? MapIcon : Box,
       run: toggleView3d,
     });
-    add(Boolean(project) && !session.generating && {
+    add(Boolean(project) && !session.generating && !compare.active && {
       id: "generate",
       title: plan ? "Сгенерировать новую версию плана" : "Сгенерировать план",
       keywords: ["построить", "посадить", "пересчитать", "генерация"],
@@ -1062,6 +1181,16 @@ export default function Home() {
       icon: Shrub,
       run: () => editing.handleRetypeSelection(selection.selectedIds, planIndex, "shrub"),
     });
+    similar.forEach((option) =>
+      add({
+        id: `similar-${option.key}`,
+        title: `Выделить похожие: ${option.label.toLowerCase()}`,
+        keywords: ["выделить", "похожие", "ряд", "порода", "крона"],
+        meta: option.ids.length.toLocaleString("ru-RU"),
+        icon: ListChecks,
+        run: () => selectSimilar(option),
+      })
+    );
     add(has && { id: "select-all", title: "Выделить всё", meta: "Ctrl+A", icon: CheckCheck, run: selection.selectAll });
     add(hasSelection && { id: "clear-selection", title: "Снять выделение", meta: "Esc", icon: X, run: selection.clear });
     add(has && !view3d && {
@@ -1093,11 +1222,26 @@ export default function Home() {
     selection: assistantSelection,
   });
   // Правая колонка: Юна, если открыта, иначе — инспектор выделения (только 2D).
-  const showInspector = !view3d && selection.summary !== null && !assistantOpen;
+  // Группа получает не колонку, а панель действий у карты (SelectionBar).
+  const showInspector = !view3d && !compare.active && selection.summary?.single !== undefined && !assistantOpen;
+  const showSelectionBar = !view3d && !compare.active && selection.summary !== null && selection.summary.single === undefined;
+
+  // Пока сравнивают версии, левая панель скрыта (полоса сравнения занимает её место);
+  // sidebarOpen при этом не трогаем — после выхода панель вернётся как была.
+  const panelOpen = sidebarOpen && !compare.active;
+  // Слой ограничений показываем, только пока открыта его панель (вкладка «Проверка»).
+  const zonesShown = zones.active && stage === "check";
 
   // Легенда статус-строки — только то, что реально есть на экране (спека §3.3).
   const legend: LegendItem[] = [];
-  if (planStats && showPlan) {
+  if (compare.active) {
+    // Сравнение: на карте не виды посадок, а что изменилось между версиями.
+    if (compare.marks) {
+      legend.push({ key: "cmp-added", label: `Добавлено · ${compare.marks.added.length.toLocaleString("ru-RU")}`, swatch: "added" });
+      legend.push({ key: "cmp-removed", label: `Убрано · ${compare.marks.removed.length.toLocaleString("ru-RU")}`, swatch: "removed" });
+      legend.push({ key: "cmp-same", label: `Без изменений · ${compare.unchanged.toLocaleString("ru-RU")}`, swatch: "same" });
+    }
+  } else if (planStats && showPlan) {
     if (planStats.trees > 0) legend.push({ key: "tree", label: "Дерево", swatch: "tree" });
     if (planStats.shrubs > 0) legend.push({ key: "shrub", label: "Кустарник", swatch: "shrub" });
     if (planStats.lawnAreaM2 > 0) legend.push({ key: "lawn", label: "Газон", swatch: "lawn" });
@@ -1129,6 +1273,22 @@ export default function Home() {
         onNewProject={session.handleClearAll}
       />
 
+      {compare.active && plan && compare.baseId && (
+        <CompareBar
+          plans={plans}
+          baseId={compare.baseId}
+          currentId={plan.plan_id}
+          loading={compare.loading}
+          base={compare.baseStats}
+          current={compare.currentStats}
+          busy={compare.busy || session.generating}
+          onBaseChange={(id) => void compare.changeBase(id)}
+          onCurrentChange={(id) => void compare.changeCurrent(id)}
+          onRevert={() => void compare.revert()}
+          onKeep={compare.exit}
+        />
+      )}
+
       <div className="flex min-h-0 flex-1">
         <div
           className={cn(
@@ -1138,7 +1298,7 @@ export default function Home() {
             // шторка 1060), но ниже уведомлений (1150), чтобы ошибка из панели
             // была видна. Десктоп: колонка в потоке, сворачивается до нуля.
             "fixed bottom-0 left-0 top-12 z-[1120] md:static md:z-auto",
-            sidebarOpen ? "w-[88vw] max-w-[340px] translate-x-0 md:w-[340px]" : "-translate-x-full md:w-0 md:translate-x-0"
+            panelOpen ? "w-[88vw] max-w-[340px] translate-x-0 md:w-[340px]" : "-translate-x-full md:w-0 md:translate-x-0"
           )}
         >
           <aside aria-label="Панель этапа" className="flex h-full w-[88vw] max-w-[340px] flex-col border-r border-gp-line bg-gp-panel md:w-[340px] md:max-w-none">
@@ -1184,7 +1344,23 @@ export default function Home() {
                 onTreesInPavingChange={setTreesInPaving}
               />
             </div>
-            {stage === "check" && (
+            {zonesShown && (
+              <div className="min-h-0 flex-1">
+                <ZonesPanel
+                  zones={zones.zones}
+                  loading={zones.loading}
+                  error={zones.error}
+                  plantingType={zones.plantingType}
+                  types={zones.types}
+                  onTypeChange={zones.setPlantingType}
+                  visible={zones.visible}
+                  onToggle={zones.toggle}
+                  onSolo={zones.solo}
+                  onBack={zones.close}
+                />
+              </div>
+            )}
+            {stage === "check" && !zonesShown && (
               <div className="min-h-0 flex-1">
                 <CheckPanel
                   projectId={project?.id}
@@ -1197,6 +1373,8 @@ export default function Home() {
                   typeOf={(id) => planIndex?.get(id)?.type}
                   stats={planStats}
                   areaBudget={plan?.area_budget}
+                  onOpenZones={() => zones.open()}
+                  onCompareVersions={startCompare}
                   showPlan={showPlan}
                   selectedItemId={singleSelectedId}
                   editBusy={editing.editBusy}
@@ -1215,7 +1393,7 @@ export default function Home() {
             )}
           </aside>
         </div>
-        {sidebarOpen && <div className="fixed inset-0 z-[1110] bg-black/40 md:hidden" onClick={() => setSidebarOpen(false)} aria-hidden />}
+        {panelOpen && <div className="fixed inset-0 z-[1110] bg-black/40 md:hidden" onClick={() => setSidebarOpen(false)} aria-hidden />}
 
         <main className="flex min-w-0 flex-1 flex-col bg-gp-map">
           <div className="relative min-h-0 flex-1 overflow-hidden">
@@ -1241,7 +1419,10 @@ export default function Home() {
                 selectMode={selection.selectMode}
                 selectedIds={selection.selectedIds}
                 violationIds={editing.violationIds}
-                editsLocked={editing.editBusy}
+                editsLocked={editing.editBusy || compare.active}
+                compareMarks={compare.marks}
+                zoneLayers={zonesShown ? zones.layers : null}
+                dimPlan={zonesShown}
                 onSelectionChange={selection.setSelection}
                 onMoveItems={editing.handleMoveItems}
                 onContextMenu={handleContextMenu}
@@ -1258,7 +1439,7 @@ export default function Home() {
                 data-map-overlay (MapView.tsx::freeMapRects не кладёт под него
                 рамку «выдели …»). */}
             <MapToolbar
-              panelOpen={sidebarOpen}
+              panelOpen={panelOpen}
               onTogglePanel={() => setSidebarOpen((v) => !v)}
               showTools={!view3d && plan !== null}
               selectMode={selection.selectMode}
@@ -1273,7 +1454,7 @@ export default function Home() {
             />
             <ViewControls
               view3d={view3d}
-              canShow3d={plan !== null}
+              canShow3d={plan !== null && !compare.active}
               onSetView3d={(on) => {
                 if (on !== view3d) toggleView3d();
               }}
@@ -1287,6 +1468,27 @@ export default function Home() {
               onSeasonChange={setSeason}
             />
             {!view3d && <ZoomControls map={leafletMap} />}
+            {showSelectionBar && selection.summary && (
+              <SelectionBar
+                summary={selection.summary}
+                name={namedSelection?.set === selection.selectedIds ? namedSelection.name : undefined}
+                onChangeInterval={
+                  // Шаг меняют у ряда, а не у любого выделения: именно ряд — линия с равными промежутками.
+                  namedSelection?.set === selection.selectedIds && namedSelection.key === "row"
+                    ? (pitchM) => {
+                        const label = namedSelection;
+                        editing.handleRespaceRow([...selection.selectedIds], pitchM, () => {
+                          pendingSelectionName.current = { name: label.name, key: label.key };
+                        });
+                      }
+                    : undefined
+                }
+                canEdit={canEditPlan}
+                onRetype={(type) => editing.handleRetypeSelection(selection.selectedIds, planIndex, type)}
+                onDelete={() => editing.handleDeleteSelection(selection.selectedIds)}
+                onClear={selection.clear}
+              />
+            )}
           </div>
           <StatusBar
             map={view3d ? null : leafletMap}

@@ -5,10 +5,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   deleteItems,
   moveItems,
+  respaceItems,
   restoreItems,
   retypeItems,
   validateItems,
   validatePlan,
+  type GeoJSONFeature,
   type LngLat,
   type PlanOut,
   type PlantingType,
@@ -208,6 +210,37 @@ export function usePlanEdits(
     });
   }
 
+  /** «Изменить интервал» у выделенного ряда. `onApplied` — до того, как
+   * выделение переключится на новые посадки (страница вешает на него название
+   * выделения: у нового множества ссылка другая). */
+  function handleRespaceRow(ids: string[], pitchM: number, onApplied?: () => void) {
+    if (ids.length < 2) return;
+    void runEdit(async ({ projectId, planId: forPlanId }) => {
+      const result = await respaceItems(projectId, forPlanId, ids, pitchM);
+      swapItems(result.previous_items, result.items);
+      patchPlanItemCount(forPlanId, result.item_count);
+      recordEdit(forPlanId, { type: "respace_items", previous: result.previous_items, created: result.items });
+      const createdIds = result.items.map((f) => String(f.properties.id));
+      await revalidateTouched(projectId, forPlanId, createdIds);
+      onApplied?.();
+      setSelection(createdIds);
+      toast.success(`Ряд перерасставлен: ${countLabel(result.previous_items.length, OBJECT_FORMS)} → ${countLabel(createdIds.length, OBJECT_FORMS)}, шаг ${pitchM.toLocaleString("ru-RU")} м.`, {
+        label: "Отменить",
+        onClick: () => stepHistoryRef.current("undo"),
+      });
+    });
+  }
+
+  /** Прежние посадки уходят, на их место встают новые — локально, без
+   * перечитывания плана; нарушения у ушедших снимаются сразу. */
+  function swapItems(gone: GeoJSONFeature[], arrived: GeoJSONFeature[]) {
+    const goneIds = gone.map((f) => String(f.properties.id));
+    applyLocalEdit({ kind: "delete", ids: goneIds });
+    applyLocalEdit({ kind: "restore", items: arrived });
+    const idSet = new Set(goneIds);
+    setViolations((prev) => (prev ? prev.filter((v) => !idSet.has(v.item_id)) : prev));
+  }
+
   function handleDeleteSelection(selectedIds: ReadonlySet<string>) {
     const ids = [...selectedIds];
     if (ids.length === 0) return;
@@ -242,6 +275,17 @@ export function usePlanEdits(
         await retypeItems(projectId, forPlanId, changes);
         applyLocalEdit({ kind: "retype", changes: changes.map((c) => ({ id: c.id, type: c.planting_type })) });
         await revalidateTouched(projectId, forPlanId, changes.map((c) => c.id));
+        break;
+      }
+      case "respace_items": {
+        const [gone, arrived] = direction === "undo" ? [entry.created, entry.previous] : [entry.previous, entry.created];
+        const goneIds = gone.map((f) => String(f.properties.id));
+        // Сначала убрать, потом вернуть: restore отказывает, если id уже есть.
+        await deleteItems(projectId, forPlanId, goneIds);
+        const result = await restoreItems(projectId, forPlanId, arrived);
+        swapItems(gone, arrived);
+        patchPlanItemCount(forPlanId, result.item_count);
+        await revalidateTouched(projectId, forPlanId, arrived.map((f) => String(f.properties.id)));
         break;
       }
       case "delete_items": {
@@ -285,7 +329,7 @@ export function usePlanEdits(
         direction === "undo" ? { undo: h.undo, redo: pushCapped(h.redo, entry) } : { undo: pushCapped(h.undo, entry), redo: h.redo }
       );
       const itemsGone = entry.type === "delete_items" && direction === "redo";
-      setSelection(itemsGone ? [] : entryItemIds(entry));
+      setSelection(itemsGone ? [] : entryItemIds(entry, direction));
     });
   }
   stepHistoryRef.current = stepHistory;
@@ -299,6 +343,7 @@ export function usePlanEdits(
     canUndo,
     canRedo,
     handleMoveItems,
+    handleRespaceRow,
     handleRetypeSelection,
     handleDeleteSelection,
     undo: (expected?: UndoEntry) => stepHistory("undo", expected),

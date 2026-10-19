@@ -14,7 +14,7 @@ import numpy as np
 import shapely
 from shapely import STRtree
 from shapely.affinity import translate
-from shapely.geometry import Point, shape
+from shapely.geometry import LineString, Point, shape
 from shapely.geometry.base import BaseGeometry
 
 from backend.app.db.models import Plan, PlantingItemRow, Project
@@ -50,6 +50,12 @@ class ItemsNotFoundError(LookupError):
     """Some ids in a batch edit no longer exist in the plan -- typically a
     stale selection or undo entry after the plan changed underneath it.
     Raised before anything is mutated, so a batch is all-or-nothing."""
+
+
+class RespaceError(ValueError):
+    """Ряд нельзя перерасставить с таким шагом: не ряд (одна посадка, площадной
+    объект, смесь типов), шаг меньше нормы по классу кроны или в ряд не
+    помещается ни одной посадки. Сообщение — готовый русский текст."""
 
 
 class ItemsAlreadyExistError(LookupError):
@@ -167,6 +173,123 @@ def delete_items(plan: Plan, ids: list[str], source_crs: str | None) -> list[dic
     return snapshots
 
 
+# Больше этого в одном ряду не бывает (самый длинный ряд реальной улицы — сотни
+# посадок): жадный обход соседей квадратичен, и «ряд» из десятков тысяч точек —
+# это выделенный весь план, а не ряд.
+_MAX_RESPACE_ITEMS = 5_000
+# Кольцо ориентира (граница участка) замкнуто: зазор между концами цепочки не
+# больше полутора обычных шагов — иначе это обычный ряд с концами.
+_RING_GAP_FACTOR = 1.5
+
+
+def _chain_order(points: list[Point]) -> list[Point]:
+    """Посадки ряда в порядке обхода: от крайней к соседней, жадно. Ряд — это
+    линия с почти равными промежутками, поэтому ближайший непосещённый сосед и
+    есть следующая точка ряда."""
+    xs = np.array([p.x for p in points])
+    ys = np.array([p.y for p in points])
+    start = int(np.argmax((xs - xs.mean()) ** 2 + (ys - ys.mean()) ** 2))  # дальняя от центра — конец ряда
+    order = [start]
+    remaining = set(range(len(points))) - {start}
+    while remaining:
+        last = order[-1]
+        nxt = min(remaining, key=lambda i: (xs[i] - xs[last]) ** 2 + (ys[i] - ys[last]) ** 2)
+        order.append(nxt)
+        remaining.remove(nxt)
+    return [points[i] for i in order]
+
+
+def respace_items(plan: Plan, ids: list[str], pitch_m: float, source_crs: str | None) -> tuple[list[dict], list[dict]]:
+    """Ряд перерасставляется с другим шагом — «Изменить интервал» на панели
+    выделения. Точки одного ряда выстраиваются в линию обходом соседей и
+    заново раскладываются по ней с шагом `pitch_m`; первая и последняя остаются
+    краями ряда (ряд остаётся на той же улице), остаток длины делится поровну по
+    концам. У замкнутого кольца шаг подгоняется так, чтобы он делил длину
+    целиком и был не меньше заданного — тот же приём, что у ряда на этапе
+    генерации (patterns.points_along), иначе на стыке образовалась бы щель или
+    нарушение интервала.
+
+    Для деревьев шаг не может быть меньше нормы по классу кроны — её проверяет
+    и отчёт (МГСН 1.02-02 п. 4.2.9.2), и отказ здесь честнее, чем подсвеченное
+    красным нарушение сразу после «Применить». Кусту интервал в ряду норма не
+    задаёт (743-ПП табл. 3.6.2 — расстояние внутри посадки, не минимум).
+
+    Прежние посадки заменяются новыми (новые id, порода/оценка/обоснование —
+    от ближайшей прежней, `group_id` сохраняется, `is_manual_edit=True`).
+    Возвращает (снимки прежних, снимки новых) — отмена удаляет новые и
+    возвращает прежние теми же эндпоинтами, что и остальные правки. Точки
+    нового ряда вне участка отбрасываются, как и всякая правка не выходит за его
+    границу; не осталось ни одной — отказ.
+    """
+    rows = _items_by_ids(plan, ids)
+    if len(rows) < 2:
+        raise RespaceError("В ряду должно быть не меньше двух посадок — выделите ряд целиком.")
+    if len(rows) > _MAX_RESPACE_ITEMS:
+        raise RespaceError("Слишком много посадок для одного ряда — выделите ряд, а не весь план.")
+    types = {row.planting_type for row in rows}
+    if types - _POINT_PLANTING_TYPES or len(types) != 1:
+        raise RespaceError("Интервал меняется у ряда деревьев или кустарника, а не у газона и не у смеси типов.")
+    (planting_type,) = types
+
+    if planting_type in SPACING_CHECKED_TYPES:
+        catalogue = load_catalogue()
+        required = max((_crown_interval(catalogue, row.species) or 0.0 for row in rows), default=0.0)
+        if pitch_m < required - 1e-6:
+            shown = f"{required:g}".replace(".", ",")
+            raise RespaceError(f"Деревья этого ряда нельзя ставить чаще, чем через {shown} м: таков интервал по классу кроны (МГСН 1.02-02 п. 4.2.9.2).")
+
+    old_points = [db_to_shape(row.geometry) for row in rows]
+    ordered = _chain_order(old_points)
+    steps = [a.distance(b) for a, b in zip(ordered, ordered[1:])]
+    typical = float(np.median(steps)) if steps else pitch_m
+    ring = len(ordered) >= 3 and ordered[0].distance(ordered[-1]) <= typical * _RING_GAP_FACTOR
+    path = [(p.x, p.y) for p in ordered] + ([(ordered[0].x, ordered[0].y)] if ring else [])
+    line = LineString(path)
+    if ring:
+        count = int(line.length // pitch_m)
+        step = line.length / count if count else pitch_m
+        distances = [i * step for i in range(count)]
+    else:
+        count = int(line.length // pitch_m) + 1
+        lead = (line.length - (count - 1) * pitch_m) / 2
+        distances = [lead + i * pitch_m for i in range(count)]
+    if len(distances) < 2:
+        raise RespaceError("Ряд короче этого шага — в него не помещается и двух посадок.")
+    new_points = [line.interpolate(d) for d in distances]
+
+    def _inside(territory: BaseGeometry) -> np.ndarray:
+        return np.asarray(shapely.within(np.array(new_points, dtype=object), territory.buffer(_TERRITORY_TOLERANCE_M)))
+
+    inside = exclusion_cache.with_territory(plan.project, _inside)
+    kept = [p for p, ok in zip(new_points, inside) if ok]
+    if not kept:
+        raise OutOfTerritoryError("Нельзя разместить посадку за границей участка: с таким шагом ни одна точка ряда не остаётся внутри.")
+
+    tree = STRtree(old_points)
+    nearest = tree.nearest(kept)
+    created = [
+        PlantingItemRow(
+            plan_id=plan.id,
+            geometry=shape_to_db(point),
+            planting_type=planting_type,
+            species=rows[int(index)].species,
+            score=rows[int(index)].score,
+            rationale=rows[int(index)].rationale,
+            group_id=rows[int(index)].group_id,
+            is_manual_edit=True,
+            plan=plan,
+        )
+        for point, index in zip(kept, nearest)
+    ]
+
+    previous = planting_items_to_geojson_dicts(rows, source_crs)
+    removed = {row.id for row in rows}
+    plan.items = [item for item in plan.items if item.id not in removed] + created
+    plan.item_count += len(created) - len(rows)
+    plan.has_manual_edits = True
+    return previous, planting_items_to_geojson_dicts(created, source_crs)
+
+
 def retype_items(plan: Plan, changes: list[tuple[str, str]], source_crs: str | None) -> tuple[list[dict], list[str]]:
     """Batch planting_type change, one target type per item -- so the same
     call serves the selection tool ("make all of these trees") and an undo
@@ -271,6 +394,8 @@ def restore_items(plan: Plan, features: list[dict], source_crs: str | None) -> N
             rationale=feature["properties"].get("rationale", ""),
             # Undo puts the item back exactly as it was -- a generated item stays "generated".
             is_manual_edit=bool(feature["properties"].get("is_manual_edit", False)),
+            # Вернувшаяся посадка остаётся в своём ряду.
+            group_id=feature["properties"].get("group_id"),
             plan=plan,
         )
         for feature, geometry in zip(features, geometries)

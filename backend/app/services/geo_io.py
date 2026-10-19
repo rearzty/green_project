@@ -126,6 +126,30 @@ def layers_to_feature_collection(layers: list[Layer], source_crs: str | None = N
     return GeoJSONFeatureCollection(features=[layer_to_geojson_feature(l, source_crs) for l in layers])
 
 
+def _scheme_of(item: PlantingItemRow) -> str:
+    """Схема, по которой поставлена посадка, — по тем же приставкам обоснования,
+    что считает сводка плана (planStats.ts, assistant_context.py): ряд, группа
+    деревьев, солитер, куртина кустарника или россыпь. Приставка «в покрытии»
+    ставится ПЕРЕД схемой, поэтому ищем вхождение, а не начало строки."""
+    from geo_engine.planner import (
+        GROUP_RATIONALE_PREFIX,
+        ROW_RATIONALE_PREFIX,
+        SOLITAIRE_RATIONALE_PREFIX,
+        TREE_GROUP_RATIONALE_PREFIX,
+    )
+
+    rationale = item.rationale or ""
+    if ROW_RATIONALE_PREFIX in rationale:
+        return "row"
+    if TREE_GROUP_RATIONALE_PREFIX in rationale:
+        return "group"
+    if SOLITAIRE_RATIONALE_PREFIX in rationale:
+        return "solitaire"
+    if GROUP_RATIONALE_PREFIX in rationale:
+        return "curtain"
+    return "scatter"
+
+
 def _crown_of(item: PlantingItemRow) -> str | None:
     """Класс кроны дерева (wide/medium/narrow) — карта рисует точку по нему:
     широкая крона крупной точкой, узкая мелкой. От класса зависят и интервал,
@@ -162,6 +186,8 @@ def planting_item_to_geojson_feature(item: PlantingItemRow, source_crs: str | No
             "score": item.score,
             "rationale": item.rationale,
             "is_manual_edit": item.is_manual_edit,
+            "group_id": item.group_id,
+            "scheme": _scheme_of(item),
         },
     )
 
@@ -196,6 +222,8 @@ def _item_properties(item: PlantingItemRow) -> dict:
         "score": item.score,
         "rationale": item.rationale,
         "is_manual_edit": item.is_manual_edit,
+        "group_id": item.group_id,
+        "scheme": _scheme_of(item),
     }
 
 
@@ -259,4 +287,5 @@ def domain_item_to_row(plan_id: str, item: PlantingItem) -> PlantingItemRow:
         score=item.score,
         rationale=item.rationale,
         is_manual_edit=item.is_manual_edit,
+        group_id=item.group_id,
     )

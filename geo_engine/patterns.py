@@ -392,7 +392,7 @@ def row_candidates(
 
     candidates: list[PlantingCandidate] = []
 
-    def add_along(path: BaseGeometry | None, phase: float) -> None:
+    def add_along(path: BaseGeometry | None, phase: float, group: str) -> None:
         for line in _as_lines(path):
             for point in points_along(line, pitch_m, phase):
                 if not buildable_area.contains(point):
@@ -403,15 +403,20 @@ def row_candidates(
                         planting_type=planting_type,
                         clearance_m=exclusion_index.distance(point),
                         zoning=zoning_index.category_at(point),
+                        group=group,
                     )
                 )
 
-    for guide in guides:
+    for guide_index, guide in enumerate(guides):
         usable, offset = _row_path(guide, buildable_area, band_m, inset_m, pitch_m)
-        add_along(usable, 0.0)
+        # Ряд — это ориентир плюс номер ряда (второй ряд аллеи — отдельный ряд).
+        # Порядок ориентиров задан входом, а не отбором, поэтому номер одного и
+        # того же ориентира одинаков в каждом проходе каскада крон: деревья
+        # разных пород вдоль одной улицы остаются одним рядом.
+        add_along(usable, 0.0, f"{planting_type}-row-{guide_index}-1")
         if rows >= 2 and usable is not None and guide.object_type != "territory":
             second = guide.geometry.buffer(offset + pitch_m * DOUBLE_ROW_GAP_FACTOR).boundary
-            add_along(second, 0.5)
+            add_along(second, 0.5, f"{planting_type}-row-{guide_index}-2")
     return candidates
 
 
@@ -669,12 +674,17 @@ def fill_group(
     else:
         clearances = [float(d) for d in shapely.distance(points, exclusion_zone)]
 
+    # Куртина — одна группа. Идентификатор по положению круга, не по счётчику:
+    # он должен совпасть при пересчёте плана (см. PlantingItem.group_id).
+    centre = disc.centroid
+    group = f"{planting_type}-curtain-{round(centre.x)}-{round(centre.y)}"
     return [
         PlantingCandidate(
             geometry=point,
             planting_type=planting_type,
             clearance_m=clearance,
             zoning=zoning_index.category_at(point),
+            group=group,
         )
         for point, clearance in zip(points, clearances)
     ]

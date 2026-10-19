@@ -231,6 +231,39 @@ class TestPlannerPatterns:
         assert in_rows, "вдоль проезда должна появиться рядовая посадка"
         assert len(in_rows) < len(items), "остальная площадь по-прежнему заполняется россыпью"
 
+    def test_rows_carry_a_group_id_the_interface_can_select_by(self, norms, catalogue):
+        """«Выделить похожие → весь ряд»: посадки одного ряда несут один
+        group_id, а россыпь и солитер — нет (у них группы нет)."""
+        from geo_engine.planner import ROW_RATIONALE_PREFIX, SOLITAIRE_RATIONALE_PREFIX, plan_items
+
+        territory, zones = self._scene()
+        items = plan_items(
+            "rows", [], zones, territory, ["tree"], self._score, norms,
+            species_overrides={"tree": "Липа мелколистная"}, pattern="auto", catalogue=catalogue,
+            density_per_ha={"tree": 0},
+        )
+
+        row_ids = {i.group_id for i in items if ROW_RATIONALE_PREFIX in i.rationale}
+        assert row_ids and None not in row_ids, "у каждой посадки в ряду есть группа"
+        assert all(group.startswith("tree-row-") for group in row_ids)
+        assert all(i.group_id is None for i in items if SOLITAIRE_RATIONALE_PREFIX in i.rationale)
+
+    def test_group_ids_are_the_same_on_every_run(self, norms, catalogue):
+        """План пересчитывается побитово (ensure_materialized) — id групп
+        не должны зависеть от счётчика, переживающего предыдущую генерацию."""
+        from geo_engine.planner import plan_items
+
+        territory, zones = self._scene()
+
+        def run():
+            return plan_items(
+                "rows", [], zones, territory, ["tree"], self._score, norms,
+                species_overrides={"tree": "Липа мелколистная"}, pattern="auto", catalogue=catalogue,
+                density_per_ha={"tree": 0},
+            )
+
+        assert [i.group_id for i in run()] == [i.group_id for i in run()]
+
     def test_scatter_reproduces_the_previous_behaviour(self, norms, catalogue):
         from geo_engine.planner import ROW_RATIONALE_PREFIX, plan_items
 
@@ -454,6 +487,15 @@ class TestDoubleRow:
             tree_rows=tree_rows,
         )
         return [i for i in items if i.rationale.startswith(ROW_RATIONALE_PREFIX)]
+
+    def test_the_second_row_is_its_own_group(self, norms, catalogue):
+        """Второй ряд аллеи — отдельный ряд: «выделить весь ряд» берёт один из
+        них, а не обе стороны улицы сразу."""
+        one = {i.group_id.rsplit("-", 1)[-1] for i in self._plan(norms, catalogue, 1) if i.group_id}
+        two = {i.group_id.rsplit("-", 1)[-1] for i in self._plan(norms, catalogue, 2) if i.group_id}
+
+        assert one == {"1"}
+        assert two == {"1", "2"}
 
     def test_the_second_row_appears_along_the_street(self, norms, catalogue):
         # Первый ряд — в ~2 м от оси проезда (отступ от дороги), второй

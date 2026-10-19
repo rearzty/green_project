@@ -82,45 +82,6 @@ function IssueRow({
   );
 }
 
-const BUDGET_TYPE_LABELS: Record<string, string> = { tree: "Деревья", shrub: "Кустарник", lawn: "Газон" };
-
-/** Why a planting type got few (or no) plantings: the share of the
- * territory still open to it and the constraints that closed the rest. On a
- * dense street the strict setback tables leave trees almost nowhere to go --
- * without this, "only shrubs" reads as a generator bug instead of what the
- * norms actually say. */
-function AreaBudgetList({ budgets }: { budgets: AreaBudget[] }) {
-  return (
-    <div className="flex flex-col gap-4 px-5 pb-4 pt-3">
-      <p className="text-[13px] leading-5 text-gp-text-3">Сколько площади оставили нормы и что закрыло остальное</p>
-      {budgets.map((budget) => {
-        const scarce = budget.usable_share < 0.05;
-        return (
-          <div key={budget.planting_type}>
-            <div className="flex items-baseline justify-between gap-2">
-              <span className="text-sm font-medium text-gp-text">{BUDGET_TYPE_LABELS[budget.planting_type] ?? budget.planting_type}</span>
-              <span className={cn("font-mono text-xs tabular-nums", scarce ? "text-gp-warn" : "text-gp-text-2")}>
-                {fmt(budget.usable_m2)} из {fmt(budget.territory_m2)} м² · {(100 * budget.usable_share).toFixed(1)}%
-              </span>
-            </div>
-            <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-gp-line">
-              <div
-                className={cn("h-full rounded-full", scarce && "bg-gp-warn-bar")}
-                style={{ width: `${Math.max(1, budget.usable_share * 100)}%`, backgroundColor: scarce ? undefined : PLANTING_COLORS[budget.planting_type] }}
-              />
-            </div>
-            {budget.blockers.length > 0 && (
-              <p className="mt-1.5 text-xs leading-5 text-gp-text-3">
-                Больше всего закрывают: {budget.blockers.slice(0, 3).map((b) => `${b.label} ${Math.round(100 * b.share)}%`).join(", ")}
-              </p>
-            )}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
 function formatPlanTime(plan: PlanSummary): string {
   return new Date(plan.created_at).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
@@ -141,6 +102,10 @@ export interface CheckPanelProps {
   stats: PlanStats | null;
   /** PlanOut.area_budget of the shown plan. */
   areaBudget?: AreaBudget[];
+  /** «Где можно сажать» / «Почему деревьев мало» — слой ограничений на карте. */
+  onOpenZones: () => void;
+  /** Режим сравнения двух версий плана. */
+  onCompareVersions: () => void;
   showPlan: boolean;
   /** Единственная выделенная посадка — строка нарушения подсвечивается. */
   selectedItemId?: string;
@@ -173,6 +138,8 @@ export function CheckPanel({
   typeOf,
   stats,
   areaBudget = [],
+  onOpenZones,
+  onCompareVersions,
   showPlan,
   selectedItemId,
   editBusy,
@@ -187,7 +154,6 @@ export function CheckPanel({
 }: CheckPanelProps) {
   const [shown, setShown] = useState(PAGE);
   const [versionsOpen, setVersionsOpen] = useState(false);
-  const [budgetOpen, setBudgetOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   // Plan-history delete is permanent -- a second click on the same row
   // confirms it (no native window.confirm(), see toast.ts).
@@ -335,8 +301,7 @@ export function CheckPanel({
 
         {areaBudget.length > 0 && (
           <>
-            <LinkRow onClick={() => setBudgetOpen((v) => !v)}>{treesScarce ? "Почему деревьев мало" : "Где можно сажать"}</LinkRow>
-            {budgetOpen && <AreaBudgetList budgets={areaBudget} />}
+            <LinkRow onClick={onOpenZones}>{treesScarce ? "Почему деревьев мало" : "Где можно сажать"}</LinkRow>
           </>
         )}
 
@@ -384,6 +349,13 @@ export function CheckPanel({
                 </button>
               </li>
             ))}
+            {plans.length > 1 && (
+              <li className="px-3 pt-1">
+                <button onClick={onCompareVersions} className="min-h-9 text-[13px] font-medium text-gp-accent hover:text-gp-accent-hover">
+                  Сравнить версии
+                </button>
+              </li>
+            )}
           </ul>
         )}
       </div>

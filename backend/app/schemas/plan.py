@@ -123,6 +123,38 @@ class AreaBlockerOut(BaseModel):
     share: float
 
 
+class ZoneGroupOut(BaseModel):
+    """Одна полоса слоя «где можно сажать»: допустимая площадь или зона,
+    закрытая одним ограничением."""
+
+    key: str
+    kind: Literal["allowed", "blocker"]
+    label: str
+    color: str
+    share: float
+    required_m: float | None = None
+    # Площадь, закрытая только этим ограничением, м² — освободится, если его убрать.
+    exclusive_m2: float = 0.0
+
+
+class ZonesAdviceOut(BaseModel):
+    key: str
+    label: str
+    exclusive_m2: float
+    extra_items: int
+
+
+class PlanZonesOut(BaseModel):
+    planting_type: PlantingType
+    bounds: tuple[tuple[float, float], tuple[float, float]]
+    territory_m2: float
+    usable_m2: float
+    usable_share: float
+    interval_m: float
+    groups: list[ZoneGroupOut]
+    advice: ZonesAdviceOut | None = None
+
+
 class AreaBudgetOut(BaseModel):
     """Сколько площади осталось под тип посадки и что закрыло остальное —
     см. geo_engine/area_budget.py."""
@@ -182,6 +214,24 @@ class ItemsDeleteResult(BaseModel):
     sidebar's count for this plan without a separate GET .../plans call."""
 
     deleted_items: list[GeoJSONFeature]
+    item_count: int
+
+
+class ItemsRespaceRequest(BaseModel):
+    """Перерасставить ряд с другим шагом (метры). Нижняя граница — не норматив
+    (его проверяет сервис по породе), а защита от шага в сантиметры, который
+    раздул бы ряд в тысячи точек."""
+
+    ids: list[str]
+    pitch_m: float = Field(ge=0.3, le=30.0)
+
+
+class ItemsRespaceResult(BaseModel):
+    """`previous_items` — снимки прежних посадок ряда (для отмены через
+    delete+restore), `items` — новые; `item_count` — свежее число посадок плана."""
+
+    previous_items: list[GeoJSONFeature]
+    items: list[GeoJSONFeature]
     item_count: int
 
 

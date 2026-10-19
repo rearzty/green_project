@@ -8,7 +8,7 @@ import { MAP_BG_COLOR, PLANTING_COLORS, VIOLATION_COLOR } from "@/lib/mapStyle";
 export interface LegendItem {
   key: string;
   label: string;
-  swatch: "tree" | "shrub" | "lawn" | "violation" | "dash";
+  swatch: "tree" | "shrub" | "lawn" | "violation" | "dash" | "added" | "removed" | "same";
   color?: string;
 }
 
@@ -46,6 +46,13 @@ function Swatch({ item }: { item: LegendItem }) {
     case "violation":
       // Кольцо, а не точка — та же форма, что на карте (globals.css .gp-violation).
       return <span className="h-[9px] w-[9px] rounded-full border-2" style={{ borderColor: VIOLATION_COLOR, boxShadow: `0 0 0 1px ${MAP_BG_COLOR}` }} />;
+    case "added":
+      // Посадка, появившаяся в новой версии: обычная точка в акцентном кольце.
+      return <span className="h-2.5 w-2.5 rounded-full" style={{ background: PLANTING_COLORS.tree, boxShadow: `0 0 0 2px ${MAP_BG_COLOR}, 0 0 0 4px #B5E07A` }} />;
+    case "removed":
+      return <span className="h-3 w-3 rounded-full border-[1.5px] border-dashed" style={{ borderColor: VIOLATION_COLOR }} />;
+    case "same":
+      return <span className="h-2.5 w-2.5 rounded-full" style={{ background: PLANTING_COLORS.tree }} />;
     default:
       return <span className="w-3.5 border-t-[1.5px] border-dashed" style={{ borderColor: item.color }} />;
   }

@@ -495,12 +495,17 @@ def _accent_items(
     items: list[PlantingItem] = []
     for kind, points in layout:
         clearances = exclusion_index.distances(points)
+        # Группа деревьев — одна группа посадок; солитер — сам по себе. Id по
+        # положению ядра (первая точка раскладки), не по счётчику: он обязан
+        # совпасть при пересчёте плана (см. PlantingItem.group_id).
+        group = f"{planting_type}-group-{round(points[0].x)}-{round(points[0].y)}" if kind == "group" else None
         candidates = [
             PlantingCandidate(
                 geometry=point,
                 planting_type=planting_type,
                 clearance_m=float(clearance),
                 zoning=zoning_index.category_at(point),
+                group=group,
             )
             for point, clearance in zip(points, clearances)
         ]

@@ -54,6 +54,8 @@ class PlantingItemRow:
     score: float = 0.0
     rationale: str = ""
     is_manual_edit: bool = False
+    # Ряд/куртина/группа, к которым относится посадка (geo_engine PlantingItem.group_id).
+    group_id: str | None = None
     # Back-reference to the owning Plan -- ORM's `relationship(back_populates=...)`
     # had no dataclass equivalent, so whatever appends an item to `plan.items`
     # is responsible for setting this too (see store.py::attach_items).

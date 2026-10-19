@@ -18,9 +18,11 @@ from backend.app.services.edit_service import (
     ItemsNotFoundError,
     OutOfTerritoryError,
     PlantingTypeGeometryMismatchError,
+    RespaceError,
     apply_item_patch,
     delete_items,
     move_items,
+    respace_items,
     restore_items,
     retype_items,
     validate_items,
@@ -529,3 +531,104 @@ class TestTreeSpacingInWebValidation:
 
         assert {v["item_id"] for v in violations if "соседнего дерева" in v["message"]} == {"a", "b"}
         assert "a" in checked
+
+
+class TestRespaceItems:
+    """«Изменить интервал» у ряда: точки выстраиваются в линию и раскладываются
+    заново с заданным шагом."""
+
+    @staticmethod
+    def _row_of(count, step, y=50.0, species="Липа мелколистная", group="tree-row-0-1", planting_type="tree"):
+        rows = []
+        for i in range(count):
+            row = _row(f"r{i}", Point(10 + i * step, y), planting_type)
+            row.species = species
+            row.group_id = group
+            rows.append(row)
+        return rows
+
+    def test_the_row_is_laid_out_again_with_the_new_step(self):
+        rows = self._row_of(6, 8.0)  # 10..50, шаг 8
+        plan = _plan_with_items(BIG_TERRITORY, rows)
+
+        previous, created = respace_items(plan, [r.id for r in rows], pitch_m=10.0, source_crs=None)
+
+        xs = sorted(f["geometry"]["coordinates"][0] for f in created)
+        gaps = [b - a for a, b in zip(xs, xs[1:])]
+        assert gaps and all(abs(gap - 10.0) < 1e-6 for gap in gaps)
+        assert len(previous) == 6 and len(created) == 5  # длина 40 м → 5 точек с шагом 10
+        assert plan.item_count == 5
+        assert plan.has_manual_edits is True
+
+    def test_new_plantings_inherit_species_and_stay_in_the_same_row(self):
+        rows = self._row_of(5, 8.0, species="Клён остролистный", group="tree-row-3-1")
+        plan = _plan_with_items(BIG_TERRITORY, rows)
+
+        _, created = respace_items(plan, [r.id for r in rows], pitch_m=8.0, source_crs=None)
+
+        assert {f["properties"]["species"] for f in created} == {"Клён остролистный"}
+        assert {f["properties"]["group_id"] for f in created} == {"tree-row-3-1"}
+        assert all(f["properties"]["is_manual_edit"] for f in created)
+        assert not {f["properties"]["id"] for f in created} & {r.id for r in rows}, "новые id, старые убраны"
+
+    def test_a_step_below_the_crown_class_norm_is_refused_for_trees(self):
+        rows = self._row_of(5, 8.0, species="Липа мелколистная")  # средняя/широкая крона: интервал не меньше нормы класса
+        plan = _plan_with_items(BIG_TERRITORY, rows)
+
+        with pytest.raises(RespaceError, match="МГСН 1.02-02"):
+            respace_items(plan, [r.id for r in rows], pitch_m=0.5, source_crs=None)
+
+        assert plan.item_count == 5 and len(plan.items) == 5, "отказ ничего не меняет"
+
+    def test_a_shrub_row_may_be_packed_tightly(self):
+        rows = self._row_of(5, 1.0, planting_type="shrub", species="Спирея японская", group="shrub-row-0-1")
+        plan = _plan_with_items(BIG_TERRITORY, rows)
+
+        _, created = respace_items(plan, [r.id for r in rows], pitch_m=0.5, source_crs=None)
+
+        assert len(created) == 9  # длина 4 м, шаг 0,5 → 9 точек
+
+    def test_a_closed_ring_gets_a_step_that_divides_its_length_and_is_never_smaller(self):
+        import math
+
+        radius = 20.0
+        count = 24
+        rows = []
+        for i in range(count):
+            angle = 2 * math.pi * i / count
+            row = _row(f"c{i}", Point(50 + radius * math.cos(angle), 50 + radius * math.sin(angle)), "shrub")
+            row.group_id = "shrub-row-1-1"
+            rows.append(row)
+        plan = _plan_with_items(BIG_TERRITORY, rows)
+
+        _, created = respace_items(plan, [r.id for r in rows], pitch_m=7.0, source_crs=None)
+
+        points = [Point(f["geometry"]["coordinates"]) for f in created]
+        nearest = [min(p.distance(q) for q in points if q is not p) for p in points]
+        assert min(nearest) >= 7.0 - 0.3, "на стыке кольца нет щели и нет сближения"
+        assert 17 <= len(created) <= 19  # периметр ≈ 125 м; шаг подогнан по длине (≥ 7 м)
+
+    def test_points_that_fall_outside_the_territory_are_dropped(self):
+        rows = self._row_of(4, 8.0, y=50.0)  # x = 10..34
+        # Уникальный id проекта: граница участка кэшируется по нему (exclusion_cache).
+        plan = _plan_with_items(Polygon([(0, 0), (0, 100), (30, 100), (30, 0)]), rows, project_id="respace-narrow-territory")  # участок кончается на x=30
+
+        _, created = respace_items(plan, [r.id for r in rows], pitch_m=8.0, source_crs=None)
+
+        assert created and all(f["geometry"]["coordinates"][0] <= 30.0 + 1e-6 for f in created)
+
+    def test_one_planting_or_a_lawn_is_not_a_row(self):
+        plan = _plan_with_items(BIG_TERRITORY, [_row("a", Point(5, 5), "tree"), _row("lawn", box(10, 10, 20, 20), "lawn")])
+
+        with pytest.raises(RespaceError):
+            respace_items(plan, ["a"], pitch_m=8.0, source_crs=None)
+        with pytest.raises(RespaceError):
+            respace_items(plan, ["a", "lawn"], pitch_m=8.0, source_crs=None)
+
+    def test_unknown_ids_change_nothing(self):
+        rows = self._row_of(3, 8.0)
+        plan = _plan_with_items(BIG_TERRITORY, rows)
+
+        with pytest.raises(ItemsNotFoundError):
+            respace_items(plan, ["r0", "ghost"], pitch_m=8.0, source_crs=None)
+        assert len(plan.items) == 3
