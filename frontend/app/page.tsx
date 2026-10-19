@@ -47,7 +47,7 @@ import {
   fetchComplianceReport,
   getItemsCompliance,
   getNearbyConstraints,
-  getNearestAllowed,
+  getAllowedArea,
   getProjectLayers3d,
   PROJECT_GONE_MESSAGE,
   type AssistantAction,
@@ -372,11 +372,10 @@ export default function Home() {
     },
     []
   );
-  const loadNearestAllowed = useCallback(async (itemId: string, at: { x: number; y: number }) => {
+  const loadAllowedArea = useCallback(async (itemId: string, at: { x: number; y: number }) => {
     const { project: current, plan: currentPlan } = runtimeRef.current.session;
     if (!current || !currentPlan) return null;
-    const found = await getNearestAllowed(current.id, currentPlan.plan_id, itemId, at);
-    return found ? found.to : null;
+    return getAllowedArea(current.id, currentPlan.plan_id, itemId, at);
   }, []);
 
   /** «Применить» в «Как исправить»: тем же путём, что кнопки панели выделения —
@@ -1536,7 +1535,7 @@ export default function Home() {
                 fixPreview={mapFixPreview}
                 partialPlan={session.generatePartial?.features ?? null}
                 loadNearbyConstraints={loadNearbyConstraints}
-                loadNearestAllowed={loadNearestAllowed}
+                loadAllowedArea={loadAllowedArea}
                 zoneLayers={zonesShown ? zones.layers : null}
                 dimPlan={zonesShown || session.generatePartial !== null}
                 onSelectionChange={selection.setSelection}

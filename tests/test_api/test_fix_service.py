@@ -246,6 +246,91 @@ class TestNearestAllowed:
         assert nearest_allowed(plan, "a", 50.0, 50.2, None) is None
 
 
+class TestAllowedArea:
+    """Перенос: полигон «здесь можно» — те же правила, что у проверки плана."""
+
+    @staticmethod
+    def _polygon(found: dict):
+        from shapely.geometry import shape
+
+        assert found["geometry"] is not None
+        return shape(found["geometry"])
+
+    def test_every_point_of_the_area_passes_the_real_check(self):
+        from backend.app.services.fix_service import allowed_area
+
+        plan = _scene("fx-area", LineString([(0, 50), (100, 50)]), rows=[_tree("a", 40, 20.0)])
+        area = self._polygon(allowed_area(plan, "a", 40.0, 20.0, None))
+
+        checked = 0
+        for x in range(-5, 106, 5):
+            for y in range(0, 101, 5):
+                point = Point(x, y)
+                if not area.contains(point):
+                    continue
+                plan.items[0].geometry = shape_to_db(point)
+                assert validate_items(plan.project, plan, ["a"]) == [], f"({x}, {y}) в области, но проверка плана её отвергает"
+                checked += 1
+        assert checked > 50, "область не должна быть пустой в чистом поле"
+
+    def test_the_setback_strip_around_the_cable_is_left_out(self):
+        from backend.app.services.fix_service import allowed_area
+
+        plan = _scene("fx-area-strip", LineString([(0, 50), (100, 50)]), rows=[_tree("a", 40, 20.0)])
+        area = self._polygon(allowed_area(plan, "a", 40.0, 20.0, None))
+
+        assert not area.contains(Point(40, 50.5)), "в полосе отступа (нужно 2 м)"
+        assert not area.contains(Point(40, 49.0))
+        assert area.contains(Point(40, 53.0))
+        assert area.contains(Point(40, 47.0))
+
+    def test_the_interval_circle_around_a_neighbour_tree_is_left_out(self):
+        from backend.app.services.fix_service import allowed_area
+
+        plan = _scene("fx-area-nb", None, rows=[_tree("a", 40, 20.0), _tree("b", 60, 20.0)])
+        area = self._polygon(allowed_area(plan, "a", 40.0, 20.0, None))
+
+        assert not area.contains(Point(61.5, 20.0)), "ближе 3 м (интервал узкой кроны) к соседу"
+        assert area.contains(Point(64.0, 20.0))
+        assert area.contains(Point(40.0, 20.0)), "сама посадка не мешает себе"
+
+    def test_a_shrub_ignores_the_trunk_interval(self):
+        from backend.app.services.fix_service import allowed_area
+
+        plan = _scene("fx-area-shrub", None, rows=[_tree("a", 40, 20.0, planting_type="shrub", species="Сирень обыкновенная"), _tree("b", 41, 20.0)])
+        area = self._polygon(allowed_area(plan, "a", 40.0, 20.0, None))
+
+        assert area.contains(Point(41.2, 20.0)), "кусту интервал между стволами не задан"
+
+    def test_no_room_in_the_window_gives_an_empty_answer_not_an_error(self):
+        from backend.app.services.fix_service import allowed_area
+
+        strip = Polygon([(0, 49), (100, 49), (100, 51), (0, 51)])
+        plan = _scene("fx-area-none", LineString([(0, 50), (100, 50)]), territory=strip, rows=[_tree("a", 50, 50.0)])
+
+        assert allowed_area(plan, "a", 50.0, 50.0, None)["geometry"] is None
+
+    def test_lawn_has_no_area(self):
+        from backend.app.services.fix_service import allowed_area
+
+        plan = _scene("fx-area-lawn", None, rows=[_tree("a", 40, 20.0, planting_type="lawn", species="default")])
+
+        assert allowed_area(plan, "a", 40.0, 20.0, None) is None
+
+    def test_a_nearest_point_on_the_area_edge_is_itself_valid(self):
+        """Интерфейс «примагничивает» к ближайшей точке границы области — она обязана быть допустимой."""
+        from backend.app.services.fix_service import allowed_area
+        from shapely.ops import nearest_points
+
+        plan = _scene("fx-area-edge", LineString([(0, 50), (100, 50)]), rows=[_tree("a", 40, 20.0)])
+        area = self._polygon(allowed_area(plan, "a", 40.0, 20.0, None))
+
+        _, edge = nearest_points(Point(40, 50.3), area.boundary)
+        plan.items[0].geometry = shape_to_db(edge)
+
+        assert validate_items(plan.project, plan, ["a"]) == []
+
+
 class TestNearbyConstraints:
     def test_zones_carry_the_norm_for_this_planting_and_the_object(self):
         from backend.app.services.constraints_service import nearby_constraints

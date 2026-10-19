@@ -24,7 +24,7 @@ export function makeMetreProjector(centreLat: number, centreLng: number, geograp
   return (lng, lat) => [(lng - centreLng) * kx, (lat - centreLat) * ky];
 }
 
-type Ring = Float64Array; // [x0, y0, x1, y1, …]
+export type Ring = Float64Array; // [x0, y0, x1, y1, …]
 
 export interface PreparedConstraint {
   index: number;
@@ -122,7 +122,7 @@ function distanceToPath(px: number, py: number, path: Ring): number {
 }
 
 /** Чётно-нечётное правило: луч вправо от точки, число пересечений рёбер кольца. */
-function insideRing(px: number, py: number, ring: Ring): boolean {
+export function insideRing(px: number, py: number, ring: Ring): boolean {
   let inside = false;
   const n = ring.length / 2;
   for (let i = 0, j = n - 1; i < n; j = i++) {

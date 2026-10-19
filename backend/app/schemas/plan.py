@@ -354,6 +354,14 @@ class NearestAllowedOut(BaseModel):
     shift_m: float
 
 
+class AllowedAreaOut(BaseModel):
+    """Где можно поставить посадку (при переносе): MultiPolygon в координатах
+    отображения или `None`, если в окне радиусом `radius_m` места нет."""
+
+    geometry: dict | None
+    radius_m: float
+
+
 class ItemTypeChange(BaseModel):
     id: str
     planting_type: PlantingType
