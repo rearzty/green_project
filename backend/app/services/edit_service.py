@@ -182,10 +182,11 @@ _MAX_RESPACE_ITEMS = 5_000
 _RING_GAP_FACTOR = 1.5
 
 
-def _chain_order(points: list[Point]) -> list[Point]:
-    """Посадки ряда в порядке обхода: от крайней к соседней, жадно. Ряд — это
-    линия с почти равными промежутками, поэтому ближайший непосещённый сосед и
-    есть следующая точка ряда."""
+def chain_indices(points: list[Point]) -> list[int]:
+    """Номера посадок ряда в порядке обхода: от крайней к соседней, жадно. Ряд —
+    это линия с почти равными промежутками, поэтому ближайший непосещённый
+    сосед и есть следующая точка ряда. Индексы, а не точки: «исправить
+    нарушение» (fix_service) должен знать, какая именно посадка стоит рядом."""
     xs = np.array([p.x for p in points])
     ys = np.array([p.y for p in points])
     start = int(np.argmax((xs - xs.mean()) ** 2 + (ys - ys.mean()) ** 2))  # дальняя от центра — конец ряда
@@ -196,7 +197,12 @@ def _chain_order(points: list[Point]) -> list[Point]:
         nxt = min(remaining, key=lambda i: (xs[i] - xs[last]) ** 2 + (ys[i] - ys[last]) ** 2)
         order.append(nxt)
         remaining.remove(nxt)
-    return [points[i] for i in order]
+    return order
+
+
+def _chain_order(points: list[Point]) -> list[Point]:
+    """Те же посадки ряда, но самими точками."""
+    return [points[i] for i in chain_indices(points)]
 
 
 def respace_items(plan: Plan, ids: list[str], pitch_m: float, source_crs: str | None) -> tuple[list[dict], list[dict]]:

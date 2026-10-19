@@ -30,6 +30,7 @@ import { CompareBar } from "@/components/CompareBar";
 import { ContextMenu, type ContextMenuEntry } from "@/components/ContextMenu";
 import { DraftPanel } from "@/components/DraftPanel";
 import { ExportDialog } from "@/components/ExportDialog";
+import type { FixPreview } from "@/components/FixPanel";
 import { Header, type Stage } from "@/components/Header";
 import { InspectorPanel, type InspectedItem } from "@/components/InspectorPanel";
 import { MapToolbar } from "@/components/map/MapToolbar";
@@ -37,7 +38,7 @@ import { SelectionBar } from "@/components/map/SelectionBar";
 import { StatusBar, type LegendItem } from "@/components/map/StatusBar";
 import { ViewControls } from "@/components/map/ViewControls";
 import { ZoomControls } from "@/components/map/ZoomControls";
-import type { HoverInfo, MapFitRequest } from "@/components/MapView";
+import type { FixPreviewMark, HoverInfo, MapFitRequest } from "@/components/MapView";
 import { PlanPanel } from "@/components/PlanPanel";
 import { Toaster } from "@/components/Toaster";
 import { ZonesPanel } from "@/components/ZonesPanel";
@@ -51,6 +52,8 @@ import {
   type AssistantGenerationSettings,
   type AssistantSelection,
   type ExportOptions,
+  type FixKind,
+  type FixOption,
   type GeoJSONFeatureCollection,
   type ItemCompliance,
   type PlantingType,
@@ -74,7 +77,7 @@ import {
   type SelectTarget,
   type UiAction,
 } from "@/lib/assistantCommands";
-import { countLabel, CROWN_LABELS, OBJECT_FORMS, PLANTING_TYPE_LABELS } from "@/lib/format";
+import { countLabel, CROWN_LABELS, formatMeters, OBJECT_FORMS, PLANTING_TYPE_LABELS } from "@/lib/format";
 import { useCompareVersions } from "@/lib/hooks/useCompareVersions";
 import { useKeyboardShortcuts } from "@/lib/hooks/useKeyboardShortcuts";
 import { usePlanEdits } from "@/lib/hooks/usePlanEdits";
@@ -298,6 +301,57 @@ export default function Home() {
     onSelectPlan: session.handleSelectPlan,
   });
   const zones = useZonesLayer(project?.id, plan);
+
+  // «Как исправить» в раскрытой строке нарушения (CheckPanel/FixPanel): выбранный
+  // вариант — предпросмотром на карте, пока строка раскрыта.
+  const [fixPreview, setFixPreview] = useState<FixPreview | null>(null);
+  const mapFixPreview = useMemo<FixPreviewMark | null>(() => {
+    if (!fixPreview) return null;
+    const { itemId, option } = fixPreview;
+    if (option.kind === "move" && option.to) {
+      return {
+        at: [option.to.y, option.to.x],
+        label: option.clearance_m != null ? `сюда · ${formatMeters(option.clearance_m)}` : "сюда",
+        tone: "ok",
+      };
+    }
+    const item = planIndex?.get(itemId);
+    return item ? { at: [(item.minLat + item.maxLat) / 2, (item.minLng + item.maxLng) / 2], tone: "violation" } : null;
+    // planRevision: planIndex правится на месте при локальной правке
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fixPreview, planIndex, planRevision]);
+  const fixBanner = useMemo(() => {
+    if (!fixPreview) return null;
+    const type = planIndex?.get(fixPreview.itemId)?.type;
+    const noun = type === "shrub" ? "куст" : type === "lawn" ? "газон" : "дерево";
+    switch (fixPreview.option.kind) {
+      case "move":
+        return `Предпросмотр: ${noun} встанет сюда`;
+      case "retype":
+        return "Предпросмотр: дерево станет кустом";
+      default:
+        return `Предпросмотр: ${noun === "дерево" ? "дерево будет удалено" : noun === "куст" ? "куст будет удалён" : "газон будет удалён"}`;
+    }
+  }, [fixPreview, planIndex]);
+
+  /** «Применить» в «Как исправить»: тем же путём, что кнопки панели выделения —
+   * поэтому одна запись в истории и Ctrl+Z возвращает как было. */
+  function applyFix(itemId: string, option: FixOption) {
+    if (!plan || !planIndex) return;
+    if (option.kind === "move" && option.to) {
+      const feature = plan.features.features.find((f) => (f.properties as { id?: string }).id === itemId);
+      const coordinates = feature?.geometry.coordinates as [number, number] | undefined;
+      if (!coordinates) return;
+      editing.handleMoveItems([itemId], { x: coordinates[0], y: coordinates[1] }, option.to);
+    } else if (option.kind === "retype") {
+      editing.handleRetypeSelection(new Set([itemId]), planIndex, "shrub");
+    } else if (option.kind === "delete") {
+      editing.handleDeleteSelection(new Set([itemId]));
+    }
+  }
+  function fixAll(ids: string[], kind: FixKind) {
+    editing.handleApplyFixes(ids, kind);
+  }
 
   // Обоснование ("Почему здесь?", InspectorPanel.tsx) -- только для ровно одной
   // выделенной точки: geo_engine.compliance.explain_items не зависит от
@@ -1379,6 +1433,9 @@ export default function Home() {
                   selectedItemId={singleSelectedId}
                   editBusy={editing.editBusy}
                   onFocusItem={selection.focusItem}
+                  onApplyFix={applyFix}
+                  onFixAll={fixAll}
+                  onPreviewFix={setFixPreview}
                   plans={plans}
                   currentPlanId={plan?.plan_id}
                   onSelectPlan={session.handleSelectPlan}
@@ -1421,6 +1478,7 @@ export default function Home() {
                 violationIds={editing.violationIds}
                 editsLocked={editing.editBusy || compare.active}
                 compareMarks={compare.marks}
+                fixPreview={mapFixPreview}
                 zoneLayers={zonesShown ? zones.layers : null}
                 dimPlan={zonesShown}
                 onSelectionChange={selection.setSelection}
@@ -1434,6 +1492,15 @@ export default function Home() {
                 loadHoverInfo={loadHoverInfo}
                 peekHoverInfo={peekHoverInfo}
               />
+            )}
+            {fixBanner && !view3d && (
+              <div
+                data-map-overlay
+                role="status"
+                className="pointer-events-none absolute left-1/2 top-[18px] z-[1050] max-w-[calc(100%-2rem)] -translate-x-1/2 rounded-lg border border-gp-border bg-gp-panel px-3.5 py-2 text-[13px] text-gp-text shadow-[0_8px_24px_rgba(0,0,0,0.35)]"
+              >
+                {fixBanner}
+              </div>
             )}
             {/* Всё, что лежит поверх карты, — вне контейнера Leaflet и с
                 data-map-overlay (MapView.tsx::freeMapRects не кладёт под него

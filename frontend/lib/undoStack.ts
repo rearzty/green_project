@@ -23,10 +23,11 @@ export type UndoEntry =
   | { type: "retype_items"; to: PlantingType; previous: { id: string; type: PlantingType }[] }
   // Inverse: restore these exact pre-delete snapshots.
   | { type: "delete_items"; items: GeoJSONFeature[] }
-  // Ряд перерасставлен: прежние посадки заменены новыми (другие id). Inverse:
-  // удалить новые и вернуть прежние; повтор — наоборот. Снимки обеих сторон
-  // хранятся целиком — id у новых посадок другие, «пересчитать ряд заново»
-  // при повторе дало бы третий вариант.
+  // Посадки заменены другими: ряд перерасставлен (новые id) либо «исправить все
+  // так же» (id прежние, сдвинутые/пересаженные; удалённых среди `created`
+  // нет). Inverse: удалить `created` и вернуть `previous`; повтор — наоборот.
+  // Снимки обеих сторон хранятся целиком — «пересчитать ряд заново» при
+  // повторе дало бы третий вариант.
   | { type: "respace_items"; previous: GeoJSONFeature[]; created: GeoJSONFeature[] };
 
 export interface UndoHistory {

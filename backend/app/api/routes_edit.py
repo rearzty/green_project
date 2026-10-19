@@ -9,6 +9,10 @@ from fastapi.concurrency import run_in_threadpool
 from backend.app.api.deps import PlanDep, get_item_or_404
 from backend.app.schemas.geo import GeoJSONFeature
 from backend.app.schemas.plan import (
+    FixesApplyRequest,
+    FixesApplyResult,
+    FixOptionOut,
+    ItemFixesOut,
     ItemIdsRequest,
     ItemPatch,
     ItemsDeleteResult,
@@ -40,6 +44,7 @@ from backend.app.services.edit_service import (
     validate_items_scoped,
     validate_plan,
 )
+from backend.app.services.fix_service import apply_fixes, item_fixes
 from backend.app.services.geo_io import display_crs, planting_item_to_geojson_feature
 
 router = APIRouter(prefix="/api/projects/{project_id}/plans/{plan_id}", tags=["edit"])
@@ -108,6 +113,27 @@ async def respace_items_route(request: ItemsRespaceRequest, plan: PlanDep) -> It
     with _edit_errors():
         previous, created = respace_items(plan, request.ids, request.pitch_m, display_crs(plan.project))
     return ItemsRespaceResult(previous_items=previous, items=created, item_count=plan.item_count)
+
+
+@router.get("/items/{item_id}/fixes", response_model=ItemFixesOut)
+async def item_fixes_route(item_id: str, plan: PlanDep) -> ItemFixesOut:
+    """Как исправить нарушение у одной посадки: сдвиг в допустимую точку, куст
+    вместо дерева, удаление — с последствиями (fix_service.item_fixes). Поиск
+    точки — реальная геометрия, поэтому в пуле потоков, а не на цикле событий."""
+    get_item_or_404(plan, item_id)
+    options = await run_in_threadpool(item_fixes, plan, item_id, display_crs(plan.project))
+    return ItemFixesOut(item_id=item_id, options=[FixOptionOut(**option) for option in options])
+
+
+@router.post("/fixes/apply", response_model=FixesApplyResult)
+async def apply_fixes_route(request: FixesApplyRequest, plan: PlanDep) -> FixesApplyResult:
+    """«Исправить все так же»: лучший вариант выбранного вида у каждой из `ids`
+    (fix_service.apply_fixes). Одним запросом и одним шагом отмены."""
+    with _edit_errors():
+        outcome = await run_in_threadpool(apply_fixes, plan, request.ids, request.kind, display_crs(plan.project))
+    return FixesApplyResult(
+        previous_items=outcome.previous, items=outcome.created, skipped_ids=outcome.skipped, item_count=plan.item_count
+    )
 
 
 @router.post("/items/restore", response_model=ItemsRestoreResult)

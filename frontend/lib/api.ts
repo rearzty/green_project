@@ -465,6 +465,52 @@ export async function respaceItems(projectId: string, planId: string, ids: strin
   return postJson(`/api/projects/${projectId}/plans/${planId}/items/respace`, { ids, pitch_m: pitchM });
 }
 
+// «Исправить нарушение в один клик» (backend/app/services/fix_service.py).
+
+export type FixKind = "move" | "retype" | "delete";
+
+export interface FixOption {
+  kind: FixKind;
+  /** Лучший по мнению сервиса; стоит только когда есть из чего выбирать. */
+  recommended: boolean;
+  /** move: новая точка в координатах остальной геометрии (WGS84 или метры чертежа). */
+  to?: LngLat | null;
+  shift_m?: number | null;
+  /** Расстояние до нарушенного ограничения после сдвига, м. */
+  clearance_m?: number | null;
+  /** Остаётся ли посадка в линии своего ряда; null — она не из ряда. */
+  keeps_row?: boolean | null;
+  /** retype */
+  type?: PlantingType | null;
+  valid?: boolean | null;
+  required_m?: number | null;
+  /** delete: пропуск, который останется в ряду, м. */
+  gap_m?: number | null;
+}
+
+export async function getItemFixes(projectId: string, planId: string, itemId: string, signal?: AbortSignal): Promise<FixOption[]> {
+  const { options } = await request<{ item_id: string; options: FixOption[] }>(
+    `/api/projects/${projectId}/plans/${planId}/items/${encodeURIComponent(itemId)}/fixes`,
+    { signal }
+  );
+  return options;
+}
+
+export interface FixesApplyResult {
+  /** Снимки прежних посадок — для отмены. */
+  previous_items: GeoJSONFeature[];
+  /** Сдвинутые и пересаженные (id прежние; удалённых среди них нет). */
+  items: GeoJSONFeature[];
+  /** Те, у кого нужного варианта нет. */
+  skipped_ids: string[];
+  item_count: number;
+}
+
+/** «Исправить все так же»: лучший вариант вида `kind` у каждой из `ids`. */
+export async function applyFixes(projectId: string, planId: string, ids: string[], kind: FixKind): Promise<FixesApplyResult> {
+  return postJson(`/api/projects/${projectId}/plans/${planId}/fixes/apply`, { ids, kind });
+}
+
 /** Undo's counterpart to deletion -- recreates the exact items given (same
  * id, geometry, type, species, score, rationale). Returns only the plan's
  * fresh item count: the caller already has the exact features it just asked

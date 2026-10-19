@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  applyFixes,
   deleteItems,
   moveItems,
   respaceItems,
@@ -10,6 +11,7 @@ import {
   retypeItems,
   validateItems,
   validatePlan,
+  type FixKind,
   type GeoJSONFeature,
   type LngLat,
   type PlanOut,
@@ -231,6 +233,39 @@ export function usePlanEdits(
     });
   }
 
+  /** «Исправить все так же» (CheckPanel): лучший вариант вида `kind` у каждой
+   * посадки с нарушением — одним запросом и одним шагом отмены. История —
+   * та же запись `respace_items`, что у перерасстановки ряда: «снимки до» и
+   * «снимки после» с теми же id, отмена = убрать новые и вернуть прежние
+   * (сначала убрать: restore отказывает, если id уже есть). */
+  function handleApplyFixes(ids: string[], kind: FixKind) {
+    if (ids.length === 0) return;
+    void runEdit(async ({ projectId, planId: forPlanId }) => {
+      const result = await applyFixes(projectId, forPlanId, ids, kind);
+      const label = kind === "move" ? "сдвинуто" : kind === "retype" ? "заменено кустом" : "удалено";
+      if (result.previous_items.length === 0) {
+        toast.info(
+          kind === "move"
+            ? "Свободного места рядом нет ни у одной посадки — сдвинуть нечего."
+            : kind === "retype"
+              ? "Куст не проходит нормы ни в одном из этих мест — заменять нечем."
+              : "Нечего удалять."
+        );
+        return;
+      }
+      swapItems(result.previous_items, result.items);
+      patchPlanItemCount(forPlanId, result.item_count);
+      recordEdit(forPlanId, { type: "respace_items", previous: result.previous_items, created: result.items });
+      await revalidateTouched(projectId, forPlanId, result.previous_items.map((f) => String(f.properties.id)));
+      const skipped = result.skipped_ids.length;
+      toast.success(
+        `Исправлено: ${label} ${countLabel(result.previous_items.length, OBJECT_FORMS)}.` +
+          (skipped > 0 ? ` Не вышло у ${countLabel(skipped, OBJECT_FORMS)} — для них нужен другой вариант.` : ""),
+        { label: "Отменить", onClick: () => stepHistoryRef.current("undo") }
+      );
+    });
+  }
+
   /** Прежние посадки уходят, на их место встают новые — локально, без
    * перечитывания плана; нарушения у ушедших снимаются сразу. */
   function swapItems(gone: GeoJSONFeature[], arrived: GeoJSONFeature[]) {
@@ -281,10 +316,13 @@ export function usePlanEdits(
         const [gone, arrived] = direction === "undo" ? [entry.created, entry.previous] : [entry.previous, entry.created];
         const goneIds = gone.map((f) => String(f.properties.id));
         // Сначала убрать, потом вернуть: restore отказывает, если id уже есть.
-        await deleteItems(projectId, forPlanId, goneIds);
-        const result = await restoreItems(projectId, forPlanId, arrived);
+        // Пустой список бывает у «исправить все так же → удалить» (нового
+        // ничего нет): запрос с пустым телом незачем.
+        let count = plan?.features.features.length ?? 0;
+        if (goneIds.length > 0) count = (await deleteItems(projectId, forPlanId, goneIds)).item_count;
+        if (arrived.length > 0) count = (await restoreItems(projectId, forPlanId, arrived)).item_count;
         swapItems(gone, arrived);
-        patchPlanItemCount(forPlanId, result.item_count);
+        patchPlanItemCount(forPlanId, count);
         await revalidateTouched(projectId, forPlanId, arrived.map((f) => String(f.properties.id)));
         break;
       }
@@ -344,6 +382,7 @@ export function usePlanEdits(
     canRedo,
     handleMoveItems,
     handleRespaceRow,
+    handleApplyFixes,
     handleRetypeSelection,
     handleDeleteSelection,
     undo: (expected?: UndoEntry) => stepHistory("undo", expected),

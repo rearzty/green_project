@@ -220,3 +220,20 @@ html {
     transform: translateX(300%);
   }
 }
+
+/* Подпись предпросмотра исправления («сюда · 2,1 м»): моно, зелёным, без
+   стрелки-клюва Leaflet — подпись стоит рядом с кольцом, а не указывает на него. */
+.leaflet-tooltip.gp-fix-label {
+  background: #1c201e;
+  border: 1px solid #3a403c;
+  border-radius: 6px;
+  color: #7bd389;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 16px;
+  padding: 2px 7px;
+  box-shadow: none;
+}
+.leaflet-tooltip.gp-fix-label::before {
+  display: none;
+}

@@ -1,11 +1,12 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, Loader2, Trash2 } from "lucide-react";
 
+import { FixPanel, type FixPreview } from "@/components/FixPanel";
 import { Button } from "@/components/ui/button";
 import { LinkRow, PanelTitle, SectionLabel } from "@/components/panel/primitives";
-import type { AreaBudget, ItemCompliance, PlanSummary, PlantingType, ValidationViolation } from "@/lib/api";
+import type { AreaBudget, FixKind, FixOption, ItemCompliance, PlanSummary, PlantingType, ValidationViolation } from "@/lib/api";
 import { formatDistancePair, OBJECT_GENITIVE_RU, PLANTING_TYPE_LABELS } from "@/lib/format";
 import { useViolationDetails } from "@/lib/hooks/useViolationDetails";
 import { PLANTING_COLORS } from "@/lib/mapStyle";
@@ -39,6 +40,7 @@ function IssueRow({
   total,
   plantingType,
   active,
+  expanded,
   disabled,
   onClick,
 }: {
@@ -48,6 +50,8 @@ function IssueRow({
   total: number;
   plantingType?: PlantingType;
   active: boolean;
+  /** Строка раскрыта — под ней «Как исправить». */
+  expanded: boolean;
   disabled: boolean;
   onClick: () => void;
 }) {
@@ -61,9 +65,10 @@ function IssueRow({
       onClick={onClick}
       disabled={disabled}
       aria-current={active ? "true" : undefined}
+      aria-expanded={expanded}
       className={cn(
         "flex w-full items-start gap-3 px-5 py-3 text-left hover:bg-gp-hover focus-visible:outline-offset-[-2px] disabled:cursor-not-allowed disabled:opacity-60",
-        active && "bg-gp-violation-row shadow-[inset_2px_0_0_#FF9351] hover:bg-gp-violation-row"
+        (active || expanded) && "bg-gp-violation-row shadow-[inset_2px_0_0_#FF9351] hover:bg-gp-violation-row"
       )}
     >
       <span className="mt-1.5 h-2 w-2 flex-none rounded-full bg-gp-violation" aria-hidden />
@@ -111,6 +116,12 @@ export interface CheckPanelProps {
   selectedItemId?: string;
   editBusy: boolean;
   onFocusItem: (itemId: string) => void;
+  /** «Применить» в раскрытой строке: тем же путём, что кнопки панели выделения. */
+  onApplyFix: (itemId: string, option: FixOption) => void;
+  /** «Исправить все так же»: вид исправления — ко всем посадкам с нарушением. */
+  onFixAll: (ids: string[], kind: FixKind) => void;
+  /** Выбранный вариант — карта рисует его предпросмотром; null — нет выбора. */
+  onPreviewFix: (preview: FixPreview | null) => void;
   plans: PlanSummary[];
   currentPlanId?: string;
   onSelectPlan: (planId: string) => Promise<void>;
@@ -144,6 +155,9 @@ export function CheckPanel({
   selectedItemId,
   editBusy,
   onFocusItem,
+  onApplyFix,
+  onFixAll,
+  onPreviewFix,
   plans,
   currentPlanId,
   onSelectPlan,
@@ -162,6 +176,46 @@ export function CheckPanel({
   const list = violations ?? [];
   const visible = useMemo(() => list.slice(0, shown), [list, shown]);
   const details = useViolationDetails(projectId, planId, planRevision, visible.map((v) => v.item_id));
+
+  // Раскрытая строка: её посадка и выбранный в ней вид исправления. Раскрыта не
+  // «строка», а посадка — у одной бывает два нарушения (отступ и интервал), и
+  // «Как исправить» у них общее, поэтому панель стоит под первой из них.
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [choiceKind, setChoiceKind] = useState<FixKind | null>(null);
+  const advanceRef = useRef<string | null>(null);
+  const expandedIndex = expandedId ? list.findIndex((v) => v.item_id === expandedId) : -1;
+
+  /** Следующая по списку посадка с нарушением (не та же самая). */
+  function neighbourOf(itemId: string): string | null {
+    const at = list.findIndex((v) => v.item_id === itemId);
+    const forward = list.slice(at + 1).find((v) => v.item_id !== itemId);
+    const backward = [...list.slice(0, Math.max(at, 0))].reverse().find((v) => v.item_id !== itemId);
+    return (forward ?? backward)?.item_id ?? null;
+  }
+
+  function expand(itemId: string | null) {
+    setExpandedId(itemId);
+    if (itemId) onFocusItem(itemId);
+  }
+
+  // Исправленная посадка ушла из списка: переходим к следующей, чтобы подряд
+  // исправлять можно было одним Enter. Правка не прошла (строка осталась) — не переходим.
+  useEffect(() => {
+    if (!expandedId || list.some((v) => v.item_id === expandedId)) return;
+    const next = advanceRef.current;
+    advanceRef.current = null;
+    if (next && list.some((v) => v.item_id === next)) expand(next);
+    else setExpandedId(null);
+    // expand читает только пропсы и сеттер
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [list, expandedId]);
+  useEffect(() => {
+    if (!editBusy) advanceRef.current = null;
+  }, [editBusy]);
+  // Другой план — раскрытая строка относилась к прежнему.
+  useEffect(() => {
+    setExpandedId(null);
+  }, [planId]);
 
   async function guarded(action: () => Promise<void>) {
     setBusy(true);
@@ -215,21 +269,56 @@ export function CheckPanel({
           ) : (
             <>
               <ul>
-                {visible.map((violation, index) => (
-                  <li key={`${violation.item_id}:${index}`}>
-                    <IssueRow
-                      violation={violation}
-                      details={details.get(violation.item_id)}
-                      index={index}
-                      total={list.length}
-                      plantingType={typeOf(violation.item_id)}
-                      active={selectedItemId === violation.item_id}
-                      disabled={!showPlan}
-                      onClick={() => onFocusItem(violation.item_id)}
-                    />
-                  </li>
-                ))}
+                {visible.map((violation, index) => {
+                  const violated = pickViolatedCheck(details.get(violation.item_id), violation.message);
+                  return (
+                    <li key={`${violation.item_id}:${index}`}>
+                      <IssueRow
+                        violation={violation}
+                        details={details.get(violation.item_id)}
+                        index={index}
+                        total={list.length}
+                        plantingType={typeOf(violation.item_id)}
+                        active={selectedItemId === violation.item_id}
+                        expanded={expandedId === violation.item_id}
+                        disabled={!showPlan}
+                        onClick={() => {
+                          // Повторный клик по раскрытой строке сворачивает её; посадка при этом остаётся выделенной.
+                          if (expandedId === violation.item_id) setExpandedId(null);
+                          else expand(violation.item_id);
+                        }}
+                      />
+                      {projectId && planId && index === expandedIndex && (
+                        <FixPanel
+                          projectId={projectId}
+                          planId={planId}
+                          planRevision={planRevision}
+                          itemId={violation.item_id}
+                          citation={violated?.citation}
+                          violatedType={violated?.object_type}
+                          disabled={editBusy}
+                          onApply={(option) => {
+                            advanceRef.current = neighbourOf(violation.item_id);
+                            onApplyFix(violation.item_id, option);
+                          }}
+                          onSkip={() => expand(neighbourOf(violation.item_id))}
+                          onPreview={onPreviewFix}
+                          onChoiceChange={setChoiceKind}
+                        />
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
+              {expandedId !== null && choiceKind !== null && new Set(list.map((v) => v.item_id)).size > 1 && (
+                <button
+                  disabled={editBusy}
+                  onClick={() => onFixAll([...new Set(list.map((v) => v.item_id))], choiceKind)}
+                  className="mx-5 mt-2 flex min-h-9 items-center text-[13px] font-medium text-gp-accent hover:text-gp-accent-hover disabled:opacity-40"
+                >
+                  Исправить все так же · {new Set(list.map((v) => v.item_id)).size.toLocaleString("ru-RU")}
+                </button>
+              )}
               {list.length > shown && (
                 <button
                   onClick={() => setShown((n) => n + PAGE)}

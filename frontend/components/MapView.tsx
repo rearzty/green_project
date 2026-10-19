@@ -452,6 +452,37 @@ function CompareOverlay({ marks }: { marks: CompareMarks | null }) {
   return null;
 }
 
+/** Предпросмотр исправления нарушения (п. 1): пунктирное кольцо `gp-ok` в
+ * точке, куда встанет посадка, и подпись «сюда · 2,1 м». Для замены и
+ * удаления — кольцо на самой посадке (`tone: "violation"`). Не интерактивно, в
+ * своей пане над кольцами сравнения. */
+export interface FixPreviewMark {
+  at: [number, number];
+  label?: string;
+  tone: "ok" | "violation";
+}
+
+function FixPreviewOverlay({ mark }: { mark: FixPreviewMark | null }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!mark) return;
+    const name = "fixPreview";
+    if (!map.getPane(name)) {
+      const pane = map.createPane(name);
+      pane.style.zIndex = "625";
+      pane.style.pointerEvents = "none";
+    }
+    const color = mark.tone === "ok" ? "#7BD389" : VIOLATION_COLOR;
+    const ring = L.circleMarker(mark.at, { pane: name, radius: 13, color, weight: 2, dashArray: "4 3", fill: false, interactive: false });
+    if (mark.label) ring.bindTooltip(mark.label, { permanent: true, direction: "right", offset: [12, 0], className: "gp-fix-label", interactive: false });
+    ring.addTo(map);
+    return () => {
+      ring.remove();
+    };
+  }, [map, mark]);
+  return null;
+}
+
 /** Приглушает точки и газон плана, пока открыт слой «где можно сажать», чтобы
  * цветные зоны читались. Класс ставится на контейнер Leaflet руками, а не
  * через `className` у `<MapContainer>`: react-leaflet читает его один раз при
@@ -1478,6 +1509,8 @@ export interface MapViewProps {
   fitRequest?: MapFitRequest | null;
   /** Сравнение версий: что добавлено и убрано (кольца поверх посадок). */
   compareMarks?: CompareMarks | null;
+  /** Предпросмотр исправления нарушения: куда встанет посадка. */
+  fixPreview?: FixPreviewMark | null;
   /** Слой «где можно сажать»: цветные зоны поверх подосновы. */
   zoneLayers?: ZoneLayers | null;
   /** Посадки плана приглушены (opacity .35), чтобы зоны читались под ними. */
@@ -1515,6 +1548,7 @@ export default function MapView({
   focusRequest,
   fitRequest,
   compareMarks = null,
+  fixPreview = null,
   zoneLayers = null,
   dimPlan = false,
   onMapReady,
@@ -1714,6 +1748,7 @@ export default function MapView({
         />
       )}
       <CompareOverlay marks={compareMarks} />
+      <FixPreviewOverlay mark={fixPreview} />
       <SelectionController
         selectMode={selectMode}
         editsLocked={editsLocked}

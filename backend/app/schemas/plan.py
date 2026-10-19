@@ -235,6 +235,63 @@ class ItemsRespaceResult(BaseModel):
     item_count: int
 
 
+FixKind = Literal["move", "retype", "delete"]
+
+
+class FixPointOut(BaseModel):
+    """Точка в тех же координатах, что и остальная геометрия ответов (WGS84,
+    если СК проекта подтверждена, иначе метры чертежа)."""
+
+    x: float
+    y: float
+
+
+class FixOptionOut(BaseModel):
+    """Один способ исправить нарушение — см. backend/app/services/fix_service.py.
+    Поля вида (`to`/`shift_m`/…, `type`/`valid`/…, `gap_m`) заполнены только у
+    своего `kind`."""
+
+    kind: FixKind
+    # Лучший по мнению сервиса; ставится только когда есть из чего выбирать.
+    recommended: bool = False
+    # move
+    to: FixPointOut | None = None
+    shift_m: float | None = None
+    # Расстояние до нарушенного ограничения после сдвига, м.
+    clearance_m: float | None = None
+    # Остаётся ли посадка в линии своего ряда; None — она не из ряда.
+    keeps_row: bool | None = None
+    # retype
+    type: PlantingType | None = None
+    valid: bool | None = None
+    required_m: float | None = None
+    # delete: пропуск, который останется в ряду, м.
+    gap_m: float | None = None
+
+
+class ItemFixesOut(BaseModel):
+    item_id: str
+    options: list[FixOptionOut]
+
+
+class FixesApplyRequest(BaseModel):
+    """«Исправить все так же»: применить к этим посадкам лучший вариант вида `kind`."""
+
+    ids: list[str] = Field(min_length=1, max_length=500)
+    kind: FixKind
+
+
+class FixesApplyResult(BaseModel):
+    """`previous_items` — снимки прежних посадок (для отмены), `items` — сдвинутые
+    и пересаженные (id прежние; удалённых среди них нет), `skipped_ids` — те, у
+    кого нужного варианта нет; `item_count` — свежее число посадок плана."""
+
+    previous_items: list[GeoJSONFeature]
+    items: list[GeoJSONFeature]
+    skipped_ids: list[str]
+    item_count: int
+
+
 class ItemTypeChange(BaseModel):
     id: str
     planting_type: PlantingType
