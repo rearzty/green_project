@@ -6,9 +6,41 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 
 import { getPlantingNorms, type GeoJSONFeatureCollection, type PlantingNorms } from "@/lib/api";
-import { buildScene3DData, hashToUnit, MAX_3D_ITEMS, type Building3D, type PlantingPoint3D, type Polygon3D } from "@/lib/plan3d";
+import { buildScene3DData, hashToUnit, MAX_3D_ITEMS, walkStops, type Building3D, type PlantingPoint3D, type Polygon3D } from "@/lib/plan3d";
 import { lookOf, type CrownForm, type PlantLook } from "@/lib/plantLook";
-import { SEASON_PALETTES, type Season } from "@/lib/mapStyle";
+import { applySceneTheme, SEASON_PALETTES, type SceneTheme, type Season } from "@/lib/mapStyle";
+import { PLANTING_TYPE_LABELS } from "@/lib/format";
+
+/** Ракурсы камеры (components/map/CameraControls3D.tsx): общий вид, сверху и
+ * обход участков посадок вплотную (`walk-next`/`walk-prev`). */
+export type CameraPose = "overview" | "top" | "walk-next" | "walk-prev";
+
+/** Где камера в обходе: номер участка (с 1) и сколько их всего; 0 — обход не начат. */
+export interface WalkState {
+  index: number;
+  total: number;
+}
+
+/** Камера обхода: за участком, на этом расстоянии по горизонтали и на этой высоте
+ * над землёй. С такой точки видно ~60 м улицы вперёд, а у дерева различим ствол. */
+const WALK_BACK_M = 26;
+const WALK_HEIGHT_M = 13;
+const WALK_TARGET_HEIGHT_M = 2;
+/** Двойной щелчок по земле: подлёт к месту — столько метров от точки, под таким
+ * углом возвышения. */
+const FLY_TO_DISTANCE_M = 30;
+const FLY_TO_ELEVATION = 0.55;
+/** Щелчок по земле дальше этого от любой посадки — в пустоту не летим. */
+const FLY_TO_PLANT_REACH_M = 15;
+/** Ближе этого к цели камера не подходит: ниже уже стена из веток, а дальше
+ * камеры лежит ближняя плоскость отсечения. */
+const MIN_CAMERA_DISTANCE_M = 2;
+
+export interface CameraCommand {
+  pose: CameraPose;
+  /** Растёт с каждым нажатием: повторный выбор того же ракурса — тоже команда. */
+  seq: number;
+}
 
 export interface ThreeDViewProps {
   layers?: GeoJSONFeatureCollection;
@@ -31,6 +63,14 @@ export interface ThreeDViewProps {
    * different, differently-scaled territory) shouldn't inherit one either.
    * Persistence is simply skipped when this is undefined (no project open yet). */
   storageKey?: string;
+  /** Оформление сцены: светлый день или тёмный «Графит» под интерфейс. */
+  sceneTheme?: SceneTheme;
+  /** Перелёт камеры в выбранный ракурс. Не пересобирает сцену. */
+  cameraCommand?: CameraCommand | null;
+  /** Медленный облёт вокруг участка. */
+  autoRotate?: boolean;
+  /** Сообщает, на каком участке обхода камера (для подписи «3 из 24»). */
+  onWalkChange?: (state: WalkState) => void;
 }
 
 // Ground stacked in thin slabs (territory, then road/greenery/lawn on top)
@@ -370,6 +410,7 @@ function buildPlants(points: PlantingPoint3D[], plantingType: "tree" | "shrub", 
     mesh.instanceMatrix.needsUpdate = true;
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     mesh.userData.castShadow = true;
+    mesh.userData.entries = trunked;
     objects.push(mesh);
   }
 
@@ -398,10 +439,38 @@ function buildPlants(points: PlantingPoint3D[], plantingType: "tree" | "shrub", 
     mesh.instanceMatrix.needsUpdate = true;
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     mesh.userData.castShadow = true;
+    mesh.userData.entries = entries;
     objects.push(mesh);
   }
   return objects;
 }
+
+/** Что показывает подсказка при наведении на дерево или куст. Размер кроны —
+ * данные плана; высота — оценка по породе (см. plantLook.ts), и подпись «≈» это
+ * прямо говорит. */
+interface PlantHover {
+  x: number;
+  y: number;
+  title: string;
+  subtitle: string;
+}
+
+function plantHoverText(entry: PlantEntry, plantingType: "tree" | "shrub"): { title: string; subtitle: string } {
+  const diameter = entry.point.canopyRadius * 2;
+  const height = diameter * entry.look.heightRatio;
+  const fmt = (m: number) => m.toLocaleString("ru-RU", { maximumFractionDigits: 1 });
+  return {
+    title: entry.point.species ?? PLANTING_TYPE_LABELS[plantingType],
+    subtitle: `${PLANTING_TYPE_LABELS[plantingType]} · крона ${fmt(diameter)} м · высота ≈ ${fmt(height)} м`,
+  };
+}
+
+/** Подсказки не считаются на очень больших планах: луч проверяет каждый экземпляр
+ * (в three у InstancedMesh нет пространственного индекса), а подсказка — удобство,
+ * не повод ронять частоту кадров. */
+const HOVER_INSTANCE_LIMIT = 60_000;
+const HOVER_DELAY_MS = 90;
+const FLIGHT_MS = 900;
 
 /** Небо — вертикальный градиент канвас-текстурой как `scene.background`, а не
  * шейдерная сфера: сфера с собственным ShaderMaterial уже пробовалась и под
@@ -466,8 +535,18 @@ function saveStoredCamera(key: string, position: THREE.Vector3, target: THREE.Ve
  * lib/plan3d.ts for how the GeoJSON is turned into local-meter geometry
  * (including what's deliberately left out -- zoning, utilities, real
  * building heights we don't have). */
-export default function ThreeDView({ layers, plan, crsVerified, season = "summer", storageKey }: ThreeDViewProps) {
+export default function ThreeDView({ layers, plan, crsVerified, season = "summer", storageKey, sceneTheme = "day", cameraCommand = null, autoRotate = false, onWalkChange }: ThreeDViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const [hover, setHover] = useState<PlantHover | null>(null);
+  // Что нужно командам камеры и облёту, чтобы не пересобирать сцену ради них:
+  // эффект сцены кладёт сюда живые камеру и управление.
+  const viewRef = useRef<{ flyTo: (pose: CameraPose) => void; controls: OrbitControls } | null>(null);
+  const autoRotateRef = useRef(autoRotate);
+  autoRotateRef.current = autoRotate;
+  // Колбэк живёт дольше рендера (его зовёт обработчик внутри эффекта сцены) —
+  // через реф, чтобы не пересобирать сцену из-за новой функции на каждый рендер.
+  const onWalkChangeRef = useRef(onWalkChange);
+  onWalkChangeRef.current = onWalkChange;
   const [norms, setNorms] = useState<PlantingNorms | undefined>(undefined);
   // Distinct from `norms` itself being set -- without this, the very first
   // render (before the fetch below resolves) would already have `data`
@@ -511,7 +590,7 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     if (!container || !data || overItemLimit) return;
 
     const disposables: Disposable[] = [];
-    const palette = SEASON_PALETTES[season];
+    const palette = applySceneTheme(SEASON_PALETTES[season], sceneTheme);
 
     const scene = new THREE.Scene();
     // A flat per-season sky color, not a gradient sphere: a custom
@@ -546,16 +625,22 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.1;
+    // Колесо приближает к тому, что под курсором, а не к центру участка: на улице
+    // в километр иначе к нужному дереву не подойти без долгой панорамы.
+    controls.zoomToCursor = true;
+    // Под землю не заглянуть: у «пола» сцены нет нижней грани.
+    controls.maxPolarAngle = Math.PI / 2 - 0.03;
 
     // A hemisphere light (sky color from above, lawn's own seasonal tone
     // bouncing from below) instead of a flat AmbientLight -- costs nothing
     // extra (still a single Light object) but reads as outdoor daylight
     // rather than a uniform studio fill, and ties naturally into the same
     // per-season palette everything else here already uses.
-    scene.add(new THREE.HemisphereLight(new THREE.Color(palette.skyBottom), new THREE.Color(palette.lawn), 1.5));
+    const graphite = sceneTheme === "graphite";
+    scene.add(new THREE.HemisphereLight(new THREE.Color(graphite ? "#8fa0b5" : palette.skyBottom), new THREE.Color(palette.lawn), graphite ? 1.0 : 1.5));
     // Силы света подобраны под физически корректное освещение three (после r155
     // интенсивность 1 — заметно темнее прежнего «условного» света).
-    const sun = new THREE.DirectionalLight(0xfff4e0, 2.4);
+    const sun = new THREE.DirectionalLight(sceneTheme === "graphite" ? 0xe3ecff : 0xfff4e0, sceneTheme === "graphite" ? 2.0 : 2.4);
     scene.add(sun);
     scene.add(sun.target);
 
@@ -607,7 +692,7 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     // silently clipping the entire scene at once (found live: objects
     // vanished when zoomed out far enough). Bounding maxDistance well under
     // camera.far means that can't happen regardless of territory size.
-    controls.minDistance = Math.max(diagonal * 0.01, camera.near);
+    controls.minDistance = MIN_CAMERA_DISTANCE_M;
     controls.maxDistance = diagonal * 2.5;
     camera.updateProjectionMatrix();
     controls.update();
@@ -671,16 +756,26 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
       if (mesh) scene.add(mesh);
     }
 
+    // Здания — ещё и преграда для луча двойного щелчка (иначе луч уходил сквозь
+    // стену в землю за домом и камера подлетала к стене).
+    const buildingMeshes: THREE.Mesh[] = [];
     for (const building of data.buildings) {
-      const mesh = buildingMesh(building, BUILDING_ROOF_COLOR, TERRITORY_DEPTH_M, disposables);
+      const mesh = buildingMesh(building, graphite ? "#5b615c" : BUILDING_ROOF_COLOR, TERRITORY_DEPTH_M, disposables);
       if (mesh) {
         mesh.userData.castShadow = true;
         scene.add(mesh);
+        buildingMeshes.push(mesh);
       }
     }
 
-    for (const object of buildPlants(data.trees, "tree", season, disposables)) scene.add(object);
-    for (const object of buildPlants(data.shrubs, "shrub", season, disposables)) scene.add(object);
+    // Деревья и кусты, по которым наводится подсказка: меши с `userData.entries`.
+    const plantMeshes: { mesh: THREE.InstancedMesh; plantingType: "tree" | "shrub" }[] = [];
+    for (const [points, plantingType] of [[data.trees, "tree"], [data.shrubs, "shrub"]] as const) {
+      for (const object of buildPlants(points, plantingType, season, disposables)) {
+        scene.add(object);
+        if (object instanceof THREE.InstancedMesh) plantMeshes.push({ mesh: object, plantingType });
+      }
+    }
 
     // Тени: принимает всё, отбрасывают здания и растения (userData.castShadow).
     scene.traverse((object) => {
@@ -704,9 +799,161 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     const resizeObserver = new ResizeObserver(resize);
     resizeObserver.observe(container);
 
+    // --- ракурсы камеры -------------------------------------------------
+    // Общий вид — тот же кадр, что и при первой загрузке; «сверху» — почти
+    // отвесно (небольшой наклон, чтобы OrbitControls не терял ось «вверх»).
+    // Обход — вплотную к участкам посадок, см. walkPose.
+    const poseOf = (pose: CameraPose): { position: THREE.Vector3; target: THREE.Vector3 } => {
+      if (pose === "top") {
+        return { position: new THREE.Vector3(centerX, diagonal * 1.05, -centerY + diagonal * 0.02), target: new THREE.Vector3(centerX, 0, -centerY) };
+      }
+      return {
+        position: new THREE.Vector3(centerX + cameraDistance, cameraDistance * 0.7 + (bounds?.maxBuildingHeight ?? 0), -centerY + cameraDistance),
+        target: new THREE.Vector3(centerX, 0, -centerY),
+      };
+    };
+    const stops = walkStops([...data.trees, ...data.shrubs]);
+    let walkIndex = -1;
+    const walkPose = (index: number): { position: THREE.Vector3; target: THREE.Vector3 } => {
+      const stop = stops[index];
+      return {
+        target: new THREE.Vector3(stop.x, WALK_TARGET_HEIGHT_M, -stop.y),
+        // Камера за участком, лицом по ходу движения; ось z сцены — минус y плана.
+        position: new THREE.Vector3(stop.x - stop.heading[0] * WALK_BACK_M, WALK_HEIGHT_M, -(stop.y - stop.heading[1] * WALK_BACK_M)),
+      };
+    };
+    onWalkChangeRef.current?.({ index: 0, total: stops.length });
+    let flight: { fromPosition: THREE.Vector3; fromTarget: THREE.Vector3; toPosition: THREE.Vector3; toTarget: THREE.Vector3; startedAt: number } | null = null;
+    viewRef.current = {
+      controls,
+      flyTo(pose) {
+        let next: { position: THREE.Vector3; target: THREE.Vector3 };
+        if (pose === "walk-next" || pose === "walk-prev") {
+          if (stops.length === 0) return;
+          // Первое нажатие «вперёд» — первый участок, «назад» — последний; дальше по кругу.
+          walkIndex = walkIndex < 0 ? (pose === "walk-next" ? 0 : stops.length - 1) : (walkIndex + (pose === "walk-next" ? 1 : -1) + stops.length) % stops.length;
+          onWalkChangeRef.current?.({ index: walkIndex + 1, total: stops.length });
+          next = walkPose(walkIndex);
+        } else {
+          walkIndex = -1;
+          onWalkChangeRef.current?.({ index: 0, total: stops.length });
+          next = poseOf(pose);
+        }
+        flight = { fromPosition: camera.position.clone(), fromTarget: controls.target.clone(), toPosition: next.position, toTarget: next.target, startedAt: performance.now() };
+      },
+    };
+    controls.autoRotate = autoRotateRef.current;
+    controls.autoRotateSpeed = 1.2;
+
+    // --- двойной щелчок: подлететь к месту ------------------------------------
+    // Точка — первое растение или здание под курсором, а если там пусто, то земля (плоскость
+    // y=0). Азимут взгляда сохраняется: пользователь не теряет, где у него север,
+    // меняются только расстояние и наклон. Ближайший участок обхода становится
+    // текущим, чтобы ‹ › продолжили путь оттуда, где человек оказался.
+    const ground = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    const flyRaycaster = new THREE.Raycaster();
+    const flyPointer = new THREE.Vector2();
+    const handleDoubleClick = (event: MouseEvent) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      flyPointer.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
+      flyRaycaster.setFromCamera(flyPointer, camera);
+      // На очень больших планах растения под курсором не ищем (как и в подсказке): луч проверяет каждый экземпляр.
+      const candidates: THREE.Object3D[] = [...buildingMeshes];
+      if (plantInstances <= HOVER_INSTANCE_LIMIT) candidates.push(...plantMeshes.map(({ mesh }) => mesh));
+      const solidHit = flyRaycaster.intersectObjects(candidates, false)[0];
+      const point = solidHit ? solidHit.point.clone() : flyRaycaster.ray.intersectPlane(ground, new THREE.Vector3());
+      if (!point) return; // луч ушёл в небо
+      point.y = Math.min(Math.max(point.y, 0), WALK_TARGET_HEIGHT_M);
+      let nearest = -1;
+      let nearestDistance = Infinity;
+      stops.forEach((stop, index) => {
+        const d = Math.hypot(stop.x - point.x, -stop.y - point.z);
+        if (d < nearestDistance) {
+          nearestDistance = d;
+          nearest = index;
+        }
+      });
+      // Щёлкнули по пустой земле вдали от посадок: лететь в пустоту незачем —
+      // подлетаем к ближайшему участку с посадками. «Вдали» меряем до ближайшей
+      // самой посадки, а не до центра участка: участок в 40 м, и до его центра от
+      // крайних кустов бывает далеко.
+      let nearestPlantSq = Infinity;
+      for (const list of [data.trees, data.shrubs]) {
+        for (const plant of list) {
+          const dx = plant.x - point.x;
+          const dz = -plant.y - point.z;
+          const d2 = dx * dx + dz * dz;
+          if (d2 < nearestPlantSq) nearestPlantSq = d2;
+        }
+      }
+      if (!solidHit && nearest >= 0 && nearestPlantSq > FLY_TO_PLANT_REACH_M * FLY_TO_PLANT_REACH_M) {
+        walkIndex = nearest;
+        onWalkChangeRef.current?.({ index: nearest + 1, total: stops.length });
+        const target = walkPose(nearest);
+        flight = { fromPosition: camera.position.clone(), fromTarget: controls.target.clone(), toPosition: target.position, toTarget: target.target, startedAt: performance.now() };
+        return;
+      }
+      const away = new THREE.Vector3(camera.position.x - controls.target.x, 0, camera.position.z - controls.target.z);
+      if (away.lengthSq() < 1e-6) away.set(1, 0, 1);
+      away.normalize();
+      const distance = Math.max(Math.min(FLY_TO_DISTANCE_M, camera.position.distanceTo(point)), 6);
+      const toPosition = point.clone().addScaledVector(away, distance * Math.cos(FLY_TO_ELEVATION));
+      toPosition.y += distance * Math.sin(FLY_TO_ELEVATION);
+      flight = { fromPosition: camera.position.clone(), fromTarget: controls.target.clone(), toPosition, toTarget: point, startedAt: performance.now() };
+      if (nearest >= 0) {
+        walkIndex = nearest;
+        onWalkChangeRef.current?.({ index: nearest + 1, total: stops.length });
+      }
+    };
+    renderer.domElement.addEventListener("dblclick", handleDoubleClick);
+
+    // --- подсказка при наведении на дерево/куст ----------------------------
+    const plantInstances = plantMeshes.reduce((sum, { mesh }) => sum + mesh.count, 0);
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    let hoverTimer: ReturnType<typeof setTimeout> | undefined;
+    const handlePointerMove = (event: PointerEvent) => {
+      clearTimeout(hoverTimer);
+      // Тянут камеру или облёт идёт — подсказка не нужна и мешала бы.
+      if (event.buttons !== 0 || controls.autoRotate) {
+        setHover(null);
+        return;
+      }
+      if (plantInstances > HOVER_INSTANCE_LIMIT) return;
+      const rect = renderer.domElement.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      hoverTimer = setTimeout(() => {
+        pointer.set((x / rect.width) * 2 - 1, -(y / rect.height) * 2 + 1);
+        raycaster.setFromCamera(pointer, camera);
+        const hit = raycaster.intersectObjects(plantMeshes.map(({ mesh }) => mesh), false)[0];
+        const entry = hit && hit.instanceId !== undefined ? (hit.object.userData.entries as PlantEntry[] | undefined)?.[hit.instanceId] : undefined;
+        if (!hit || !entry) {
+          setHover(null);
+          return;
+        }
+        const plantingType = plantMeshes.find(({ mesh }) => mesh === hit.object)?.plantingType ?? "tree";
+        setHover({ x, y, ...plantHoverText(entry, plantingType) });
+      }, HOVER_DELAY_MS);
+    };
+    const hideHover = () => {
+      clearTimeout(hoverTimer);
+      setHover(null);
+    };
+    renderer.domElement.addEventListener("pointermove", handlePointerMove);
+    renderer.domElement.addEventListener("pointerleave", hideHover);
+    renderer.domElement.addEventListener("pointerdown", hideHover);
+
     let frameId = 0;
     const animate = () => {
       frameId = requestAnimationFrame(animate);
+      if (flight) {
+        const k = Math.min((performance.now() - flight.startedAt) / FLIGHT_MS, 1);
+        const eased = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+        camera.position.lerpVectors(flight.fromPosition, flight.toPosition, eased);
+        controls.target.lerpVectors(flight.fromTarget, flight.toTarget, eased);
+        if (k >= 1) flight = null;
+      }
       controls.update();
       renderer.render(scene, camera);
     };
@@ -715,6 +962,13 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     return () => {
       cancelAnimationFrame(frameId);
       clearTimeout(saveTimeout);
+      clearTimeout(hoverTimer);
+      renderer.domElement.removeEventListener("dblclick", handleDoubleClick);
+      renderer.domElement.removeEventListener("pointermove", handlePointerMove);
+      renderer.domElement.removeEventListener("pointerleave", hideHover);
+      renderer.domElement.removeEventListener("pointerdown", hideHover);
+      viewRef.current = null;
+      setHover(null);
       controls.removeEventListener("change", handleControlsChange);
       resizeObserver.disconnect();
       controls.dispose();
@@ -728,7 +982,18 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
       if (renderer.domElement.parentNode === container) container.removeChild(renderer.domElement);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- overItemLimit is derived from `data`, not an independent input
-  }, [data, overItemLimit, season, storageKey]);
+  }, [data, overItemLimit, season, sceneTheme, storageKey]);
+
+  // Команда ракурса: перелёт без пересборки сцены. seq в зависимостях — повторное
+  // нажатие того же ракурса тоже должно сработать.
+  useEffect(() => {
+    if (cameraCommand) viewRef.current?.flyTo(cameraCommand.pose);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cameraCommand?.seq]);
+  useEffect(() => {
+    if (viewRef.current) viewRef.current.controls.autoRotate = autoRotate;
+    if (autoRotate) setHover(null);
+  }, [autoRotate]);
 
   if (!plan) {
     return <div className="flex h-full w-full items-center justify-center text-sm text-stone-500">Нет плана для 3D-просмотра.</div>;
@@ -740,5 +1005,19 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
       </div>
     );
   }
-  return <div ref={containerRef} className="h-full w-full" />;
+  return (
+    <div className="relative h-full w-full">
+      <div ref={containerRef} className="h-full w-full" />
+      {hover && (
+        <div
+          role="tooltip"
+          style={{ left: Math.min(hover.x + 14, (containerRef.current?.clientWidth ?? 9999) - 250), top: hover.y + 14 }}
+          className="pointer-events-none absolute z-10 w-[240px] rounded-lg border border-gp-border bg-gp-float px-3 py-2 text-gp-text shadow-[0_10px_28px_rgba(0,0,0,.45)]"
+        >
+          <p className="m-0 text-sm font-medium">{hover.title}</p>
+          <p className="m-0 mt-0.5 text-xs text-gp-text-2">{hover.subtitle}</p>
+        </div>
+      )}
+    </div>
+  );
 }

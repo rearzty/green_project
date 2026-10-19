@@ -309,3 +309,134 @@ export function buildScene3DData(
     bounds,
   };
 }
+
+/** Главная ось облака точек (посадки вдоль улицы): центр, направление и
+ * протяжённость по ней. Нужна для ракурса «вровень с землёй» — идти надо вдоль
+ * улицы, а не вдоль осей экрана (улица редко лежит ровно с запада на восток).
+ * Метод главных компонент для двух координат: угол оси — ½·atan2(2·sxy, sxx−syy),
+ * без разложения матрицы. Точек не больше `MAX_AXIS_SAMPLE` (равномерно по списку):
+ * на ось плана в сотни тысяч посадок хватает пяти тысяч. */
+const MAX_AXIS_SAMPLE = 5000;
+
+export interface PrincipalAxis {
+  mean: [number, number];
+  /** Единичный вектор оси в тех же координатах (x — на восток, y — на север). */
+  direction: [number, number];
+  /** Положение крайних точек вдоль оси относительно центра: tMin ≤ 0 ≤ tMax. */
+  tMin: number;
+  tMax: number;
+}
+
+export function principalAxis(points: { x: number; y: number }[]): PrincipalAxis | null {
+  if (points.length < 2) return null;
+  const step = Math.max(1, Math.floor(points.length / MAX_AXIS_SAMPLE));
+  const sample: { x: number; y: number }[] = [];
+  for (let i = 0; i < points.length; i += step) sample.push(points[i]);
+  const n = sample.length;
+  const meanX = sample.reduce((sum, p) => sum + p.x, 0) / n;
+  const meanY = sample.reduce((sum, p) => sum + p.y, 0) / n;
+  let sxx = 0;
+  let syy = 0;
+  let sxy = 0;
+  for (const p of sample) {
+    const dx = p.x - meanX;
+    const dy = p.y - meanY;
+    sxx += dx * dx;
+    syy += dy * dy;
+    sxy += dx * dy;
+  }
+  const angle = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+  const direction: [number, number] = [Math.cos(angle), Math.sin(angle)];
+  let tMin = 0;
+  let tMax = 0;
+  for (const p of sample) {
+    const t = (p.x - meanX) * direction[0] + (p.y - meanY) * direction[1];
+    if (t < tMin) tMin = t;
+    if (t > tMax) tMax = t;
+  }
+  return { mean: [meanX, meanY], direction, tMin, tMax };
+}
+
+/** Остановка «обхода»: участок посадок, к которому камера подлетает вплотную. */
+export interface WalkStop {
+  /** Центр посадок участка, метры сцены. */
+  x: number;
+  y: number;
+  /** Куда смотреть: единичный вектор в сторону следующего участка. */
+  heading: [number, number];
+  count: number;
+}
+
+/** Размер участка обхода, м: ряд деревьев на таком отрезке виден целиком и
+ * достаточно крупно, чтобы различить породы и кусты. */
+export const WALK_CELL_M = 40;
+/** Участок, где меньше стольких посадок, — не остановка, а случайный куст. */
+const WALK_MIN_PLANTS = 3;
+/** Дальше этого (в размерах участка) до соседа — это уже другая улица, а не
+ * продолжение пути: смотреть «вперёд» туда нечего. */
+const WALK_CONNECTED_CELLS = 2.2;
+
+/** Остановки обхода в порядке движения: посадки делятся на участки сеткой,
+ * путь идёт от конца улицы по ближайшему непосещённому участку. Сетка, а не
+ * ломаная по оси улицы: улицы бывают Г-образными и разветвлёнными, и одна ось
+ * (principalAxis) на них проходит мимо самих посадок. Для ветвления «ближайший
+ * непосещённый» вернётся в ответвление позже — путь не оптимальный, но каждый
+ * участок с посадками встречается ровно один раз. */
+export function walkStops(points: { x: number; y: number }[], cellM: number = WALK_CELL_M): WalkStop[] {
+  const cells = new Map<string, { sx: number; sy: number; n: number }>();
+  for (const p of points) {
+    const key = `${Math.floor(p.x / cellM)}:${Math.floor(p.y / cellM)}`;
+    const cell = cells.get(key);
+    if (cell) {
+      cell.sx += p.x;
+      cell.sy += p.y;
+      cell.n += 1;
+    } else {
+      cells.set(key, { sx: p.x, sy: p.y, n: 1 });
+    }
+  }
+  const remaining = [...cells.values()].filter((cell) => cell.n >= WALK_MIN_PLANTS).map((cell) => ({ x: cell.sx / cell.n, y: cell.sy / cell.n, count: cell.n }));
+  if (remaining.length === 0) return [];
+
+  // Начало — конец улицы по главной оси посадок.
+  const axis = principalAxis(points);
+  let startIndex = 0;
+  if (axis) {
+    let best = Infinity;
+    remaining.forEach((cell, index) => {
+      const t = (cell.x - axis.mean[0]) * axis.direction[0] + (cell.y - axis.mean[1]) * axis.direction[1];
+      if (t < best) {
+        best = t;
+        startIndex = index;
+      }
+    });
+  }
+  const ordered: { x: number; y: number; count: number }[] = [remaining.splice(startIndex, 1)[0]];
+  while (remaining.length > 0) {
+    const last = ordered[ordered.length - 1];
+    let nearest = 0;
+    let nearestDistance = Infinity;
+    remaining.forEach((cell, index) => {
+      const distance = Math.hypot(cell.x - last.x, cell.y - last.y);
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearest = index;
+      }
+    });
+    ordered.push(remaining.splice(nearest, 1)[0]);
+  }
+
+  const unit = (dx: number, dy: number): [number, number] | null => {
+    const length = Math.hypot(dx, dy);
+    return length > 1e-6 ? [dx / length, dy / length] : null;
+  };
+  const fallback: [number, number] = axis ? axis.direction : [0, 1];
+  return ordered.map((cell, index) => {
+    const next = ordered[index + 1];
+    const previous = ordered[index - 1];
+    let heading: [number, number] | null = null;
+    if (next && Math.hypot(next.x - cell.x, next.y - cell.y) <= cellM * WALK_CONNECTED_CELLS) heading = unit(next.x - cell.x, next.y - cell.y);
+    if (!heading && previous && Math.hypot(cell.x - previous.x, cell.y - previous.y) <= cellM * WALK_CONNECTED_CELLS) heading = unit(cell.x - previous.x, cell.y - previous.y);
+    return { x: cell.x, y: cell.y, heading: heading ?? fallback, count: cell.count };
+  });
+}

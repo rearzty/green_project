@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { LAYERS_ICON } from "@/components/map/icons";
-import { SEASON_LABELS, type LayerLegendEntry, type Season } from "@/lib/mapStyle";
+import { SCENE_THEME_LABELS, SEASON_LABELS, type LayerLegendEntry, type SceneTheme, type Season } from "@/lib/mapStyle";
 import { cn } from "@/lib/utils";
 
 export interface ViewControlsProps {
@@ -19,10 +19,12 @@ export interface ViewControlsProps {
   hasPlan: boolean;
   season: Season;
   onSeasonChange: (season: Season) => void;
+  sceneTheme: SceneTheme;
+  onSceneThemeChange: (theme: SceneTheme) => void;
 }
 
 /** Правый верхний угол карты: переключатель 2D/3D и «Слои» с поповером
- * (слои чертежа, «Сгенерированный план», а в 3D — сезоны). */
+ * (в 3D сверху — сезон и оформление сцены, ниже слои чертежа и «Сгенерированный план»). */
 export function ViewControls({
   view3d,
   canShow3d,
@@ -35,6 +37,8 @@ export function ViewControls({
   hasPlan,
   season,
   onSeasonChange,
+  sceneTheme,
+  onSceneThemeChange,
 }: ViewControlsProps) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -98,6 +102,43 @@ export function ViewControls({
             aria-label="Слои"
             className="gp-menu absolute right-0 top-[46px] max-h-[min(70vh,34rem)] w-72 overflow-y-auto rounded-lg border border-gp-border bg-gp-panel py-1.5 shadow-xl"
           >
+            {view3d && (
+              <>
+                <p className="px-3 pb-1.5 pt-1 text-[13px] font-medium text-gp-text-2">Сезон</p>
+                <div className="grid grid-cols-4 gap-1 px-3 pb-1.5">
+                  {(Object.keys(SEASON_LABELS) as Season[]).map((s) => (
+                    <button
+                      key={s}
+                      onClick={() => onSeasonChange(s)}
+                      aria-pressed={season === s}
+                      className={cn(
+                        "h-8 rounded-md border text-xs font-medium",
+                        season === s ? "border-gp-accent-soft-border bg-gp-accent-soft text-gp-text" : "border-gp-border text-gp-text-2 hover:bg-gp-hover"
+                      )}
+                    >
+                      {SEASON_LABELS[s]}
+                    </button>
+                  ))}
+                </div>
+                <p className="px-3 pb-1.5 pt-1 text-[13px] font-medium text-gp-text-2">Сцена</p>
+                <div className="grid grid-cols-2 gap-1 px-3 pb-1.5">
+                  {(Object.keys(SCENE_THEME_LABELS) as SceneTheme[]).map((theme) => (
+                    <button
+                      key={theme}
+                      onClick={() => onSceneThemeChange(theme)}
+                      aria-pressed={sceneTheme === theme}
+                      className={cn(
+                        "h-8 rounded-md border text-xs font-medium",
+                        sceneTheme === theme ? "border-gp-accent-soft-border bg-gp-accent-soft text-gp-text" : "border-gp-border text-gp-text-2 hover:bg-gp-hover"
+                      )}
+                    >
+                      {SCENE_THEME_LABELS[theme]}
+                    </button>
+                  ))}
+                </div>
+                <div className="my-1 border-t border-gp-line" />
+              </>
+            )}
             {hasPlan && (
               <label className="flex min-h-10 cursor-pointer items-center gap-3 px-3 text-sm text-gp-text hover:bg-gp-hover">
                 <input type="checkbox" checked={showPlan} onChange={(e) => onToggleShowPlan(e.target.checked)} className="h-4 w-4 accent-gp-accent" />
@@ -125,27 +166,6 @@ export function ViewControls({
                     </li>
                   ))}
                 </ul>
-              </>
-            )}
-            {view3d && (
-              <>
-                <div className="my-1 border-t border-gp-line" />
-                <p className="px-3 pb-1.5 pt-1 text-[13px] font-medium text-gp-text-2">Сезон</p>
-                <div className="grid grid-cols-4 gap-1 px-3 pb-1.5">
-                  {(Object.keys(SEASON_LABELS) as Season[]).map((s) => (
-                    <button
-                      key={s}
-                      onClick={() => onSeasonChange(s)}
-                      aria-pressed={season === s}
-                      className={cn(
-                        "h-8 rounded-md border text-xs font-medium",
-                        season === s ? "border-gp-accent-soft-border bg-gp-accent-soft text-gp-text" : "border-gp-border text-gp-text-2 hover:bg-gp-hover"
-                      )}
-                    >
-                      {SEASON_LABELS[s]}
-                    </button>
-                  ))}
-                </div>
               </>
             )}
             {!hasPlan && layerLegend.length === 0 && <p className="px-3 py-2 text-[13px] text-gp-text-3">Слоёв пока нет — загрузите чертёж.</p>}

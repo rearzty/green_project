@@ -72,6 +72,43 @@ export const SEASON_PALETTES: Record<Season, SeasonPalette> = {
   },
 };
 
+/** Оформление сцены 3D: «День» — светлое небо и поверхности по сезону (как было),
+ * «Графит» — тёмная сцена под графитовый интерфейс. Сезон при этом задаёт то
+ * же, что и раньше — цвета растений и газона, — а тема лишь пересаживает сцену
+ * на тёмный фон: небо, землю, дороги и пол. */
+export type SceneTheme = "day" | "graphite";
+
+export const SCENE_THEME_LABELS: Record<SceneTheme, string> = { day: "День", graphite: "Графит" };
+
+function channel(hex: string, from: number): number {
+  return parseInt(hex.slice(from, from + 2), 16);
+}
+
+/** Смесь двух #rrggbb: 0 — первый цвет, 1 — второй. */
+export function mixHex(a: string, b: string, t: number): string {
+  const mixed = [1, 3, 5].map((from) => Math.round(channel(a, from) + (channel(b, from) - channel(a, from)) * t));
+  return `#${mixed.map((v) => v.toString(16).padStart(2, "0")).join("")}`;
+}
+
+const GRAPHITE = { skyTop: "#141816", skyBottom: "#2a302c", ground: "#444b45", road: "#262a28", pad: "#2a302c", dim: "#1e2220" };
+
+/** Палитра сезона в выбранной теме. Растения не трогаем (их цвет — из
+ * lib/plantLook.ts), а газон и зелень чуть приглушаем: на тёмной земле они
+ * иначе светятся ярче самих деревьев. */
+export function applySceneTheme(palette: SeasonPalette, theme: SceneTheme): SeasonPalette {
+  if (theme === "day") return palette;
+  return {
+    ...palette,
+    skyTop: GRAPHITE.skyTop,
+    skyBottom: GRAPHITE.skyBottom,
+    ground: GRAPHITE.ground,
+    road: GRAPHITE.road,
+    pad: GRAPHITE.pad,
+    lawn: mixHex(palette.lawn, GRAPHITE.dim, 0.3),
+    greenery: mixHex(palette.greenery, GRAPHITE.dim, 0.35),
+  };
+}
+
 /** The shape the "Слои" popover (components/LayersPopover.tsx) renders one row from -- now filled by
  * layer_raster.py's own grouping (api.ts::LayersRasterGroup, a structural
  * superset of this with a `url` field) rather than built here from
