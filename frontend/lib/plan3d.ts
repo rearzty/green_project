@@ -27,6 +27,17 @@ const METERS_PER_DEGREE_LAT = 111_320;
  * ~1M items). */
 export const MAX_3D_ITEMS = 300_000;
 
+/** Сколько окружения оставляем вокруг участка, м. Топоплан снимает весь квартал, а
+ * не только участок работ: за границей лежат тысячи кроп деревьев, чужие дворы и
+ * дороги. На 3D они выглядели как россыпь точек вдали от карты, а ещё раздували
+ * рамку сцены и отодвигали камеру. Полоса оставляет соседние дома и дорогу рядом
+ * (контекст), а дальнее убирает. */
+export const SURROUNDINGS_BAND_M = 40;
+const SURROUNDINGS_CELL_M = 8;
+const SURROUNDINGS_MAX_CELLS_PER_AXIS = 2000;
+const SURROUNDINGS_SAMPLES_PER_POLYGON = 24;
+const SURROUNDINGS_MAX_EDGE_STEPS = 400;
+
 /** Default tree_default/shrub_default.canopy_radius_m from
  * geo_engine/config/planting_norms.yaml, used only if the /api/config
  * fetch hasn't resolved yet or a species_spacing key is missing. */
@@ -120,6 +131,109 @@ export interface Scene3DData {
   shrubs: PlantingPoint3D[];
   totalItemCount: number;
   bounds: Scene3DBounds | null;
+}
+
+/** Проверка «лежит ли объект не дальше `bandM` от участка» — для окружения в 3D.
+ * Участок кладётся на грубую сетку (клетки по 8 м: сама граница отрезками и
+ * внутренность построчной заливкой), сетка расширяется кругом радиуса `bandM`, и
+ * объект остаётся, если хоть одна из его вершин (до 24, равномерно) попала в
+ * помеченную клетку. Точное расстояние до многоугольника здесь не нужно: полоса —
+ * вопрос вкуса, а проход по каждой из сотен тысяч вершин окружения точной
+ * геометрией был бы заметно дороже самой сборки сцены. Участка нет — остаётся всё. */
+export function nearTerritoryFilter(territory: Polygon3D[], bandM: number = SURROUNDINGS_BAND_M): (polygon: Polygon3D) => boolean {
+  const rings = territory.flatMap((p) => [p.outer, ...p.holes]).filter((r) => r.length >= 3);
+  if (rings.length === 0) return () => true;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const ring of rings) {
+    for (const [x, y] of ring) {
+      minX = Math.min(minX, x);
+      maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y);
+      maxY = Math.max(maxY, y);
+    }
+  }
+  // Клетка растёт, если участок огромен, — сетка не должна превращаться в гигабайт.
+  const cell = Math.max(SURROUNDINGS_CELL_M, (maxX - minX + 2 * bandM) / SURROUNDINGS_MAX_CELLS_PER_AXIS, (maxY - minY + 2 * bandM) / SURROUNDINGS_MAX_CELLS_PER_AXIS);
+  const x0 = minX - bandM - cell;
+  const y0 = minY - bandM - cell;
+  const cols = Math.ceil((maxX - minX + 2 * bandM) / cell) + 3;
+  const rowsN = Math.ceil((maxY - minY + 2 * bandM) / cell) + 3;
+  const solid = new Uint8Array(cols * rowsN);
+  const col = (x: number) => Math.floor((x - x0) / cell);
+  const row = (y: number) => Math.floor((y - y0) / cell);
+
+  // Граница: клетки вдоль каждого ребра.
+  for (const ring of rings) {
+    for (let i = 0; i < ring.length; i++) {
+      const [ax, ay] = ring[i];
+      const [bx, by] = ring[(i + 1) % ring.length];
+      const steps = Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay) / (cell / 2)));
+      for (let k = 0; k <= steps; k++) {
+        const c = col(ax + ((bx - ax) * k) / steps);
+        const r = row(ay + ((by - ay) * k) / steps);
+        if (c >= 0 && c < cols && r >= 0 && r < rowsN) solid[r * cols + c] = 1;
+      }
+    }
+  }
+  // Внутренность: построчно, чётно-нечётное правило по всем кольцам сразу (дыры вычитаются сами).
+  for (let r = 0; r < rowsN; r++) {
+    const y = y0 + (r + 0.5) * cell;
+    const crossings: number[] = [];
+    for (const ring of rings) {
+      for (let i = 0; i < ring.length; i++) {
+        const [ax, ay] = ring[i];
+        const [bx, by] = ring[(i + 1) % ring.length];
+        if (ay > y !== by > y) crossings.push(ax + ((y - ay) * (bx - ax)) / (by - ay));
+      }
+    }
+    crossings.sort((a, b) => a - b);
+    for (let k = 0; k + 1 < crossings.length; k += 2) {
+      const from = Math.max(0, col(crossings[k]));
+      const to = Math.min(cols - 1, col(crossings[k + 1]));
+      for (let c = from; c <= to; c++) solid[r * cols + c] = 1;
+    }
+  }
+  // Полоса: круг радиуса bandM вокруг каждой занятой клетки.
+  const reach = Math.ceil(bandM / cell);
+  const near = new Uint8Array(cols * rowsN);
+  for (let r = 0; r < rowsN; r++) {
+    for (let c = 0; c < cols; c++) {
+      if (!solid[r * cols + c]) continue;
+      for (let dr = -reach; dr <= reach; dr++) {
+        const rr = r + dr;
+        if (rr < 0 || rr >= rowsN) continue;
+        for (let dc = -reach; dc <= reach; dc++) {
+          const cc = c + dc;
+          if (cc >= 0 && cc < cols && Math.hypot(dr, dc) * cell <= bandM + cell) near[rr * cols + cc] = 1;
+        }
+      }
+    }
+  }
+  const isNear = (x: number, y: number) => {
+    const c = col(x);
+    const r = row(y);
+    return c >= 0 && c < cols && r >= 0 && r < rowsN && near[r * cols + c] === 1;
+  };
+  return (polygon) => {
+    const ring = polygon.outer;
+    if (ring.length === 0) return false;
+    // Не только вершины: длинная прямая дорога может состоять из четырёх вершин
+    // далеко по краям и при этом пересекать участок посередине — точки берутся и
+    // вдоль рёбер, с шагом в клетку.
+    const stride = Math.max(1, Math.floor(ring.length / SURROUNDINGS_SAMPLES_PER_POLYGON));
+    for (let i = 0; i < ring.length; i += stride) {
+      const [ax, ay] = ring[i];
+      const [bx, by] = ring[(i + 1) % ring.length];
+      const steps = Math.min(SURROUNDINGS_MAX_EDGE_STEPS, Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay) / cell)));
+      for (let k = 0; k < steps; k++) {
+        if (isNear(ax + ((bx - ax) * k) / steps, ay + ((by - ay) * k) / steps)) return true;
+      }
+    }
+    return false;
+  };
 }
 
 /** Raw (lon, lat) rings for every polygon in a Polygon or MultiPolygon
@@ -261,6 +375,12 @@ export function buildScene3DData(
     else if (props.object_type === "existing_greenery") existingGreenery.push(...polygons);
   }
 
+  // Окружение — только в полосе вокруг участка (см. SURROUNDINGS_BAND_M).
+  const inBand = nearTerritoryFilter(territory);
+  const nearBuildings = buildings.filter(inBand);
+  const nearRoads = roads.filter(inBand);
+  const nearGreenery = existingGreenery.filter(inBand);
+
   const lawns: Polygon3D[] = [];
   const trees: PlantingPoint3D[] = [];
   const shrubs: PlantingPoint3D[] = [];
@@ -288,20 +408,20 @@ export function buildScene3DData(
   }
 
   let bounds: Scene3DBounds | null = null;
-  const allOuterRings = [...territory, ...buildings, ...roads, ...existingGreenery, ...lawns].map((p) => p.outer);
+  const allOuterRings = [...territory, ...nearBuildings, ...nearRoads, ...nearGreenery, ...lawns].map((p) => p.outer);
   const allPoints = [...trees, ...shrubs].map((p): [number, number] => [p.x, p.y]);
   if (allOuterRings.some((ring) => ring.length > 0) || allPoints.length > 0) {
     bounds = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity, maxBuildingHeight: 0 };
     allOuterRings.forEach((ring) => extendBounds(bounds!, ring));
     extendBounds(bounds, allPoints);
-    bounds.maxBuildingHeight = buildings.reduce((max, b) => Math.max(max, b.height), 0);
+    bounds.maxBuildingHeight = nearBuildings.reduce((max, b) => Math.max(max, b.height), 0);
   }
 
   return {
     territory,
-    buildings,
-    roads,
-    existingGreenery,
+    buildings: nearBuildings,
+    roads: nearRoads,
+    existingGreenery: nearGreenery,
     lawns,
     trees,
     shrubs,
@@ -439,4 +559,44 @@ export function walkStops(points: { x: number; y: number }[], cellM: number = WA
     if (!heading && previous && Math.hypot(cell.x - previous.x, cell.y - previous.y) <= cellM * WALK_CONNECTED_CELLS) heading = unit(cell.x - previous.x, cell.y - previous.y);
     return { x: cell.x, y: cell.y, heading: heading ?? fallback, count: cell.count };
   });
+}
+
+/** Точка внутри кольца — чётно-нечётное правило (луч вправо). */
+export function pointInRing(x: number, y: number, ring: [number, number][]): boolean {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i];
+    const [xj, yj] = ring[j];
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+/** «Стена» для хождения от первого лица: точка внутри контура любого здания.
+ * Сначала по габаритной рамке (массивом, без обращения к вершинам), потом точно —
+ * зданий в сцене сотни-тысячи, а проверка идёт на каждом кадре движения. */
+export function buildingCollider(buildings: { outer: [number, number][] }[]): (x: number, y: number) => boolean {
+  const n = buildings.length;
+  const box = new Float64Array(n * 4);
+  buildings.forEach((b, i) => {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const [x, y] of b.outer) {
+      minX = Math.min(minX, x);
+      maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y);
+      maxY = Math.max(maxY, y);
+    }
+    box.set([minX, minY, maxX, maxY], i * 4);
+  });
+  return (x, y) => {
+    for (let i = 0; i < n; i++) {
+      const k = i * 4;
+      if (x < box[k] || x > box[k + 2] || y < box[k + 1] || y > box[k + 3]) continue;
+      if (pointInRing(x, y, buildings[i].outer)) return true;
+    }
+    return false;
+  };
 }
