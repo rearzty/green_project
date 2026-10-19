@@ -211,3 +211,88 @@ class TestApplyFixes:
         apply_fixes(plan, ["a"], "move", None)
 
         assert validate_items(plan.project, plan, ["a"]) == []
+
+
+class TestNearestAllowed:
+    """Alt при перетаскивании: ближайшая допустимая точка вокруг курсора."""
+
+    def test_a_cursor_inside_the_zone_is_pulled_to_its_edge(self):
+        from backend.app.services.fix_service import nearest_allowed
+
+        plan = _scene("fx-alt", LineString([(0, 50), (100, 50)]), rows=[_tree("a", 40, 20.0)])
+
+        found = nearest_allowed(plan, "a", 40.0, 50.5, None)  # курсор в 0,5 м от кабеля: нужно 2 м
+
+        assert found is not None
+        assert found["to"]["y"] == pytest.approx(52.1, abs=0.15) or found["to"]["y"] == pytest.approx(47.9, abs=0.15)
+        assert 1.4 <= found["shift_m"] <= 1.8
+
+    def test_the_answer_passes_the_real_check_when_applied(self):
+        from backend.app.services.fix_service import nearest_allowed
+
+        plan = _scene("fx-alt-check", LineString([(0, 50), (100, 50)]), rows=[_tree("a", 40, 20.0)])
+        found = nearest_allowed(plan, "a", 41.0, 50.2, None)
+        assert found is not None
+        plan.items[0].geometry = shape_to_db(Point(found["to"]["x"], found["to"]["y"]))
+
+        assert _violators(plan) == set()
+
+    def test_no_place_nearby_gives_none(self):
+        from backend.app.services.fix_service import nearest_allowed
+
+        strip = Polygon([(0, 49), (100, 49), (100, 51), (0, 51)])
+        plan = _scene("fx-alt-none", LineString([(0, 50), (100, 50)]), territory=strip, rows=[_tree("a", 50, 50.5)])
+
+        assert nearest_allowed(plan, "a", 50.0, 50.2, None) is None
+
+
+class TestNearbyConstraints:
+    def test_zones_carry_the_norm_for_this_planting_and_the_object(self):
+        from backend.app.services.constraints_service import nearby_constraints
+
+        plan = _scene("nc-basic", LineString([(0, 50), (100, 50)]), rows=[_tree("a", 40, 49.0)])
+
+        result = nearby_constraints(plan, 40.0, 49.0, 15.0, "tree", "a", None)
+
+        cables = [f for f in result["features"] if f["object_type"] == "cable_line"]
+        assert len(cables) == 1 and cables[0]["kind"] == "constraint"
+        assert cables[0]["required_m"] == pytest.approx(2.0)
+        assert cables[0]["zone"]["type"] in ("Polygon", "MultiPolygon")
+
+    def test_the_norm_depends_on_the_planting_type(self):
+        from backend.app.services.constraints_service import nearby_constraints
+
+        plan = _scene("nc-shrub", LineString([(0, 50), (100, 50)]), rows=[_tree("a", 40, 49.0)])
+
+        tree = nearby_constraints(plan, 40.0, 49.0, 15.0, "tree", None, None)["features"]
+        shrub = nearby_constraints(plan, 40.0, 49.0, 15.0, "shrub", None, None)["features"]
+
+        assert tree[0]["required_m"] == pytest.approx(2.0)
+        assert shrub[0]["required_m"] == pytest.approx(0.7), "кусту — мягче: СП 42.13330.2016 табл. 9.1"
+
+    def test_a_neighbouring_tree_brings_its_crown_interval(self):
+        from backend.app.services.constraints_service import nearby_constraints
+
+        plan = _scene("nc-neighbour", None, rows=[_tree("a", 40, 40.0), _tree("n", 43, 40.0)])
+
+        found = nearby_constraints(plan, 40.0, 40.0, 15.0, "tree", "a", None)["features"]
+
+        assert [f["id"] for f in found if f["kind"] == "neighbour"] == ["n"], "саму тянутую посадку за соседа не считаем"
+        assert next(f for f in found if f["kind"] == "neighbour")["required_m"] == pytest.approx(3.0)
+
+    def test_objects_beyond_the_radius_are_left_out(self):
+        from backend.app.services.constraints_service import nearby_constraints
+
+        plan = _scene("nc-far", LineString([(0, 90), (100, 90)]), rows=[_tree("a", 40, 10.0)])
+
+        assert nearby_constraints(plan, 40.0, 10.0, 15.0, "tree", "a", None)["features"] == []
+
+    def test_long_lines_are_cut_to_the_window_around_the_point(self):
+        from backend.app.services.constraints_service import nearby_constraints
+
+        plan = _scene("nc-clip", LineString([(0, 50), (100, 50)]), rows=[_tree("a", 40, 49.0)])
+
+        feature = nearby_constraints(plan, 40.0, 49.0, 15.0, "tree", "a", None)["features"][0]
+        xs = [c[0] for c in feature["geometry"]["coordinates"]]
+
+        assert min(xs) >= 40 - 15 - 2.0 - 1e-6 and max(xs) <= 40 + 15 + 2.0 + 1e-6, "кабель вдоль всего участка в ответ целиком не идёт"

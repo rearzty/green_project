@@ -121,7 +121,8 @@ html {
    сливалась с соседями. Толщину кольца иконка задаёт сама (--gp-ring:
    на мелком кусте 3.5 px съели бы всю точку). Фон перебивает inline-цвет
    иконки, отсюда !important. */
-.gp-plan-marker.gp-violation .gp-plan-dot {
+.gp-plan-marker.gp-violation .gp-plan-dot,
+.gp-plan-marker.gp-drag-violation .gp-plan-dot {
   background: transparent !important;
   border: var(--gp-ring, 3px) solid #ff9351;
   box-shadow:
@@ -235,5 +236,26 @@ html {
   box-shadow: none;
 }
 .leaflet-tooltip.gp-fix-label::before {
+  display: none;
+}
+
+/* Нормы при перетаскивании (MapView.tsx::DragNormsController). Штриховка
+   теплосети — узор из SVG-<defs> того же контроллера (CSS-fill перебивает
+   атрибут Leaflet). Подпись зоны — как подпись предпросмотра исправления. */
+path.gp-zone-hatch {
+  fill: url(#gp-hatch-heat);
+  fill-opacity: 1;
+}
+.leaflet-tooltip.gp-zone-label {
+  background: #1c201e;
+  border: 1px solid #3a403c;
+  border-radius: 6px;
+  color: #eceeea;
+  font-size: 12px;
+  line-height: 16px;
+  padding: 2px 7px;
+  box-shadow: none;
+}
+.leaflet-tooltip.gp-zone-label::before {
   display: none;
 }

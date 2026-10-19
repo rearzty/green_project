@@ -292,6 +292,33 @@ class FixesApplyResult(BaseModel):
     item_count: int
 
 
+class NearbyConstraintOut(BaseModel):
+    """Ограничение рядом с перетаскиваемой посадкой: что это, сколько до него
+    нужно и где оно лежит. Геометрия — в координатах отображения (как всё
+    остальное); расстояние до неё считает клиент на каждом кадре."""
+
+    kind: Literal["constraint", "neighbour"]
+    # Только у соседнего дерева: чтобы не считать за ограничение саму группу, которую тянут.
+    id: str | None = None
+    object_type: str
+    object_label: str
+    required_m: float
+    geometry: GeoJSONGeometry | None = None
+    # Охранная зона: геометрия, раздутая на required_m.
+    zone: GeoJSONGeometry
+
+
+class NearbyConstraintsOut(BaseModel):
+    radius_m: float
+    features: list[NearbyConstraintOut]
+
+
+class NearestAllowedOut(BaseModel):
+    to: FixPointOut
+    # Расстояние от запрошенной точки до допустимой, м.
+    shift_m: float
+
+
 class ItemTypeChange(BaseModel):
     id: str
     planting_type: PlantingType

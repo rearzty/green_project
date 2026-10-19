@@ -511,6 +511,49 @@ export async function applyFixes(projectId: string, planId: string, ids: string[
   return postJson(`/api/projects/${projectId}/plans/${planId}/fixes/apply`, { ids, kind });
 }
 
+// Охранные зоны рядом с точкой — слой, который проступает при перетаскивании
+// посадки (backend/app/services/constraints_service.py).
+
+export interface NearbyConstraint {
+  kind: "constraint" | "neighbour";
+  /** Только у соседнего дерева. */
+  id?: string | null;
+  object_type: string;
+  object_label: string;
+  required_m: number;
+  /** Сам объект (линия сети, полигон здания, точка соседа). */
+  geometry: GeoJSONGeometry | null;
+  /** Его охранная зона — геометрия, раздутая на required_m. */
+  zone: GeoJSONGeometry;
+}
+
+/** Ограничения в `radius` м от точки (x, y) — координаты отображения, как и ответ.
+ * `itemId` — какую посадку тянут: от породы зависят и отступы, и интервал до соседей. */
+export async function getNearbyConstraints(
+  projectId: string,
+  planId: string,
+  query: { x: number; y: number; radius?: number; plantingType: PlantingType; itemId?: string }
+): Promise<NearbyConstraint[]> {
+  const params = new URLSearchParams({ x: String(query.x), y: String(query.y), planting_type: query.plantingType });
+  if (query.radius) params.set("radius", String(query.radius));
+  if (query.itemId) params.set("item_id", query.itemId);
+  const { features } = await request<{ radius_m: number; features: NearbyConstraint[] }>(
+    `/api/projects/${projectId}/plans/${planId}/constraints/near?${params}`
+  );
+  return features;
+}
+
+/** Alt при перетаскивании: ближайшая допустимая точка для посадки, если её
+ * поставить у (x, y). null — рядом места нет (сервер отвечает 404). */
+export async function getNearestAllowed(projectId: string, planId: string, itemId: string, at: LngLat): Promise<{ to: LngLat; shift_m: number } | null> {
+  try {
+    return await request(`/api/projects/${projectId}/plans/${planId}/items/${encodeURIComponent(itemId)}/nearest-allowed?x=${at.x}&y=${at.y}`);
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return null;
+    throw e;
+  }
+}
+
 /** Undo's counterpart to deletion -- recreates the exact items given (same
  * id, geometry, type, species, score, rationale). Returns only the plan's
  * fresh item count: the caller already has the exact features it just asked

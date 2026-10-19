@@ -45,6 +45,8 @@ import { ZonesPanel } from "@/components/ZonesPanel";
 import {
   fetchComplianceReport,
   getItemsCompliance,
+  getNearbyConstraints,
+  getNearestAllowed,
   getProjectLayers3d,
   PROJECT_GONE_MESSAGE,
   type AssistantAction,
@@ -333,6 +335,22 @@ export default function Home() {
         return `Предпросмотр: ${noun === "дерево" ? "дерево будет удалено" : noun === "куст" ? "куст будет удалён" : "газон будет удалён"}`;
     }
   }, [fixPreview, planIndex]);
+
+  // Нормы при перетаскивании: запросы привязаны к открытому плану.
+  const loadNearbyConstraints = useCallback(
+    async (query: { x: number; y: number; radius: number; plantingType: PlantingType; itemId: string }) => {
+      const { project: current, plan: currentPlan } = runtimeRef.current.session;
+      if (!current || !currentPlan) return [];
+      return getNearbyConstraints(current.id, currentPlan.plan_id, query);
+    },
+    []
+  );
+  const loadNearestAllowed = useCallback(async (itemId: string, at: { x: number; y: number }) => {
+    const { project: current, plan: currentPlan } = runtimeRef.current.session;
+    if (!current || !currentPlan) return null;
+    const found = await getNearestAllowed(current.id, currentPlan.plan_id, itemId, at);
+    return found ? found.to : null;
+  }, []);
 
   /** «Применить» в «Как исправить»: тем же путём, что кнопки панели выделения —
    * поэтому одна запись в истории и Ctrl+Z возвращает как было. */
@@ -1479,6 +1497,8 @@ export default function Home() {
                 editsLocked={editing.editBusy || compare.active}
                 compareMarks={compare.marks}
                 fixPreview={mapFixPreview}
+                loadNearbyConstraints={loadNearbyConstraints}
+                loadNearestAllowed={loadNearestAllowed}
                 zoneLayers={zonesShown ? zones.layers : null}
                 dimPlan={zonesShown}
                 onSelectionChange={selection.setSelection}

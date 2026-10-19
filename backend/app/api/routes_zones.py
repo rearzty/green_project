@@ -7,8 +7,9 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 
 from backend.app.api.deps import PlanDep
-from backend.app.schemas.plan import PlanZonesOut, PlantingType
-from backend.app.services import zones_service
+from backend.app.schemas.plan import NearbyConstraintsOut, PlanZonesOut, PlantingType
+from backend.app.services import constraints_service, zones_service
+from backend.app.services.geo_io import display_crs
 
 router = APIRouter(prefix="/api/projects/{project_id}/plans/{plan_id}", tags=["zones"])
 
@@ -31,3 +32,21 @@ async def get_zone_image(plan: PlanDep, group: str, planting_type: PlantingType 
     if png is None:
         raise HTTPException(status_code=404, detail=f"Группа «{group}» в слое ограничений не найдена.")
     return Response(content=png, media_type="image/png")
+
+
+@router.get("/constraints/near", response_model=NearbyConstraintsOut)
+async def get_nearby_constraints(
+    plan: PlanDep,
+    x: float,
+    y: float,
+    radius: float = constraints_service.DEFAULT_RADIUS_M,
+    planting_type: PlantingType = "tree",
+    item_id: str | None = None,
+) -> NearbyConstraintsOut:
+    """Охранные зоны вокруг точки (x, y) — для перетаскивания посадки: сами
+    ограничения, их зоны и нормы. Расстояния считает клиент. `item_id` — какую
+    посадку тянут (от породы зависят и отступы, и интервал до соседей)."""
+    result = await run_in_threadpool(
+        constraints_service.nearby_constraints, plan, x, y, radius, planting_type, item_id, display_crs(plan.project)
+    )
+    return NearbyConstraintsOut(**result)

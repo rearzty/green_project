@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 import shapely
@@ -32,7 +33,7 @@ from shapely.geometry import LineString, Point
 from backend.app.db.models import Plan, PlantingItemRow
 from backend.app.services import compliance_service, exclusion_cache
 from backend.app.services.edit_service import _catalogue, _crown_interval, _items_by_ids, chain_indices
-from backend.app.services.geo_io import _to_wgs84, db_to_shape, planting_items_to_geojson_dicts, shape_to_db
+from backend.app.services.geo_io import _to_wgs84, db_to_shape, from_wgs84, planting_items_to_geojson_dicts, shape_to_db
 from backend.app.services.pipeline_service import plan_norms
 from geo_engine.compliance import NEIGHBOUR_OBJECT_TYPE, SPACING_CHECKED_TYPES
 
@@ -57,20 +58,18 @@ _SPACING_MARGIN_M = 0.005
 _ROW_MARK = "-row-"
 
 
-def _offsets() -> tuple[np.ndarray, np.ndarray]:
+@lru_cache(maxsize=4)
+def _offsets(radius_m: float) -> tuple[np.ndarray, np.ndarray]:
     """Смещения сетки (N, 2) и их длины, по возрастанию длины; сама точка не входит."""
-    steps = int(round(SEARCH_RADIUS_M / SEARCH_STEP_M))
+    steps = int(round(radius_m / SEARCH_STEP_M))
     axis = np.arange(-steps, steps + 1) * SEARCH_STEP_M
     gx, gy = np.meshgrid(axis, axis)
     distance = np.hypot(gx, gy)
-    keep = (distance <= SEARCH_RADIUS_M + 1e-9) & (distance > SEARCH_STEP_M / 2)
+    keep = (distance <= radius_m + 1e-9) & (distance > SEARCH_STEP_M / 2)
     offsets = np.column_stack([gx[keep], gy[keep]])
     lengths = distance[keep]
     order = np.argsort(lengths, kind="stable")
     return offsets[order], lengths[order]
-
-
-_OFFSETS, _OFFSET_LENGTHS = _offsets()
 
 
 @dataclass
@@ -143,11 +142,14 @@ class _Context:
         return [others[i] for i in chain_indices(points)]
 
 
-def _find_move(ctx: _Context, row: PlantingItemRow) -> _Move | None:
-    point = db_to_shape(row.geometry)
+def _find_move(ctx: _Context, row: PlantingItemRow, origin: Point | None = None, radius_m: float = SEARCH_RADIUS_M) -> _Move | None:
+    """Ближайшая допустимая точка вокруг `origin` (по умолчанию — вокруг самой
+    посадки; Alt при перетаскивании ищет вокруг курсора)."""
+    point = origin if origin is not None else db_to_shape(row.geometry)
     if point.geom_type != "Point":
         return None
-    xy = _OFFSETS + np.array([point.x, point.y])
+    offsets, lengths = _offsets(radius_m)
+    xy = offsets + np.array([point.x, point.y])
     candidates = shapely.points(xy)
     ok = np.ones(len(candidates), dtype=bool)
 
@@ -184,7 +186,7 @@ def _find_move(ctx: _Context, row: PlantingItemRow) -> _Move | None:
     if row.planting_type in SPACING_CHECKED_TYPES:
         own_interval = _crown_interval(_catalogue(), row.species) or 0.0
         neighbour_xy, neighbour_interval = ctx.trees.around(
-            point.x, point.y, SEARCH_RADIUS_M + max(own_interval, float(ctx.trees.interval.max(initial=0.0))), row.id
+            point.x, point.y, radius_m + max(own_interval, float(ctx.trees.interval.max(initial=0.0))), row.id
         )
         if len(neighbour_xy):
             required = np.maximum(own_interval, neighbour_interval)
@@ -200,7 +202,7 @@ def _find_move(ctx: _Context, row: PlantingItemRow) -> _Move | None:
     if neighbours:
         line = LineString([db_to_shape(m.geometry) for m in neighbours])
         keeps = shapely.distance(candidates, line) <= ROW_TOLERANCE_M
-    score = _OFFSET_LENGTHS + (0.0 if keeps is None else np.where(keeps, 0.0, OFF_ROW_PENALTY_M))
+    score = lengths + (0.0 if keeps is None else np.where(keeps, 0.0, OFF_ROW_PENALTY_M))
 
     found = np.flatnonzero(ok)
     found = found[np.argsort(score[found], kind="stable")][:_VERIFY_TOP]
@@ -222,7 +224,7 @@ def _find_move(ctx: _Context, row: PlantingItemRow) -> _Move | None:
     return _Move(
         x=float(xy[chosen, 0]),
         y=float(xy[chosen, 1]),
-        shift_m=float(_OFFSET_LENGTHS[chosen]),
+        shift_m=float(lengths[chosen]),
         keeps_row=None if keeps is None else bool(keeps[chosen]),
     )
 
@@ -414,3 +416,24 @@ def apply_fixes(plan: Plan, ids: list[str], kind: str, source_crs: str | None) -
     if planned:
         plan.has_manual_edits = True
     return FixOutcome(previous=previous, created=planting_items_to_geojson_dicts(changed, source_crs), skipped=skipped)
+
+
+# Alt при перетаскивании ищет вокруг курсора, а курсор бывает глубоко в
+# запретной зоне (здание с отступом 5 м) — радиус больше, чем у «Как исправить».
+NEAREST_ALLOWED_RADIUS_M = 8.0
+
+
+def nearest_allowed(plan: Plan, item_id: str, x: float, y: float, source_crs: str | None) -> dict | None:
+    """Ближайшая допустимая точка для посадки `item_id`, если её поставить у
+    (x, y) — «Alt: к ближайшему допустимому месту» при перетаскивании. Те же
+    условия, что у «Как исправить» (см. `_find_move`); `None` — рядом места нет.
+    (x, y) — в координатах отображения, как и ответ."""
+    ctx = _Context(plan)
+    row = next((r for r in plan.items if r.id == item_id), None)
+    if row is None or row.planting_type == "lawn":
+        return None
+    origin = from_wgs84(Point(x, y), source_crs)
+    move = _find_move(ctx, row, origin=origin, radius_m=NEAREST_ALLOWED_RADIUS_M)
+    if move is None:
+        return None
+    return {"to": _display_point(move.x, move.y, source_crs), "shift_m": round(move.shift_m, 2)}

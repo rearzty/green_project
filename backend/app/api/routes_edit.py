@@ -24,6 +24,7 @@ from backend.app.schemas.plan import (
     ItemsRestoreResult,
     ItemsRetypeRequest,
     ItemsRetypeResult,
+    NearestAllowedOut,
     ValidateItemsRequest,
     ValidateResponse,
     ValidationViolation,
@@ -44,7 +45,7 @@ from backend.app.services.edit_service import (
     validate_items_scoped,
     validate_plan,
 )
-from backend.app.services.fix_service import apply_fixes, item_fixes
+from backend.app.services.fix_service import apply_fixes, item_fixes, nearest_allowed
 from backend.app.services.geo_io import display_crs, planting_item_to_geojson_feature
 
 router = APIRouter(prefix="/api/projects/{project_id}/plans/{plan_id}", tags=["edit"])
@@ -123,6 +124,17 @@ async def item_fixes_route(item_id: str, plan: PlanDep) -> ItemFixesOut:
     get_item_or_404(plan, item_id)
     options = await run_in_threadpool(item_fixes, plan, item_id, display_crs(plan.project))
     return ItemFixesOut(item_id=item_id, options=[FixOptionOut(**option) for option in options])
+
+
+@router.get("/items/{item_id}/nearest-allowed", response_model=NearestAllowedOut)
+async def nearest_allowed_route(item_id: str, x: float, y: float, plan: PlanDep) -> NearestAllowedOut:
+    """Alt при перетаскивании: ближайшая допустимая точка для посадки, если её
+    поставить у (x, y) (координаты отображения). 404 — рядом места нет."""
+    get_item_or_404(plan, item_id)
+    found = await run_in_threadpool(nearest_allowed, plan, item_id, x, y, display_crs(plan.project))
+    if found is None:
+        raise HTTPException(status_code=404, detail="Рядом нет места, где нормы позволяют поставить эту посадку.")
+    return NearestAllowedOut(**found)
 
 
 @router.post("/fixes/apply", response_model=FixesApplyResult)

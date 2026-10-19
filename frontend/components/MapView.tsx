@@ -6,7 +6,18 @@ import { AttributionControl, ImageOverlay, MapContainer, Rectangle, TileLayer, G
 import L, { type Layer, type PathOptions } from "leaflet";
 import type { Feature } from "geojson";
 
-import type { GeoJSONFeatureCollection, LayersRaster, LngLat } from "@/lib/api";
+import type { GeoJSONFeatureCollection, LayersRaster, LngLat, NearbyConstraint, PlantingType } from "@/lib/api";
+import {
+  dragZoneColor,
+  makeMetreProjector,
+  prepareConstraints,
+  samplePoints,
+  worstReading,
+  MAX_SAMPLED_POINTS,
+  type MetreProjector,
+  type PreparedConstraint,
+} from "@/lib/dragNorms";
+import { formatMeters, OBJECT_GENITIVE_RU } from "@/lib/format";
 import { plantingColor, SELECTION_COLOR, VIOLATION_COLOR } from "@/lib/mapStyle";
 import { boundsOfItems, itemsInBox, type LatLngBox, type PlanIndex } from "@/lib/planIndex";
 
@@ -698,6 +709,420 @@ function HoverTooltipController({
   );
 }
 
+/** Нормы при перетаскивании (п. 2, Drag.dc.html): пока тянешь посадку, вокруг
+ * ближайших ограничений проступают охранные зоны, у курсора — живая подпись
+ * «0,9 м · нужно 2 м», справа — список зон рядом, внизу — подсказка клавиш.
+ *
+ * Геометрию зон сервер отдаёт ОДИН раз в начале жеста; расстояния на каждом
+ * кадре считает клиент (lib/dragNorms.ts) — запрос на кадр был бы медленнее
+ * самого жеста. Если зоны не пришли (сеть, нет участка), перенос работает как
+ * раньше, без подписи.
+ *
+ * Отпускание в запретной зоне посадку НЕ возвращает: ручная правка в проекте
+ * сознательно может нарушать отступ — посадка встаёт и помечается (см.
+ * `edit_service.validate_plan`: «a designer may have a legitimate reason»). В
+ * макете подсказка обещает «дерево вернётся» — расходится с этим правилом, и
+ * текст подсказки здесь говорит то, что происходит на самом деле. */
+export interface DragNormsApi {
+  start(ids: string[]): void;
+  move(offset: { dLat: number; dLng: number }, pointer: L.Point, alt: boolean): void;
+  end(): void;
+  /** Alt при отпускании: ближайшая допустимая точка около `at` для одной посадки; null — нет. */
+  nearestAllowed(at: L.LatLng): Promise<L.LatLng | null>;
+}
+
+const DRAG_ZONES_PANE = "dragZones";
+const NEARBY_RADIUS_M = 15;
+const MAX_ZONE_LABELS = 3;
+/** Подпись у курсора — только когда ограничение рядом: «15 м · нужно 3 м» посреди пустого места ничего не говорит. */
+const LABEL_REACH_M = 8;
+const ALT_QUERY_DELAY_MS = 120;
+
+interface DragSession {
+  ids: string[];
+  idSet: ReadonlySet<string>;
+  points: { id: string; lat: number; lng: number; mx: number; my: number }[];
+  centre: { lat: number; lng: number };
+  project: MetreProjector;
+  plantingType: PlantingType;
+  itemId: string;
+  single: boolean;
+  constraints: PreparedConstraint[] | null;
+  /** Последний кадр, пришедший до того, как зоны загрузились. */
+  pending: { offset: { dLat: number; dLng: number }; pointer: L.Point; alt: boolean } | null;
+}
+
+interface DragNormsRow {
+  type: string;
+  label: string;
+  requiredM: number;
+  violated: boolean;
+}
+
+interface DragNormsView {
+  label: { x: number; y: number; text: string; violated: boolean } | null;
+  rows: DragNormsRow[];
+  violated: boolean;
+  single: boolean;
+}
+
+function DragNormsController({
+  apiRef,
+  planIndex,
+  registryRef,
+  crsVerified,
+  loadNearby,
+  loadNearestAllowed,
+}: {
+  apiRef: MutableRefObject<DragNormsApi | null>;
+  planIndex?: PlanIndex;
+  registryRef: MutableRefObject<Map<string, RegistryEntry>>;
+  crsVerified?: boolean;
+  loadNearby?: (query: { x: number; y: number; radius: number; plantingType: PlantingType; itemId: string }) => Promise<NearbyConstraint[]>;
+  loadNearestAllowed?: (itemId: string, at: LngLat) => Promise<LngLat | null>;
+}) {
+  const map = useMap();
+  const latest = useRef({ planIndex, crsVerified, loadNearby, loadNearestAllowed });
+  latest.current = { planIndex, crsVerified, loadNearby, loadNearestAllowed };
+  const [view, setView] = useState<DragNormsView | null>(null);
+
+  useEffect(() => {
+    let session: DragSession | null = null;
+    let lastItemId: string | null = null;
+    let zones: L.LayerGroup | null = null;
+    let altRing: L.CircleMarker | null = null;
+    let altTimer: ReturnType<typeof setTimeout> | undefined;
+    let altSeq = 0;
+    let marked: HTMLElement[] = [];
+
+    function clearMarks() {
+      marked.forEach((el) => el.classList.remove("gp-drag-violation"));
+      marked = [];
+    }
+
+    function clearAlt() {
+      clearTimeout(altTimer);
+      altSeq += 1;
+      altRing?.remove();
+      altRing = null;
+    }
+
+    function draw(current: DragSession, features: NearbyConstraint[]) {
+      if (!map.getPane(DRAG_ZONES_PANE)) {
+        const pane = map.createPane(DRAG_ZONES_PANE);
+        pane.style.zIndex = "440";
+        pane.style.pointerEvents = "none";
+      }
+      const group = L.layerGroup();
+      const labelled = new Set<string>();
+      // Ближайшие к центру жеста — первыми: подпись получает самое близкое ограничение каждого типа.
+      const ordered = features
+        .map((feature, index) => ({ feature, index, prepared: current.constraints?.[index] }))
+        .sort((a, b) => nearestDistance(a.prepared) - nearestDistance(b.prepared));
+      for (const { feature } of ordered) {
+        const color = dragZoneColor(feature.object_type);
+        const heat = feature.object_type === "heat_network";
+        const neighbour = feature.kind === "neighbour";
+        L.geoJSON({ type: "Feature", geometry: feature.zone, properties: {} } as never, {
+          pane: DRAG_ZONES_PANE,
+          interactive: false,
+          style: {
+            color,
+            weight: 1.5,
+            opacity: 0.95,
+            dashArray: neighbour ? "4 4" : "6 4",
+            fill: !neighbour,
+            fillColor: color,
+            fillOpacity: heat ? 1 : 0.14,
+            className: heat ? "gp-zone-hatch" : undefined,
+          },
+        }).addTo(group);
+        // Сама линия сети — чтобы было видно, ОТ ЧЕГО отступ.
+        if (feature.geometry && (feature.geometry.type === "LineString" || feature.geometry.type === "MultiLineString")) {
+          L.geoJSON({ type: "Feature", geometry: feature.geometry, properties: {} } as never, {
+            pane: DRAG_ZONES_PANE,
+            interactive: false,
+            style: { color, weight: 2, opacity: 0.9 },
+          }).addTo(group);
+        }
+        if (!neighbour && !labelled.has(feature.object_type) && labelled.size < MAX_ZONE_LABELS && feature.geometry) {
+          labelled.add(feature.object_type);
+          const at = nearestVertex(feature.geometry, current);
+          const genitive = OBJECT_GENITIVE_RU[feature.object_type];
+          if (at) {
+            L.tooltip({ permanent: true, direction: "top", offset: [0, -4], className: "gp-zone-label", interactive: false })
+              .setLatLng(at)
+              .setContent(`${formatMeters(feature.required_m)}${genitive ? ` от ${genitive}` : ""}`)
+              .addTo(group);
+          }
+        }
+      }
+      group.addTo(map);
+      zones = group;
+    }
+
+    function nearestDistance(prepared: PreparedConstraint | undefined): number {
+      if (!prepared) return Infinity;
+      let best = Infinity;
+      for (const line of prepared.lines) {
+        for (let i = 0; i < line.length; i += 2) best = Math.min(best, Math.hypot(line[i], line[i + 1]));
+      }
+      for (const [x, y] of prepared.points) best = Math.min(best, Math.hypot(x, y));
+      return best;
+    }
+
+    function nearestVertex(geometry: NearbyConstraint["geometry"], current: DragSession): L.LatLng | null {
+      if (!geometry) return null;
+      let best: L.LatLng | null = null;
+      let bestDistance = Infinity;
+      const visit = (coords: unknown) => {
+        if (!Array.isArray(coords) || coords.length === 0) return;
+        if (typeof coords[0] === "number") {
+          const [lng, lat] = coords as number[];
+          const [mx, my] = current.project(lng, lat);
+          const d = Math.hypot(mx, my);
+          if (d < bestDistance) {
+            bestDistance = d;
+            best = L.latLng(lat, lng);
+          }
+          return;
+        }
+        coords.forEach(visit);
+      };
+      visit(geometry.coordinates);
+      return best;
+    }
+
+    function update(current: DragSession, offset: { dLat: number; dLng: number }, pointer: L.Point, alt: boolean) {
+      const constraints = current.constraints;
+      if (!constraints) {
+        current.pending = { offset, pointer, alt };
+        return;
+      }
+      const [ox, oy] = current.project(current.centre.lng + offset.dLng, current.centre.lat + offset.dLat);
+      const [cx, cy] = current.project(current.centre.lng, current.centre.lat);
+      const dx = ox - cx;
+      const dy = oy - cy;
+      const moved = current.points.map((p) => [p.mx + dx, p.my + dy] as [number, number]);
+      const reading = worstReading(constraints, samplePoints(moved), current.idSet);
+      const violated = reading !== null && reading.slackM < 0;
+
+      // Строки панели: по типу ограничения самое тесное место среди проверяемых точек.
+      const rows = new Map<string, DragNormsRow>();
+      const sampled = samplePoints(moved);
+      for (const constraint of constraints) {
+        if (constraint.kind === "neighbour" && constraint.id && current.idSet.has(constraint.id)) continue;
+        let slack = Infinity;
+        for (const [x, y] of sampled) slack = Math.min(slack, distanceSlack(constraint, x, y));
+        const known = rows.get(constraint.type);
+        const row: DragNormsRow = { type: constraint.type, label: constraint.label, requiredM: constraint.requiredM, violated: slack < 0 };
+        if (!known || (row.violated && !known.violated)) rows.set(constraint.type, row);
+      }
+
+      // Перетаскиваемая точка — кольцо нарушения, пока стоит в запретной зоне (до MAX_SAMPLED_POINTS точек).
+      clearMarks();
+      if (current.points.length <= MAX_SAMPLED_POINTS) {
+        current.points.forEach((p, i) => {
+          if ((worstReading(constraints, [moved[i]], current.idSet)?.slackM ?? 0) < 0) {
+            const layer = registryRef.current.get(p.id)?.layer;
+            const el = layer instanceof L.Marker ? layer.getElement() : null;
+            if (el) {
+              el.classList.add("gp-drag-violation");
+              marked.push(el);
+            }
+          }
+        });
+      }
+
+      const size = map.getSize();
+      setView({
+        label: reading && (violated || reading.distanceM <= reading.constraint.requiredM + LABEL_REACH_M)
+          ? {
+              x: Math.max(8, Math.min(pointer.x + 16, size.x - 190)),
+              y: Math.max(8, pointer.y - 36),
+              text: `${formatMeters(reading.distanceM)} · нужно ${formatMeters(reading.constraint.requiredM)}`,
+              violated,
+            }
+          : null,
+        rows: [...rows.values()].sort((a, b) => Number(b.violated) - Number(a.violated) || b.requiredM - a.requiredM).slice(0, 5),
+        violated,
+        single: current.single,
+      });
+
+      // Alt: показать, куда посадка встанет, если отпустить с Alt.
+      if (alt && current.single && violated && latest.current.loadNearestAllowed) {
+        clearTimeout(altTimer);
+        const seq = ++altSeq;
+        const at = L.latLng(current.points[0].lat + offset.dLat, current.points[0].lng + offset.dLng);
+        altTimer = setTimeout(() => {
+          latest.current
+            .loadNearestAllowed?.(current.itemId, { x: at.lng, y: at.lat })
+            .then((target) => {
+              if (seq !== altSeq || session !== current) return;
+              altRing?.remove();
+              altRing = null;
+              if (!target) return;
+              altRing = L.circleMarker([target.y, target.x], {
+                pane: DRAG_ZONES_PANE,
+                radius: 12,
+                color: "#7BD389",
+                weight: 2,
+                dashArray: "4 3",
+                fill: false,
+                interactive: false,
+              }).addTo(map);
+            })
+            .catch(() => undefined);
+        }, ALT_QUERY_DELAY_MS);
+      } else if (!alt && altRing) {
+        clearAlt();
+      }
+    }
+
+    function distanceSlack(constraint: PreparedConstraint, x: number, y: number): number {
+      return worstReading([constraint], [[x, y]])?.slackM ?? Infinity;
+    }
+
+    const api: DragNormsApi = {
+      start(ids) {
+        end();
+        const p = latest.current;
+        const index = p.planIndex;
+        if (!index || !p.loadNearby) return;
+        const points: DragSession["points"] = [];
+        let minLat = Infinity;
+        let maxLat = -Infinity;
+        let minLng = Infinity;
+        let maxLng = -Infinity;
+        for (const id of ids) {
+          const item = index.get(id);
+          // Газон — полигон: отступов «точки» у него нет, группа с ним считается по деревьям и кустам.
+          if (!item?.isPoint) continue;
+          points.push({ id, lat: item.minLat, lng: item.minLng, mx: 0, my: 0 });
+          minLat = Math.min(minLat, item.minLat);
+          maxLat = Math.max(maxLat, item.maxLat);
+          minLng = Math.min(minLng, item.minLng);
+          maxLng = Math.max(maxLng, item.maxLng);
+        }
+        if (points.length === 0) return;
+        const centre = { lat: (minLat + maxLat) / 2, lng: (minLng + maxLng) / 2 };
+        const project = makeMetreProjector(centre.lat, centre.lng, p.crsVerified ?? true);
+        let reach = 0;
+        for (const point of points) {
+          [point.mx, point.my] = project(point.lng, point.lat);
+          reach = Math.max(reach, Math.hypot(point.mx, point.my));
+        }
+        const plantingType: PlantingType = ids.some((id) => index.get(id)?.type === "tree") ? "tree" : "shrub";
+        const representative = points.find((point) => index.get(point.id)?.type === plantingType) ?? points[0];
+        const current: DragSession = {
+          ids,
+          idSet: new Set(ids),
+          points,
+          centre,
+          project,
+          plantingType,
+          itemId: representative.id,
+          single: ids.length === 1,
+          constraints: null,
+          pending: null,
+        };
+        session = current;
+        lastItemId = current.itemId;
+        setView({ label: null, rows: [], violated: false, single: current.single });
+        p.loadNearby({ x: centre.lng, y: centre.lat, radius: Math.min(60, NEARBY_RADIUS_M + reach), plantingType, itemId: current.itemId })
+          .then((features) => {
+            if (session !== current) return;
+            current.constraints = prepareConstraints(features, project);
+            draw(current, features);
+            if (current.pending) update(current, current.pending.offset, current.pending.pointer, current.pending.alt);
+          })
+          .catch(() => {
+            // Без зон перенос работает, как раньше, — только без подписи.
+          });
+      },
+      move(offset, pointer, alt) {
+        if (session) update(session, offset, pointer, alt);
+      },
+      end,
+      async nearestAllowed(at) {
+        const loader = latest.current.loadNearestAllowed;
+        const id = session?.itemId ?? lastItemId;
+        if (!loader || !id) return null;
+        const found = await loader(id, { x: at.lng, y: at.lat });
+        return found ? L.latLng(found.y, found.x) : null;
+      },
+    };
+
+    function end() {
+      clearAlt();
+      clearMarks();
+      zones?.remove();
+      zones = null;
+      session = null;
+      setView(null);
+    }
+
+    apiRef.current = api;
+    return () => {
+      end();
+      apiRef.current = null;
+    };
+  }, [map, apiRef, registryRef]);
+
+  if (!view) return null;
+  return (
+    <>
+      {/* Штриховка теплосети: CSS `.gp-zone-hatch` ссылается на этот узор по id. */}
+      <svg aria-hidden width="0" height="0" className="pointer-events-none absolute">
+        <defs>
+          <pattern id="gp-hatch-heat" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+            <rect width="7" height="7" fill="rgba(169,148,232,0.08)" />
+            <line x1="0" y1="0" x2="0" y2="7" stroke="rgba(169,148,232,0.55)" strokeWidth="2" />
+          </pattern>
+        </defs>
+      </svg>
+      {view.label && (
+        <div
+          style={{ left: view.label.x, top: view.label.y }}
+          className={`pointer-events-none absolute z-[1100] whitespace-nowrap rounded-md border px-2 py-1 font-mono text-xs tabular-nums shadow-[0_6px_18px_rgba(0,0,0,.4)] ${
+            view.label.violated ? "border-gp-violation bg-gp-violation-soft text-gp-violation-text" : "border-gp-border bg-gp-float text-gp-text"
+          }`}
+        >
+          {view.label.text}
+        </div>
+      )}
+      {view.rows.length > 0 && (
+        <div className="pointer-events-none absolute right-3 top-16 z-[1100] w-[224px] rounded-lg border border-gp-border bg-gp-float px-3.5 py-3 text-gp-text shadow-[0_10px_28px_rgba(0,0,0,.45)]">
+          <p className="m-0 text-[13px] font-medium">Охранные зоны рядом</p>
+          <p className="m-0 mt-0.5 text-[11px] text-gp-text-3">Видны, только пока вы тянете посадку</p>
+          <ul className="m-0 mt-2.5 flex list-none flex-col gap-1.5 p-0">
+            {view.rows.map((row) => (
+              <li key={row.type} className="flex items-center gap-2 text-xs">
+                <span className="h-2.5 w-2.5 flex-none rounded-[3px]" style={{ background: dragZoneColor(row.type) }} aria-hidden />
+                <span className={`flex-1 first-letter:uppercase ${row.violated ? "text-gp-violation-text" : "text-gp-text-2"}`}>{row.label}</span>
+                <span className={`font-mono tabular-nums ${row.violated ? "text-gp-violation-text" : "text-gp-text"}`}>{formatMeters(row.requiredM)}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      <div className="pointer-events-none absolute bottom-[74px] left-1/2 z-[1100] max-w-[calc(100%-2rem)] -translate-x-1/2 rounded-lg border border-gp-border bg-gp-float px-3.5 py-2 text-center text-[13px] text-gp-text shadow-[0_8px_24px_rgba(0,0,0,.4)]">
+        {view.violated ? <span className="text-gp-violation-text">Здесь нарушение нормы — посадка встанет, но будет помечена</span> : <span>Можно отпускать</span>}
+        <span className="text-gp-text-3">
+          {" · "}
+          <kbd className="font-mono text-[11px]">Esc</kbd> отменить
+          {view.single && (
+            <>
+              {" · "}
+              <kbd className="font-mono text-[11px]">Alt</kbd> к ближайшему допустимому месту
+            </>
+          )}
+        </span>
+      </div>
+    </>
+  );
+}
+
 type RegistryEntry = { layer: Layer; type: string };
 type LatLngTree = L.LatLng | LatLngTree[];
 
@@ -734,6 +1159,8 @@ interface Gesture {
   additive: boolean;
   dragging: boolean;
   moveIds: string[];
+  /** Alt зажат на последнем движении — «к ближайшему допустимому месту». */
+  alt: boolean;
   /** Each live-previewed layer's position at drag start. */
   originals: Map<Layer, LatLngTree>;
 }
@@ -757,6 +1184,9 @@ interface SelectionControllerProps {
   /** Под CRS.Simple (чертёж без проверенной СК) зум — это 2^zoom пикселей на
    * метр, и «близкий» зум 18 геодезической карты там означал бы 260 тыс. px/м. */
   crsVerified?: boolean;
+  /** Нормы при перетаскивании (DragNormsController): жест сообщает ему начало,
+   * кадры и конец; сам он ничего не знает про указатель. */
+  dragNormsRef?: MutableRefObject<DragNormsApi | null>;
 }
 
 /** All pointer handling for plan items: click-select, box-select, drag-move,
@@ -860,6 +1290,7 @@ function SelectionController(props: SelectionControllerProps) {
       applyMovePreview(g, 0, 0);
       setDrawBox(null);
       setMoveOffset(null);
+      latest.current.dragNormsRef?.current?.end();
       try {
         container.releasePointerCapture(g.pointerId);
       } catch {
@@ -880,6 +1311,7 @@ function SelectionController(props: SelectionControllerProps) {
         ids = [...p.selectedIds];
       }
       g.moveIds = ids;
+      p.dragNormsRef?.current?.start(ids);
       if (ids.length > LIVE_MOVE_PREVIEW_LIMIT) return;
       for (const id of ids) {
         const entry = p.registryRef.current.get(id);
@@ -899,6 +1331,7 @@ function SelectionController(props: SelectionControllerProps) {
         const offset = { dLat: latlng.lat - g.startLatLng.lat, dLng: latlng.lng - g.startLatLng.lng };
         applyMovePreview(g, offset.dLat, offset.dLng);
         setMoveOffset(offset);
+        latest.current.dragNormsRef?.current?.move(offset, pendingPoint, g.alt);
       }
     }
 
@@ -945,6 +1378,7 @@ function SelectionController(props: SelectionControllerProps) {
         additive,
         dragging: false,
         moveIds: [],
+        alt: false,
         originals: new Map(),
       };
       suppressClickRef.current = true;
@@ -954,6 +1388,7 @@ function SelectionController(props: SelectionControllerProps) {
       const g = gestureRef.current;
       if (!g || e.pointerId !== g.pointerId) return;
       const point = map.mouseEventToContainerPoint(e);
+      g.alt = e.altKey;
       if (!g.dragging) {
         if (point.distanceTo(g.startPoint) < DRAG_THRESHOLD_PX) return;
         g.dragging = true;
@@ -988,14 +1423,29 @@ function SelectionController(props: SelectionControllerProps) {
         const ids = itemsInBox(p.planIndex, boxFromCorners(g.startLatLng, end));
         p.onSelectionChange(g.additive ? [...new Set([...p.selectedIds, ...ids])] : ids);
       } else if (g.moveIds.length > 0) {
+        const norms = p.dragNormsRef?.current;
         if (end.equals(g.startLatLng)) {
+          norms?.end();
           applyMovePreview(g, 0, 0);
           return;
         }
-        // Items stay where they were dropped until the saved plan comes back
-        // (or snap back with it, if the server rejects the move).
-        applyMovePreview(g, end.lat - g.startLatLng.lat, end.lng - g.startLatLng.lng);
-        p.onMoveItems(g.moveIds, { x: g.startLatLng.lng, y: g.startLatLng.lat }, { x: end.lng, y: end.lat });
+        const commit = (target: L.LatLng) => {
+          // Items stay where they were dropped until the saved plan comes back
+          // (or snap back with it, if the server rejects the move).
+          applyMovePreview(g, target.lat - g.startLatLng.lat, target.lng - g.startLatLng.lng);
+          p.onMoveItems(g.moveIds, { x: g.startLatLng.lng, y: g.startLatLng.lat }, { x: target.lng, y: target.lat });
+        };
+        // Alt при отпускании — «к ближайшему допустимому месту» (одна посадка):
+        // сервер ищет вокруг курсора, и правка идёт уже в найденную точку; нет
+        // такой — как обычно, туда, где отпустили.
+        if (e.altKey && g.moveIds.length === 1 && norms) {
+          const asked = norms.nearestAllowed(end);
+          norms.end();
+          asked.then((target) => commit(target ?? end)).catch(() => commit(end));
+        } else {
+          norms?.end();
+          commit(end);
+        }
       }
     }
 
@@ -1031,6 +1481,16 @@ function SelectionController(props: SelectionControllerProps) {
       if (gestureRef.current && e.touches.length === 1) e.stopPropagation();
     }
 
+    // Esc во время переноса — отмена жеста, а не «снять выделение»: слушаем в
+    // фазе захвата и гасим событие, чтобы обработчик страницы его не увидел.
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== "Escape" || !gestureRef.current?.dragging) return;
+      e.preventDefault();
+      e.stopPropagation();
+      cancelGesture();
+    }
+
+    window.addEventListener("keydown", onKeyDown, true);
     container.addEventListener("pointerdown", onPointerDown, true);
     container.addEventListener("pointermove", onPointerMove);
     container.addEventListener("pointerup", onPointerUp);
@@ -1040,6 +1500,7 @@ function SelectionController(props: SelectionControllerProps) {
     container.addEventListener("touchstart", onTouchStart, { capture: true, passive: true });
     return () => {
       cancelGesture();
+      window.removeEventListener("keydown", onKeyDown, true);
       container.removeEventListener("pointerdown", onPointerDown, true);
       container.removeEventListener("pointermove", onPointerMove);
       container.removeEventListener("pointerup", onPointerUp);
@@ -1098,6 +1559,12 @@ function SelectionController(props: SelectionControllerProps) {
         <Rectangle
           bounds={boxBounds(selectionBox, moveOffset)}
           pane={SELECTION_PANE}
+          // Не только в pathOptions: react-leaflet отдаёт Leaflet'у при создании лишь
+          // верхнеуровневые пропсы, а pathOptions применяет потом через setStyle — когда
+          // класс `leaflet-interactive` уже на пути. Рамка группы, лежащей в одну линию
+          // (ряд), вырождается в линию ровно по центрам точек и перехватывала нажатие
+          // на них: вместо переноса ряда двигалась карта.
+          interactive={false}
           pathOptions={{
             color: SELECTION_COLOR,
             weight: 1.5,
@@ -1112,6 +1579,7 @@ function SelectionController(props: SelectionControllerProps) {
         <Rectangle
           bounds={boxBounds(drawBox)}
           pane={SELECTION_PANE}
+          interactive={false}
           pathOptions={{ color: SELECTION_COLOR, weight: 1.5, fillColor: SELECTION_COLOR, fillOpacity: 0.12, interactive: false }}
         />
       )}
@@ -1511,6 +1979,10 @@ export interface MapViewProps {
   compareMarks?: CompareMarks | null;
   /** Предпросмотр исправления нарушения: куда встанет посадка. */
   fixPreview?: FixPreviewMark | null;
+  /** Охранные зоны вокруг точки — для подсказок при перетаскивании (DragNormsController). */
+  loadNearbyConstraints?: (query: { x: number; y: number; radius: number; plantingType: PlantingType; itemId: string }) => Promise<NearbyConstraint[]>;
+  /** Alt при перетаскивании: ближайшая допустимая точка для посадки. */
+  loadNearestAllowed?: (itemId: string, at: LngLat) => Promise<LngLat | null>;
   /** Слой «где можно сажать»: цветные зоны поверх подосновы. */
   zoneLayers?: ZoneLayers | null;
   /** Посадки плана приглушены (opacity .35), чтобы зоны читались под ними. */
@@ -1549,6 +2021,8 @@ export default function MapView({
   fitRequest,
   compareMarks = null,
   fixPreview = null,
+  loadNearbyConstraints,
+  loadNearestAllowed,
   zoneLayers = null,
   dimPlan = false,
   onMapReady,
@@ -1561,6 +2035,8 @@ export default function MapView({
   // remounting every marker (maintained through each layer's add/remove
   // events, so it's correct however react-leaflet (re)creates the layer group).
   const registryRef = useRef(new Map<string, RegistryEntry>());
+  // Мост «жест переноса → подсказки норм»: SelectionController зовёт, DragNormsController слушает.
+  const dragNormsRef = useRef<DragNormsApi | null>(null);
   const stateRef = useRef({ selectedIds, violationIds });
   stateRef.current = { selectedIds, violationIds };
   const appliedRef = useRef({ selectedIds, violationIds });
@@ -1763,6 +2239,15 @@ export default function MapView({
         onViewChange={onViewChange}
         focusRequest={focusRequest}
         crsVerified={crsVerified}
+        dragNormsRef={dragNormsRef}
+      />
+      <DragNormsController
+        apiRef={dragNormsRef}
+        planIndex={planIndex}
+        registryRef={registryRef}
+        crsVerified={crsVerified}
+        loadNearby={loadNearbyConstraints}
+        loadNearestAllowed={loadNearestAllowed}
       />
       {loadHoverInfo && peekHoverInfo && (
         <HoverTooltipController enabled={hoverEnabled && showPlan} registryRef={registryRef} load={loadHoverInfo} peek={peekHoverInfo} />
