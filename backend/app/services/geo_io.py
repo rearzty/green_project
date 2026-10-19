@@ -163,9 +163,11 @@ def _crown_of(item: PlantingItemRow) -> str | None:
 
 
 def _crown_diameter_of(item: PlantingItemRow) -> float | None:
-    """Диаметр кроны дерева, м (geo_engine/config/species.yaml) — сводка плана
-    на фронте считает по нему, какую долю допустимой площади заняли кроны."""
-    if item.planting_type != "tree":
+    """Диаметр кроны растения, м (geo_engine/config/species.yaml) — сводка плана
+    на фронте считает по нему, какую долю допустимой площади заняли кроны
+    деревьев, а 3D-просмотр рисует по нему каждое дерево и куст своего размера
+    (раньше все деревья в 3D брали один норматив). У газона кроны нет."""
+    if item.planting_type == "lawn":
         return None
     from geo_engine.species import load_catalogue
 

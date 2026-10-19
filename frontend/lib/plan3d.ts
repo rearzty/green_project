@@ -93,7 +93,13 @@ export interface Building3D extends Polygon3D {
 export interface PlantingPoint3D {
   x: number;
   y: number;
+  /** Радиус кроны, м: из диаметра кроны породы (`crown_m` посадки), а если его
+   * нет — норматив типа посадки (planting_norms.yaml). */
   canopyRadius: number;
+  /** Порода из плана — по ней ThreeDView подбирает форму и цвет (lib/plantLook.ts). */
+  species: string | null;
+  /** Класс кроны дерева (wide/medium/narrow); у куста null. */
+  crownClass: string | null;
 }
 
 export interface Scene3DBounds {
@@ -267,10 +273,16 @@ export function buildScene3DData(
       const point = pointLonLat(feature.geometry);
       if (!point) continue;
       const [x, y] = projector.project(point[0], point[1]);
+      const props = feature.properties as { species?: unknown; crown?: unknown; crown_m?: unknown };
+      // Реальный размер кроны породы, а не один норматив на всех: липа (8 м) и
+      // рябина (4 м) в плане занимают разное место, и 3D обязан это показывать.
+      const crownDiameter = typeof props.crown_m === "number" && props.crown_m > 0 ? props.crown_m : null;
       (plantingType === "tree" ? trees : shrubs).push({
         x,
         y,
-        canopyRadius: plantingType === "tree" ? treeCanopyRadius : shrubCanopyRadius,
+        canopyRadius: crownDiameter !== null ? crownDiameter / 2 : plantingType === "tree" ? treeCanopyRadius : shrubCanopyRadius,
+        species: typeof props.species === "string" && props.species !== "default" ? props.species : null,
+        crownClass: typeof props.crown === "string" ? props.crown : null,
       });
     }
   }
