@@ -443,7 +443,8 @@ class Dropped:
     # нет, нарушений ноль); with_deselect — в том же ответе «сними
     # выделение», непонятно, что из двух имелось в виду; lawn_only — газон тип
     # не меняет; same_type — выделенные уже этого типа; asked — просьба была
-    # вопросом или условием («можно удалить выделенные?»).
+    # вопросом или условием («можно удалить выделенные?»); negated, except,
+    # no_request, partial, not_confirmed — строгий допуск, см. edit_gate.
     reason: str
 
 
@@ -453,6 +454,7 @@ def guard_commands(
     *,
     select_attempted: bool = False,
     asked: Collection[str] = (),
+    message: str | None = None,
 ) -> tuple[list[AssistantCommand], list[Dropped]]:
     """Правила, которые держит код, а не промпт: модель можно уговорить, код — нет.
 
@@ -468,6 +470,9 @@ def guard_commands(
         только так: «можно удалить выделенные?», «а если сделать их
         кустами?») не выполняется: модель и разбор выполнили бы вопрос
         буквально. Юна объясняет, что будет, и ждёт просьбы.
+    (d) `message` — строгий допуск (edit_gate): правка проходит, только если
+        сообщение — прямая просьба именно о ней, без отрицания, исключения,
+        вопроса или условия, и не про часть выделенного.
     «Сними выделение и удали» — ни то ни другое молча: выделение остаётся,
     чтобы следующей просьбой удалить можно было именно его.
     Ослабить нормы отступов нечем вовсе — такого инструмента нет.
@@ -482,6 +487,8 @@ def guard_commands(
     for command in commands:
         if isinstance(command, EditSelectionCommand):
             reason = _edit_refusal(command.operation, selection, bool(picks), select_attempted, bool(selects), asked)
+            if reason is None and message is not None:
+                reason = edit_gate(message, command.operation, selection)
             if reason:
                 dropped.append(Dropped(command.operation, reason))
                 continue
@@ -684,6 +691,20 @@ def describe_actions(
             )
         elif drop.reason == "asked":
             sentences.append(_asked_text(drop.operation, selection))
+        elif drop.reason == "negated":
+            sentences.append(f"{_NOT_DONE[drop.operation]} В сообщении есть «не»/«нет» — если всё же нужно, скажите просто «{_SAY[drop.operation]}».")
+        elif drop.reason == "except":
+            sentences.append(
+                f"{_NOT_DONE[drop.operation]} Правлю только выделенное, «кроме» и «остальные» не выполняю — "
+                "выделите ровно то, что нужно изменить."
+            )
+        elif drop.reason in ("no_request", "not_confirmed"):
+            sentences.append(f"{_NOT_DONE[drop.operation]} Если нужно, скажите прямо: «{_SAY[drop.operation]}».")
+        elif drop.reason == "partial":
+            sentences.append(
+                f"{_NOT_DONE[drop.operation]} В выделении есть не только то, что вы назвали, а правка затронула бы всё "
+                "выделенное — выделите только нужные посадки (например, «выдели все кусты») и повторите."
+            )
         elif drop.reason == "lawn_only":
             sentences.append("Газон — это площадь, а не точка: деревом или кустом его не сделать.")
         elif drop.reason == "same_type":
@@ -1076,6 +1097,8 @@ class _Ctx:
     violations_count: int | None
     view: str
     default_spacing: dict[str, float]
+    # Сообщение целиком — для строгого допуска правки (edit_gate).
+    message: str | None = None
 
     @property
     def selected_count(self) -> int:
@@ -2187,6 +2210,7 @@ def _compose(intents: list[_Intent], ctx: _Ctx) -> RulesAnswer:
         ctx.selection,
         select_attempted=answer.select_attempted,
         asked={op for op, asked in answer.edit_asked.items() if asked},
+        message=ctx.message,
     )
     if any(isinstance(c, SelectCommand) and c.target == "violations" for c in commands):
         # «Сколько нарушений? Удали их»: «скажите «покажи нарушения»» рядом с
@@ -2237,6 +2261,7 @@ def rules_answer(
         violations_count=violations_count,
         view=view,
         default_spacing={**FALLBACK_SPACING, **(default_spacing or {})},
+        message=message,
     )
     if not split_clauses(message) and "?" in (message or ""):
         return RulesAnswer(HELP_TEXT, [])  # одинокий «?» — это «что ты умеешь»
@@ -2255,3 +2280,59 @@ def answer_with_rules(
     """rules_answer без подробностей для модельного пути: (ответ, команды)."""
     answer = rules_answer(message, settings, facts, selection, violations_count, view, default_spacing)
     return answer.reply, answer.commands
+
+
+# --- Строгий допуск правки -----------------------------------------------------
+#
+# Правка выделенного разрушительна, а понять просьбу неверно легко: состязательная
+# проверка находила удаление на «не удоляй» (отрицание с опечаткой), «удали всё
+# кроме выделенных», вопросах без «?» («а можно удалить выделенные»), и
+# «удали выделенные кусты» удаляло вместе с кустами выделенные деревья. Поэтому
+# допуск — не «нашёлся глагол», а «ничего не мешает»: лишний отказ стоит одного
+# повторного сообщения, лишнее удаление — чужой работы. Один и тот же допуск
+# держат оба режима (guard_commands), модель обойти его не может.
+
+# Любое отрицание в сообщении — правки нет. Без разбора, к чему оно относится:
+# «ни удаляй», «не надо пока», «нельзя удалять» одинаково не просьба.
+_GATE_NEGATION = _rx(r"\b(не|ни|нельзя|нет|отставить|стоп|погоди\w*|подожди\w*|отмен\w*|передумал\w*)\b")
+# Исключение из выделения: правка задела бы не выделенное.
+_GATE_EXCEPT = _rx(r"\b(кроме|помимо|исключ\w*|за исключением|остальн\w*|невыделенн\w*|невыбранн\w*)\b")
+# Вопрос без вопросительного знака и условие — то, что _ASKING не ловит.
+_GATE_ASKING = _rx(
+    r"^(а\s+|и\s+|ну\s+|так\s+)?(как|что|зачем|почему|сколько|какие|какой|где|когда|разве|неужели|надо|нужно|"
+    r"стоит|могла бы|мог бы|получится|хорошо бы|было бы)\b"
+    r"|\b(если|когда|вдруг|бы|ли|наверное|может быть|возможно)\b"
+)
+_GATE_SOURCES = {"tree": "trees", "shrub": "shrubs", "lawn": "lawns"}
+
+
+def edit_gate(message: str, operation: str, selection: AssistantSelection | None) -> str | None:
+    """Причина не выполнять правку выделенного по этому сообщению, или None.
+
+    negated — в сообщении отрицание; except — исключение из выделения;
+    asked — вопрос или условие, в том числе без «?»; no_request — в сообщении
+    нет самой просьбы об этой правке (модель вызвала правку по догадке);
+    partial — просьба про часть выделенного («удали выделенные кусты», когда
+    выделены и деревья): правка задела бы и то, о чём не просили.
+    """
+    text = normalize(message or "")
+    if _GATE_NEGATION.search(text):
+        return "negated"
+    if _GATE_EXCEPT.search(text):
+        return "except"
+    if "?" in (message or "") or is_question(message or "") or any(_GATE_ASKING.search(c) for c in split_clauses(message or "")):
+        return "asked"
+    if operation == "delete":
+        if not _DELETE.search(text):
+            return "no_request"
+        named = set(_subjects(text))
+    else:
+        if _retype_operation(text) != operation:
+            return "no_request"
+        target = "tree" if operation == "to_tree" else "shrub"
+        named = set(_subjects(text)) - {target}
+    if named and selection is not None and selection.count:
+        outside = sum(getattr(selection, field) for kind, field in _GATE_SOURCES.items() if kind not in named)
+        if outside > 0:
+            return "partial"
+    return None

@@ -709,6 +709,25 @@ def _asked_operations(message: str, parsed: RulesAnswer | None) -> tuple[str, ..
     return tuple(op for op in EDIT_OPERATIONS if op not in said)
 
 
+def _unconfirmed_edits(
+    commands: list[AssistantCommand], parsed: RulesAnswer | None
+) -> tuple[list[AssistantCommand], list[Dropped]]:
+    """A model's edit_selection stands only when the built-in parser read the
+    same edit in the message too -- the model can be talked into a call (seen
+    in the adversarial check: a guard on the parser side turned a refusal into
+    a delete), a fixed parser can't. Removed edits come back as drops."""
+    said = {c.operation for c in (parsed.commands if parsed else []) if isinstance(c, EditSelectionCommand)}
+    confirms = set(parsed.confirms) if parsed else set()
+    dropped: list[Dropped] = []
+    kept: list[AssistantCommand] = []
+    for command in commands:
+        if isinstance(command, EditSelectionCommand) and command.operation not in said and command.operation not in confirms:
+            dropped.append(Dropped(command.operation, "not_confirmed"))
+            continue
+        kept.append(command)
+    return kept, dropped
+
+
 def _more_commands(parsed: list[AssistantCommand], commands: list[AssistantCommand]) -> bool:
     return len({_command_key(c) for c in parsed}) > len({_command_key(c) for c in commands})
 
@@ -835,7 +854,24 @@ async def ask_yuna(
     parsed = _parser_answer(message, current, facts, selection, violations_count, view, defaults)
     if not result.commands and not result.notes and parsed is not None and _parser_knows_better(parsed, reply):
         logger.info("The model called nothing for %r (%r) -- the built-in parser answers", message, reply[:80])
-        return parsed.reply, parsed.commands
+        edits = [c for c in parsed.commands if isinstance(c, EditSelectionCommand)]
+        if not edits:
+            return parsed.reply, parsed.commands
+        # The model declined to edit -- the parser never edits in its place:
+        # a destructive edit needs both to read the message as one.
+        rest = [c for c in parsed.commands if not isinstance(c, EditSelectionCommand)]
+        if not rest and reply:
+            return reply, []
+        text = describe_actions(
+            rest,
+            [Dropped(e.operation, "not_confirmed") for e in edits],
+            current=current,
+            selection=selection,
+            violations_count=violations_count,
+            facts=facts,
+            default_spacing=defaults,
+        )
+        return text, rest
     if result.commands and parsed is not None and _more_commands(parsed.commands, result.commands):
         try:
             more = _tool_calls(await _chat([*messages, *_answered_calls(choice)]))
@@ -861,7 +897,12 @@ async def ask_yuna(
         # delete what is selected now.
         select_attempted=result.select_attempted or bool(parsed and parsed.select_attempted),
         asked=_asked_operations(message, parsed),
+        message=message,
     )
+    # Last, so the more specific reasons above (nothing selected, a question)
+    # are what the user hears.
+    commands, unconfirmed = _unconfirmed_edits(commands, parsed)
+    dropped += unconfirmed
     dropped += [d for d in deferred if d.operation not in {x.operation for x in dropped}]
     if deferred and not result.notes and commands == parsed.commands:
         # Exactly the parser's two steps: its reply also answers what was asked

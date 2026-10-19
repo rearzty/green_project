@@ -71,8 +71,11 @@ class TestExplainItemsById:
         assert record.compliant
         # "Клён остролистный" -- широкая крона (8м > 5м) -- триггерит
         # увеличивающую поправку по примечанию 1 (743-ПП), поэтому именно
-        # он, а не СП 42.13330.2016, становится определяющим основанием.
-        assert "743-ПП" in record.summary
+        # он, а не СП 42.13330.2016, основание отступа от газопровода.
+        # (Определяющим в сводке может стать интервал до соседнего дерева —
+        # карточка теперь видит соседей, см. TestOneItemSeesItsNeighbours.)
+        gas = next(c for c in record.checks if c.object_type == "gas_pipe")
+        assert "743-ПП" in gas.citation
 
     def test_a_planting_too_close_to_the_gas_pipe_is_a_violation(self):
         plan = _plan_with_gas_pipe_and_two_trees()
@@ -127,3 +130,29 @@ class TestFullTraceCsv:
         assert len(rows) == row_count
         assert row_count > 0
         assert {"act", "clause", "required_m", "actual_m"} <= set(rows[0])
+
+
+class TestOneItemSeesItsNeighbours:
+    """The map's check counts the tree-to-tree interval against the whole plan;
+    the card of one selected tree used to explain it alone -- with no
+    neighbour in sight, a tree the map paints red was called compliant."""
+
+    def test_a_crowded_tree_is_a_violation_on_its_own_card(self):
+        plan = _plan_with_gas_pipe_and_two_trees()
+        plan.items.append(
+            PlantingItemRow(
+                id="tree-crowding",
+                plan_id="plan-1",
+                geometry=shape_to_db(Point(12, 10)),
+                planting_type="tree",
+                species="Клён остролистный",
+                score=0.8,
+                rationale="",
+            )
+        )
+
+        [(item_id, record)] = explain_items_by_id(plan.project, plan, ["tree-far"], load_norms())
+
+        assert item_id == "tree-far"
+        neighbour = next(c for c in record.checks if c.object_type == "neighbour_tree")
+        assert neighbour.actual_m < neighbour.required_m and not record.compliant
