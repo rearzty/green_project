@@ -3,10 +3,45 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { mergeGeometries, mergeVertices } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 
 import { getPlantingNorms, type GeoJSONFeatureCollection, type PlantingNorms } from "@/lib/api";
-import { buildScene3DData, hashToUnit, MAX_3D_ITEMS, type Building3D, type PlantingPoint3D, type Polygon3D } from "@/lib/plan3d";
-import { SEASON_PALETTES, ZONE_COLORS, type Season } from "@/lib/mapStyle";
+import { buildScene3DData, hashToUnit, MAX_3D_ITEMS, walkStops, pointInRing, type Building3D, type PlantingPoint3D, type Polygon3D } from "@/lib/plan3d";
+import { lookOf, type CrownForm, type PlantLook } from "@/lib/plantLook";
+import { applySceneTheme, SEASON_PALETTES, type SceneTheme, type Season } from "@/lib/mapStyle";
+import { PLANTING_TYPE_LABELS } from "@/lib/format";
+
+/** Ракурсы камеры (components/map/CameraControls3D.tsx): общий вид, сверху и
+ * обход участков посадок вплотную (`walk-next`/`walk-prev`). */
+export type CameraPose = "overview" | "top" | "walk-next" | "walk-prev";
+
+/** Где камера в обходе: номер участка (с 1) и сколько их всего; 0 — обход не начат. */
+export interface WalkState {
+  index: number;
+  total: number;
+}
+
+/** Камера обхода: за участком, на этом расстоянии по горизонтали и на этой высоте
+ * над землёй. С такой точки видно ~60 м улицы вперёд, а у дерева различим ствол. */
+const WALK_BACK_M = 26;
+const WALK_HEIGHT_M = 13;
+const WALK_TARGET_HEIGHT_M = 2;
+/** Двойной щелчок по земле: подлёт к месту — столько метров от точки, под таким
+ * углом возвышения. */
+const FLY_TO_DISTANCE_M = 30;
+const FLY_TO_ELEVATION = 0.55;
+/** Щелчок по земле дальше этого от любой посадки — в пустоту не летим. */
+const FLY_TO_PLANT_REACH_M = 15;
+/** Ближе этого к цели камера не подходит: ниже уже стена из веток, а дальше
+ * камеры лежит ближняя плоскость отсечения. */
+const MIN_CAMERA_DISTANCE_M = 2;
+
+
+export interface CameraCommand {
+  pose: CameraPose;
+  /** Растёт с каждым нажатием: повторный выбор того же ракурса — тоже команда. */
+  seq: number;
+}
 
 export interface ThreeDViewProps {
   layers?: GeoJSONFeatureCollection;
@@ -29,6 +64,14 @@ export interface ThreeDViewProps {
    * different, differently-scaled territory) shouldn't inherit one either.
    * Persistence is simply skipped when this is undefined (no project open yet). */
   storageKey?: string;
+  /** Оформление сцены: светлый день или тёмный «Графит» под интерфейс. */
+  sceneTheme?: SceneTheme;
+  /** Перелёт камеры в выбранный ракурс. Не пересобирает сцену. */
+  cameraCommand?: CameraCommand | null;
+  /** Медленный облёт вокруг участка. */
+  autoRotate?: boolean;
+  /** Сообщает, на каком участке обхода камера (для подписи «3 из 24»). */
+  onWalkChange?: (state: WalkState) => void;
 }
 
 // Ground stacked in thin slabs (territory, then road/greenery/lawn on top)
@@ -46,36 +89,18 @@ const EXISTING_GREENERY_Y = TERRITORY_DEPTH_M + 0.14;
 const LAWN_Y = TERRITORY_DEPTH_M + 0.2;
 const PLANTING_BASE_Y = TERRITORY_DEPTH_M + 0.2;
 
-const TRUNK_COLOR = "#7c5a3a";
+/** Анизотропная фильтрация для текстур окон и газона: без неё окна здания на
+ * расстоянии рябят муаром. Выставляется один раз при создании рендерера (он
+ * знает предел видеокарты), текстуры читают значение при создании. */
+let textureAnisotropy = 1;
 
-// One shared canvas texture for every building's walls -- Texture.clone()
-// (used per-building below) copies only repeat/wrapping settings, not
-// pixels, so this stays a single small GPU upload regardless of how many
-// buildings a site has (~25+ on this session's stress-test site).
-let sharedWindowTexture: THREE.CanvasTexture | null = null;
-function getWindowTexture(): THREE.CanvasTexture {
-  if (sharedWindowTexture) return sharedWindowTexture;
-  const canvas = document.createElement("canvas");
-  canvas.width = canvas.height = 64;
-  const ctx = canvas.getContext("2d")!;
-  // Higher contrast than a first attempt (light grey wall / near-white
-  // windows) turned out to need -- at real building scale the pattern
-  // tiled so finely it washed out to a flat grey blur from any normal
-  // viewing distance. Darker "glass" squares against a lighter wall read
-  // as windows even at a glance.
-  ctx.fillStyle = "#d6d3d1";
-  ctx.fillRect(0, 0, 64, 64);
-  ctx.fillStyle = "#475569";
-  for (let y = 6; y < 64; y += 16) {
-    for (let x = 6; x < 64; x += 16) ctx.fillRect(x, y, 10, 10);
-  }
-  sharedWindowTexture = new THREE.CanvasTexture(canvas);
-  sharedWindowTexture.wrapS = sharedWindowTexture.wrapT = THREE.RepeatWrapping;
-  sharedWindowTexture.colorSpace = THREE.SRGBColorSpace;
-  return sharedWindowTexture;
-}
+/** Тени считаются только на сцене не крупнее этого числа посадок: теневая карта —
+ * ещё один проход по всем экземплярам, а на реальном масштабе (сотни тысяч
+ * посадок на участке в километр) разрешения одной карты всё равно не хватило бы
+ * на читаемую тень. Выше порога сцена рисуется без теней, как раньше. */
+const SHADOW_ITEM_LIMIT = 80_000;
 
-// Same shared-canvas-texture trick as the window texture above, but drawn in
+// A shared canvas texture for every lawn, drawn in
 // neutral white/grey (not pre-colored green) -- MeshStandardMaterial
 // multiplies a diffuse map by `material.color`, so painting it grayscale lets
 // SEASON_PALETTES' actual lawn color (spring pale green through winter
@@ -118,6 +143,7 @@ function lawnMesh(polygon: Polygon3D, color: string, y: number, disposables: Dis
   if (!shape) return null;
   const geometry = new THREE.ShapeGeometry(shape);
   const texture = getGrassTexture().clone();
+  texture.anisotropy = textureAnisotropy;
   texture.needsUpdate = true;
   texture.repeat.set(1 / GRASS_TILE_METRES, 1 / GRASS_TILE_METRES);
   const material = new THREE.MeshStandardMaterial({ color, map: texture, side: THREE.DoubleSide });
@@ -171,179 +197,770 @@ function extrudedMesh(polygon: Polygon3D, color: string, height: number, baseY: 
   return mesh;
 }
 
-/** Buildings only (territory/roads/etc. keep using extrudedMesh/flatMesh
- * above with one material) -- ExtrudeGeometry groups faces by material index
- * 0 = lid (top + bottom caps, from buildLidFaces) and 1 = extruded side
- * walls (from buildSideFaces), confirmed against the installed three@0.186.0
- * source rather than assumed, so a flat roof color and a textured wall are
- * two separate materials passed as an array, not one material with a
- * texture that would also smear across the roof. */
-function buildingMesh(building: Building3D, capColor: string, baseY: number, disposables: Disposable[]): THREE.Mesh | null {
+/** Стили фасадов: панельный дом, кирпичный, оштукатуренный. Какой у здания — по
+ * хэшу его контура (plan3d.ts), как и высота: реальных данных о фасадах нет, это
+ * оформление, а не сведения о доме. */
+type FacadeStyle = "panel" | "brick" | "plaster";
+const FACADE_STYLES: FacadeStyle[] = ["panel", "brick", "plaster"];
+/** Плитка фасада — 4×4 окна по 3 м: у каждого своё состояние (шторы, свет), и узор
+ * повторяется только раз в 12 м, а не в каждом окне (иначе фасад — штамп). */
+const FACADE_TILE_M = 12;
+const FACADE_BAY_M = 3;
+/** Лёгкий оттенок стены поверх цвета текстуры: дома одного стиля не близнецы. */
+const FACADE_TINTS = ["#ffffff", "#f6eee2", "#e8efe9", "#f2e8ee"];
+const ROOF_COLORS = ["#8e8c88", "#6f6b67", "#9a5d4a", "#7d8b7b"];
+
+function facadeTexture(style: FacadeStyle): THREE.CanvasTexture {
+  const size = 256;
+  const bay = size / 4;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d")!;
+  const salt = style === "brick" ? 1.7 : style === "plaster" ? 5.3 : 9.1;
+  const rnd = (n: number) => hashToUnit(n * 7.13 + salt);
+
+  ctx.fillStyle = style === "brick" ? "#c98d73" : style === "plaster" ? "#eee6cf" : "#dedad2";
+  ctx.fillRect(0, 0, size, size);
+  if (style === "brick") {
+    for (let row = 0; row < size / 6; row++) {
+      const y = row * 6;
+      const offset = row % 2 ? 7 : 0;
+      for (let x = -offset; x < size; x += 14) {
+        const tone = rnd(row * 53 + x);
+        ctx.fillStyle = tone > 0.5 ? `rgba(255,222,200,${0.06 + tone * 0.1})` : `rgba(90,40,30,${0.05 + tone * 0.12})`;
+        ctx.fillRect(x + 1, y + 1, 12, 4);
+      }
+      ctx.fillStyle = "rgba(236,226,216,0.6)";
+      ctx.fillRect(0, y + 5, size, 1);
+      for (let x = -offset; x < size; x += 14) ctx.fillRect(x + 13, y, 1, 6);
+    }
+  } else {
+    for (let i = 0; i < 700; i++) {
+      ctx.fillStyle = `rgba(0,0,0,${0.025 + rnd(i) * 0.03})`;
+      ctx.fillRect(rnd(i * 3 + 1) * size, rnd(i * 5 + 2) * size, 1 + rnd(i * 7 + 3) * 2, 1 + rnd(i * 11 + 4) * 2);
+    }
+    if (style === "panel") {
+      // Стыки панелей: между окнами и между этажами.
+      ctx.fillStyle = "rgba(120,115,108,0.55)";
+      for (let k = 0; k < 4; k++) {
+        ctx.fillRect(k * bay, 0, 2, size);
+        ctx.fillRect(0, k * bay, size, 2);
+      }
+    } else {
+      // Поэтажные полочки.
+      for (let k = 0; k < 4; k++) {
+        ctx.fillStyle = "rgba(255,255,255,0.55)";
+        ctx.fillRect(0, k * bay + 2, size, 3);
+        ctx.fillStyle = "rgba(0,0,0,0.08)";
+        ctx.fillRect(0, k * bay + 5, size, 2);
+      }
+    }
+  }
+
+  for (let j = 0; j < 4; j++) {
+    for (let i = 0; i < 4; i++) {
+      const wide = style === "plaster" ? 40 : 36;
+      const x = i * bay + (bay - wide) / 2;
+      const y = j * bay + 14;
+      const h = 34;
+      const roll = rnd(j * 4 + i + 100);
+      ctx.fillStyle = "#f4f4f2";
+      ctx.fillRect(x - 2, y - 2, wide + 4, h + 4);
+      const glass = ctx.createLinearGradient(0, y, 0, y + h);
+      if (roll > 0.82) {
+        glass.addColorStop(0, "#f2de9e");
+        glass.addColorStop(1, "#c8a65a"); // свет в окне
+      } else if (roll > 0.6) {
+        glass.addColorStop(0, "#d2c4a4");
+        glass.addColorStop(1, "#a99b7e"); // шторы
+      } else {
+        glass.addColorStop(0, "#718ca8");
+        glass.addColorStop(1, "#33475e");
+      }
+      ctx.fillStyle = glass;
+      ctx.fillRect(x, y, wide, h);
+      ctx.fillStyle = "#f4f4f2";
+      ctx.fillRect(x + wide / 2 - 1, y, 2, h);
+      ctx.fillStyle = "rgba(255,255,255,0.14)";
+      ctx.beginPath();
+      ctx.moveTo(x + 4, y + h);
+      ctx.lineTo(x + 14, y);
+      ctx.lineTo(x + 22, y);
+      ctx.lineTo(x + 12, y + h);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = "rgba(70,66,60,0.55)";
+      ctx.fillRect(x - 3, y + h + 2, wide + 6, 3);
+      if (style === "panel" && rnd(j * 9 + i + 300) > 0.72) {
+        // Балкон: плита и ограждение под окном.
+        ctx.fillStyle = "rgba(96,99,103,0.85)";
+        ctx.fillRect(i * bay + 4, y + h + 5, bay - 8, 5);
+        ctx.fillStyle = "rgba(60,64,70,0.55)";
+        ctx.fillRect(i * bay + 4, y + h - 6, bay - 8, 11);
+      }
+    }
+  }
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.wrapS = THREE.RepeatWrapping;
+  texture.wrapT = THREE.RepeatWrapping;
+  texture.colorSpace = THREE.SRGBColorSpace;
+  // У боковых граней ExtrudeGeometry v = 1 − высота, то есть вверх он убывает; без flipY
+  // фасад висел бы вверх ногами (подоконники над окнами).
+  texture.flipY = false;
+  texture.anisotropy = textureAnisotropy;
+  texture.repeat.set(1 / FACADE_TILE_M, 1 / FACADE_TILE_M);
+  return texture;
+}
+
+/** Общие материалы зданий: три фасада × четыре оттенка и четыре крыши на всю сцену,
+ * а не по материалу и текстуре на каждый дом. Тёмная тема приглушает всё. */
+class BuildingKit {
+  private readonly textures = new Map<FacadeStyle, THREE.CanvasTexture>();
+  private readonly walls = new Map<string, THREE.MeshStandardMaterial>();
+  private readonly roofs = new Map<number, THREE.MeshStandardMaterial>();
+  constructor(private readonly dim: number, private readonly disposables: Disposable[]) {}
+
+  wall(style: FacadeStyle, tone: number): THREE.MeshStandardMaterial {
+    const key = `${style}:${tone}`;
+    let material = this.walls.get(key);
+    if (!material) {
+      let texture = this.textures.get(style);
+      if (!texture) {
+        texture = facadeTexture(style);
+        this.textures.set(style, texture);
+      }
+      material = new THREE.MeshStandardMaterial({ map: texture, vertexColors: true, color: new THREE.Color(FACADE_TINTS[tone]).multiplyScalar(this.dim), roughness: 0.92 });
+      this.walls.set(key, material);
+      this.disposables.push({ material, texture: this.textures.get(style) });
+    }
+    return material;
+  }
+
+  roof(index: number): THREE.MeshStandardMaterial {
+    let material = this.roofs.get(index);
+    if (!material) {
+      material = new THREE.MeshStandardMaterial({ color: new THREE.Color(ROOF_COLORS[index]).multiplyScalar(this.dim), vertexColors: true, roughness: 0.95 });
+      this.roofs.set(index, material);
+      this.disposables.push({ material });
+    }
+    return material;
+  }
+}
+
+/** Здание: ExtrudeGeometry группирует грани по материалам — индекс 0 крышка и дно,
+ * индекс 1 боковые стены (подтверждено чтением исходников three 0.186), поэтому
+ * крыша — плоский цвет, а фасад — текстура, не размазанная по крыше. Цвет вершин
+ * темнее у земли (стена там затенена и испачкана — без этого дом «стоит на листе»),
+ * сдвиг текстуры свой у каждого дома — соседние фасады не повторяют друг друга. */
+function buildingMesh(building: Building3D, kit: BuildingKit, baseY: number): THREE.Mesh | null {
   const shape = shapeFromPolygon(building);
   if (!shape) return null;
   const geometry = new THREE.ExtrudeGeometry(shape, { depth: building.height, bevelEnabled: false });
-  const capMaterial = new THREE.MeshStandardMaterial({ color: capColor });
 
-  const wallTexture = getWindowTexture().clone();
-  wallTexture.needsUpdate = true;
-  // ExtrudeGeometry's default side-wall UV generator (verified by reading
-  // three's own source, not assumed) does NOT normalize U/V to [0,1] per
-  // face -- it uses the vertex's raw LOCAL METER coordinate directly (the
-  // along-wall axis for U, extrusion depth for V). A repeat count meant for
-  // "N tiles across the whole wall" was actually being read as "N tiles per
-  // metre", tiling a real building's wall so finely (sub-centimetre) that it
-  // averaged out to a flat grey blur -- found live, close-up screenshots
-  // showed no visible pattern at all despite the material/texture/UVs all
-  // checking out individually. Fixed by treating repeat as "tiles per
-  // metre" directly: 1 tile roughly every 3m reads as a believable
-  // window-bay rhythm at both real (tens of metres) and demo (~20m) scale.
-  const TILE_METRES = 3;
-  wallTexture.repeat.set(1 / TILE_METRES, 1 / TILE_METRES);
-  const wallMaterial = new THREE.MeshStandardMaterial({
-    map: wallTexture,
-    // Same centroid hash `height` derives from -- a subtle per-building tint
-    // so a row of buildings doesn't look like identical clones, without a
-    // second, unrelated source of randomness.
-    color: new THREE.Color().setHSL(building.hash01, 0.12, 0.55),
-  });
+  const position = geometry.attributes.position;
+  const colors = new Float32Array(position.count * 3);
+  for (let i = 0; i < position.count; i++) {
+    const z = position.getZ(i);
+    const t = Math.max(0, Math.min(1, z / 5));
+    const shade = 0.66 + 0.34 * t * t * (3 - 2 * t);
+    colors[i * 3] = shade;
+    colors[i * 3 + 1] = shade;
+    colors[i * 3 + 2] = shade;
+  }
+  geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
 
-  const mesh = new THREE.Mesh(geometry, [capMaterial, wallMaterial]);
+  const uv = geometry.attributes.uv;
+  const offsetU = hashToUnit(building.hash01 * 91.7 + 3.1) * FACADE_TILE_M;
+  const offsetV = Math.floor(hashToUnit(building.hash01 * 57.3 + 8.8) * 4) * FACADE_BAY_M;
+  for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) + offsetU, uv.getY(i) + offsetV);
+
+  const style = FACADE_STYLES[Math.min(FACADE_STYLES.length - 1, Math.floor(building.hash01 * FACADE_STYLES.length))];
+  const tone = Math.floor(hashToUnit(building.hash01 * 13.7 + 1.9) * FACADE_TINTS.length) % FACADE_TINTS.length;
+  const roof = Math.floor(hashToUnit(building.hash01 * 29.1 + 6.6) * ROOF_COLORS.length) % ROOF_COLORS.length;
+  const mesh = new THREE.Mesh(geometry, [kit.roof(roof), kit.wall(style, tone)]);
   mesh.rotation.x = -Math.PI / 2;
   mesh.position.y = baseY;
-  disposables.push({ geometry, material: capMaterial });
-  disposables.push({ geometry, material: wallMaterial, texture: wallTexture });
   return mesh;
 }
 
+/** Карниз и крышные надстройки всех домов — одним мешем, а не по мешу на дом.
+ * Карниз — полка вокруг крыши (контур, чуть увеличенный вокруг центра, ниже уровня
+ * крыши: виден только свес). Надстройки — лифтовая/лестничная шахта и вентканалы в
+ * местах, где они целиком внутри контура: крыша перестаёт быть пустой плиткой. */
+function buildRoofDetails(buildings: Building3D[], baseY: number, dim: number, disposables: Disposable[]): THREE.Mesh | null {
+  const parts: THREE.BufferGeometry[] = [];
+  const paint = (geometry: THREE.BufferGeometry, hex: string) => {
+    const color = new THREE.Color(hex).multiplyScalar(dim);
+    const count = geometry.attributes.position.count;
+    const array = new Float32Array(count * 3);
+    for (let i = 0; i < count; i++) array.set([color.r, color.g, color.b], i * 3);
+    geometry.setAttribute("color", new THREE.BufferAttribute(array, 3));
+    geometry.clearGroups();
+    return geometry;
+  };
+  for (const building of buildings) {
+    const ring = building.outer;
+    if (ring.length < 4 || building.height < 5) continue;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    let cx = 0;
+    let cy = 0;
+    for (const [x, y] of ring) {
+      minX = Math.min(minX, x);
+      maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y);
+      maxY = Math.max(maxY, y);
+      cx += x;
+      cy += y;
+    }
+    cx /= ring.length;
+    cy /= ring.length;
+    const half = Math.max(maxX - minX, maxY - minY) / 2;
+    const top = baseY + building.height;
+
+    // Карниз.
+    const scaled = ring.map(([x, y]): [number, number] => [cx + (x - cx) * (1 + 0.5 / Math.max(2, half)), cy + (y - cy) * (1 + 0.5 / Math.max(2, half))]);
+    const ledgeShape = shapeFromPolygon({ outer: scaled, holes: [] });
+    if (ledgeShape) {
+      const ledge = new THREE.ExtrudeGeometry(ledgeShape, { depth: 0.45, bevelEnabled: false });
+      ledge.rotateX(-Math.PI / 2);
+      ledge.translate(0, top - 0.5, 0);
+      parts.push(paint(ledge, "#d9d5cd"));
+    }
+
+    // Надстройки: шахта побольше и пара вентканалов, каждая только если помещается в контур.
+    const inside = (x: number, y: number, w: number, d: number) =>
+      pointInRing(x - w / 2, y - d / 2, ring) && pointInRing(x + w / 2, y - d / 2, ring) && pointInRing(x - w / 2, y + d / 2, ring) && pointInRing(x + w / 2, y + d / 2, ring);
+    const seed = building.hash01 * 100;
+    const boxes: [number, number, number, number, number, string][] = [
+      [2.4 + hashToUnit(seed + 1) * 1.4, 2.6, 2.4 + hashToUnit(seed + 2) * 1.4, (hashToUnit(seed + 3) - 0.5) * half * 0.6, (hashToUnit(seed + 4) - 0.5) * half * 0.6, "#7d7974"],
+      [0.8, 0.9, 0.8, (hashToUnit(seed + 5) - 0.5) * half * 1.1, (hashToUnit(seed + 6) - 0.5) * half * 1.1, "#8a8680"],
+      [0.8, 0.9, 0.8, (hashToUnit(seed + 7) - 0.5) * half * 1.1, (hashToUnit(seed + 8) - 0.5) * half * 1.1, "#8a8680"],
+    ];
+    for (const [w, h, d, dx, dy, color] of boxes) {
+      const bx = cx + dx;
+      const by = cy + dy;
+      if (!inside(bx, by, w, d)) continue;
+      const box = new THREE.BoxGeometry(w, h, d).toNonIndexed();
+      box.translate(bx, top + h / 2, -by); // план y → сцена −z
+      parts.push(paint(box, color));
+    }
+  }
+  if (parts.length === 0) return null;
+  const merged = mergeGeometries(parts);
+  parts.forEach((part) => part.dispose());
+  if (!merged) return null;
+  const material = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95 });
+  disposables.push({ geometry: merged, material });
+  return new THREE.Mesh(merged, material);
+}
+
 interface Disposable {
-  geometry: THREE.BufferGeometry;
-  material: THREE.Material;
+  geometry?: THREE.BufferGeometry;
+  /** Нет у геометрии, чей материал общий с другой и освобождается вместе с ней. */
+  material?: THREE.Material;
   // Material.dispose() does not cascade-dispose a `map` texture -- a cloned
   // per-building window texture (see buildingMesh below) needs its own
   // explicit disposal or it leaks on every remount/season rebuild.
   texture?: THREE.Texture;
 }
 
-/** Per-plant look derived once from its own (x, y) via hashToUnit
- * (plan3d.ts) -- same plant always renders the same way across a full scene
- * rebuild (season change, ensure_materialized re-fetch), no separate
- * randomness source to keep in sync with anything. Three independent-looking
- * values come from one hash function by offsetting the seed (58.2/finding
- * three unrelated-looking outputs from one sine hash needs seeds spread
- * further apart than the hash's own short period of visible correlation --
- * these offsets were picked empirically, same spirit as buildingHash01's own
- * 0.1013/0.0721 weights). */
-interface PlantInstanceStyle {
-  /** ~0.82-1.18 -- scales trunk height/radius and canopy size together, so a
-   * "taller" tree's canopy doesn't detach from a not-equally-taller trunk. */
-  sizeJitter: number;
+/** Случайные, но воспроизводимые отличия одного растения от другого — из его
+ * же координат через hashToUnit (plan3d.ts): один и тот же план рисуется
+ * одинаково на любой пересборке сцены (смена сезона, повторная загрузка), и
+ * отдельного источника случайности, который надо синхронизировать, нет. */
+interface PlantJitter {
+  size: number;
+  height: number;
   rotationY: number;
+  hue: number;
+  saturation: number;
+  lightness: number;
 }
 
-function plantStyle(point: PlantingPoint3D, variantSalt: number): PlantInstanceStyle {
-  const seed = point.x * 0.1013 + point.y * 0.0721 + variantSalt;
+function plantJitter(point: PlantingPoint3D): PlantJitter {
+  const seed = point.x * 0.1013 + point.y * 0.0721;
   return {
-    sizeJitter: 0.82 + hashToUnit(seed + 31.7) * 0.36,
+    size: 0.9 + hashToUnit(seed + 31.7) * 0.2,
+    height: 0.9 + hashToUnit(seed + 77.3) * 0.2,
     rotationY: hashToUnit(seed + 58.2) * Math.PI * 2,
+    hue: (hashToUnit(seed + 12.9) - 0.5) * 0.03,
+    saturation: (hashToUnit(seed + 44.1) - 0.5) * 0.12,
+    lightness: (hashToUnit(seed + 91.6) - 0.5) * 0.12,
   };
 }
 
-/** One InstancedMesh trunk plus one of two canopy silhouettes (conical --
- * evergreen-ish, or rounded -- deciduous-ish) per tree, picked per-plant by
- * `plantStyle`'s hash so the same site always renders the same mix across
- * rebuilds. Still exactly 3 draw calls total for however many trees a plan
- * holds (trunk + 2 canopy buckets), not 3 per tree -- GPU instancing is what
- * makes hundreds of thousands of these (see CLAUDE.md) cheap in the first
- * place, splitting into 2 canopy shapes doesn't change that order of
- * magnitude. Geometry is a unit primitive (radius/height 1), scaled
- * per-instance via the matrix. */
-function buildTrees(points: PlantingPoint3D[], canopyColor: string, disposables: Disposable[]): THREE.Object3D[] {
+/** Сколько полигонов позволить на крону при таком числе экземпляров одной формы.
+ * У икосаэдра в three 20·(detail+1)² граней: детализация 2 — 180, 1 — 80, 0 — 20.
+ * Крона «lobed» (шесть шаров) на ступени 2 — 1 080 треугольников: для сотни деревьев
+ * это ничто и крона выглядит органично, а на реальном масштабе (сотни тысяч посадок,
+ * см. MAX_3D_ITEMS) — десятки миллионов и слайд-шоу на обычной видеокарте. Поэтому
+ * детализация падает ступенями: 2 (≈1 100, гладкая, с текстурой листвы) → 1 (≈480) →
+ * 0 (≈120, плоские грани) → -1 (один шар, 20): силуэт леса при этом остаётся, а число
+ * экземпляров не режется. */
+function crownDetail(instances: number): number {
+  if (instances <= 1_500) return 2;
+  if (instances <= 25_000) return 1;
+  if (instances <= 120_000) return 0;
+  return -1;
+}
+
+/** Сколько вариантов формы у одной формы кроны: без них все липы — близнецы и лес
+ * читается как штамп. Каждый вариант — свой `InstancedMesh`, то есть вызовов отрисовки
+ * на форму в три раза больше, но не больше, чем число посадок. */
+const CROWN_VARIANTS = 3;
+
+/** Шум значений в [0, 1]: гладкий, детерминированный, без внешних зависимостей. Нужен
+ * для неровностей кроны — на гладком шаре дерево читается леденцом на палочке. */
+function noise3(x: number, y: number, z: number): number {
+  const ix = Math.floor(x);
+  const iy = Math.floor(y);
+  const iz = Math.floor(z);
+  const fx = x - ix;
+  const fy = y - iy;
+  const fz = z - iz;
+  const u = fx * fx * (3 - 2 * fx);
+  const v = fy * fy * (3 - 2 * fy);
+  const w = fz * fz * (3 - 2 * fz);
+  const at = (dx: number, dy: number, dz: number) => hashToUnit((ix + dx) * 12.9898 + (iy + dy) * 78.233 + (iz + dz) * 37.719);
+  const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+  const x00 = lerp(at(0, 0, 0), at(1, 0, 0), u);
+  const x10 = lerp(at(0, 1, 0), at(1, 1, 0), u);
+  const x01 = lerp(at(0, 0, 1), at(1, 0, 1), u);
+  const x11 = lerp(at(0, 1, 1), at(1, 1, 1), u);
+  return lerp(lerp(x00, x10, v), lerp(x01, x11, v), w);
+}
+
+/** Сдвиг вершин шара вдоль направления от его центра на шум в двух масштабах:
+ * крупные бугры кроны и мелкая неровность края. Зависит только от положения
+ * вершины, поэтому совпадающие вершины соседних граней сдвигаются одинаково и
+ * щелей не остаётся. */
+function roughen(geometry: THREE.BufferGeometry, centre: [number, number, number], amplitude: number, seed: number): void {
+  const position = geometry.attributes.position;
+  for (let i = 0; i < position.count; i++) {
+    const x = position.getX(i);
+    const y = position.getY(i);
+    const z = position.getZ(i);
+    const dx = x - centre[0];
+    const dy = y - centre[1];
+    const dz = z - centre[2];
+    const length = Math.hypot(dx, dy, dz) || 1;
+    const bump = (noise3(x * 2.6 + seed, y * 2.6 + seed * 1.7, z * 2.6 + seed * 2.3) - 0.5) * 2 * amplitude + (noise3(x * 7 + seed, y * 7, z * 7 - seed) - 0.5) * 2 * amplitude * 0.4;
+    position.setXYZ(i, x + (dx / length) * bump, y + (dy / length) * bump, z + (dz / length) * bump);
+  }
+}
+
+/** Ярусный конус (можжевельник): три яруса, а не гладкий конус из учебника. */
+function tieredConeParts(detail: number): THREE.BufferGeometry[] {
+  const radial = detail >= 1 ? 14 : 8;
+  return [
+    [1, 1.15, -1],
+    [0.76, 1.0, -0.38],
+    [0.5, 0.9, 0.2],
+  ].map(([radius, height, bottom]) => {
+    const cone = new THREE.ConeGeometry(radius, height, radial, 1).toNonIndexed();
+    cone.translate(0, bottom + height / 2, 0);
+    return cone;
+  });
+}
+
+/** Единичная геометрия кроны, вписанная в [-1, 1] по всем осям: экземпляр
+ * растягивается до своей ширины и высоты матрицей, так что одна геометрия
+ * обслуживает кроны любого размера. «lobed» и «bush» — несколько сросшихся
+ * неровных шаров, «oval» — яйцо, суженное кверху (берёза), «cone» — ярусный конус.
+ * `variant` сдвигает шум и положение шаров: три варианта на форму, чтобы деревья
+ * одной породы не были близнецами. Вблизи (detail ≥ 1) нормали сглажены, на
+ * удалении (detail ≤ 0) — плоские грани: там грани крошечные и дешевле. */
+function crownGeometry(form: CrownForm, detail: number, variant: number): THREE.BufferGeometry {
+  const seed = variant * 17.31 + (form === "bush" ? 3.1 : form === "cone" ? 7.7 : form === "oval" ? 11.3 : 0);
+  let merged: THREE.BufferGeometry;
+  if (detail < 0) {
+    merged = new THREE.IcosahedronGeometry(1, 0);
+  } else if (form === "cone") {
+    const parts = tieredConeParts(detail);
+    parts.forEach((part) => roughen(part, [0, 0, 0], 0.045, seed));
+    merged = mergeGeometries(parts)!;
+    parts.forEach((part) => part.dispose());
+  } else if (form === "oval") {
+    const ball = new THREE.IcosahedronGeometry(1, Math.min(detail + 1, 3));
+    const position = ball.attributes.position;
+    for (let i = 0; i < position.count; i++) {
+      // Яйцо: у верхушки уже, чем у основания.
+      const taper = 1 - 0.3 * Math.max(0, position.getY(i));
+      position.setXYZ(i, position.getX(i) * taper, position.getY(i), position.getZ(i) * taper);
+    }
+    roughen(ball, [0, 0, 0], 0.06, seed);
+    merged = ball;
+  } else {
+    const base: [number, number, number, number][] =
+      form === "bush"
+        ? [
+            [0, 0, 0, 0.8],
+            [0.55, -0.2, 0.1, 0.55],
+            [-0.5, -0.15, -0.2, 0.58],
+            [0.05, 0.1, 0.55, 0.5],
+            [-0.1, -0.05, -0.55, 0.45],
+          ]
+        : [
+            [0, 0, 0, 0.85],
+            [0.5, -0.15, 0.2, 0.6],
+            [-0.45, -0.1, 0.35, 0.58],
+            [0.1, 0.3, -0.5, 0.6],
+            [-0.2, 0.45, 0.1, 0.5],
+            [0.35, 0.35, 0.35, 0.42],
+          ];
+    const parts = base.map(([x, y, z, r], k) => {
+      // Каждый вариант чуть сдвигает и раздувает шары — кроны не повторяются.
+      const jitter = (n: number) => (hashToUnit(seed + k * 3.7 + n * 9.1) - 0.5) * 0.18;
+      const cx = x + jitter(1);
+      const cy = y + jitter(2) * 0.6;
+      const cz = z + jitter(3);
+      const part = new THREE.IcosahedronGeometry(r * (1 + jitter(4) * 0.5), detail);
+      part.translate(cx, cy, cz);
+      roughen(part, [cx, cy, cz], 0.075, seed + k);
+      return part;
+    });
+    merged = mergeGeometries(parts)!;
+    parts.forEach((part) => part.dispose());
+  }
+
+  merged.computeBoundingBox();
+  const box = merged.boundingBox!;
+  const halfWidth = Math.max(Math.abs(box.min.x), box.max.x, Math.abs(box.min.z), box.max.z);
+  const halfHeight = Math.max(Math.abs(box.min.y), box.max.y);
+  merged.scale(1 / halfWidth, 1 / halfHeight, 1 / halfWidth);
+
+  // Гладкие нормали вблизи: убрать нормали и uv, слить совпадающие вершины, пересчитать.
+  let geometry = merged;
+  if (detail >= 1) {
+    merged.deleteAttribute("normal");
+    merged.deleteAttribute("uv");
+    geometry = mergeVertices(merged, 1e-4);
+    merged.dispose();
+  } else {
+    merged.deleteAttribute("uv");
+  }
+  geometry.computeVertexNormals();
+
+  // Плоская проекция на текстуру листвы (без шва, у сферической развёртки он был бы виден) и
+  // цвет вершин: снизу темнее (кроне нечего освещать изнутри), сверху светлее, плюс
+  // пятнистость — без неё крона одного цвета читается пластилином.
+  const position = geometry.attributes.position;
+  const uv = new Float32Array(position.count * 2);
+  const colors = new Float32Array(position.count * 3);
+  for (let i = 0; i < position.count; i++) {
+    const x = position.getX(i);
+    const y = position.getY(i);
+    const z = position.getZ(i);
+    uv[i * 2] = x * 0.5 + 0.5 + z * 0.31;
+    uv[i * 2 + 1] = y * 0.5 + 0.5 - z * 0.17;
+    const height = Math.max(0, Math.min(1, (y + 0.9) / 1.8));
+    const light = 0.62 + 0.5 * height * height * (3 - 2 * height);
+    const mottling = 0.86 + 0.28 * noise3(x * 3.2 + seed, y * 3.2, z * 3.2 - seed);
+    const v = light * mottling;
+    colors[i * 3] = v;
+    colors[i * 3 + 1] = v;
+    colors[i * 3 + 2] = v;
+  }
+  geometry.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+  geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  return geometry;
+}
+
+/** Мелкие пятна листвы: серая (светлее основы) тайловая текстура, умножается на
+ * цвет породы. Края сшиты — пятна, вылезающие за край, дорисовываются с обратной
+ * стороны. Без неё даже неровная крона одного оттенка выглядит гладкой. */
+function foliageTexture(): THREE.CanvasTexture {
+  const size = 128;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d")!;
+  ctx.fillStyle = "#dcdcdc";
+  ctx.fillRect(0, 0, size, size);
+  for (let i = 0; i < 520; i++) {
+    const x = hashToUnit(i * 1.7 + 0.3) * size;
+    const y = hashToUnit(i * 2.9 + 4.1) * size;
+    const rx = 2 + hashToUnit(i * 3.3 + 7.7) * 5;
+    const ry = 1.5 + hashToUnit(i * 5.1 + 1.9) * 3.5;
+    const angle = hashToUnit(i * 7.3 + 2.2) * Math.PI;
+    const grey = Math.round(120 + hashToUnit(i * 11.7 + 9.4) * 135);
+    ctx.fillStyle = `rgba(${grey},${grey},${grey},0.5)`;
+    for (const dx of [-size, 0, size]) {
+      for (const dy of [-size, 0, size]) {
+        if (x + dx < -rx - 2 || x + dx > size + rx + 2 || y + dy < -rx - 2 || y + dy > size + rx + 2) continue;
+        ctx.beginPath();
+        ctx.ellipse(x + dx, y + dy, rx, ry, angle, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.wrapS = THREE.RepeatWrapping;
+  texture.wrapT = THREE.RepeatWrapping;
+  texture.repeat.set(2.4, 2.4);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+/** Кора: вертикальные прожилки и редкие поперечные чёрточки (у берёзы читаются как её
+ * знаменитые отметины), серая — умножается на цвет ствола породы. */
+function barkTexture(): THREE.CanvasTexture {
+  const width = 64;
+  const height = 128;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d")!;
+  ctx.fillStyle = "#e0e0e0";
+  ctx.fillRect(0, 0, width, height);
+  for (let i = 0; i < 34; i++) {
+    let x = hashToUnit(i * 1.3 + 2.1) * width;
+    const alpha = 0.18 + hashToUnit(i * 4.7 + 1.1) * 0.35;
+    ctx.strokeStyle = `rgba(55,55,55,${alpha})`;
+    ctx.lineWidth = 1 + hashToUnit(i * 6.1 + 3.3) * 1.6;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    for (let y = 8; y <= height; y += 8) {
+      x += (hashToUnit(i * 9.9 + y) - 0.5) * 2.4;
+      ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+  for (let i = 0; i < 16; i++) {
+    ctx.fillStyle = "rgba(40,40,40,0.55)";
+    ctx.fillRect(hashToUnit(i * 2.3 + 8.8) * (width - 12), hashToUnit(i * 3.9 + 6.4) * height, 5 + hashToUnit(i * 7.7) * 7, 2);
+  }
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.wrapS = THREE.RepeatWrapping;
+  texture.wrapT = THREE.RepeatWrapping;
+  texture.repeat.set(2, 3);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+/** Мягкое тёмное пятно под растением: вкладывает его в землю. Тени от солнца
+ * (SHADOW_ITEM_LIMIT) есть не на каждой сцене и не мягкие, а без заземления
+ * кроны «парят» над газоном. */
+function groundBlobTexture(): THREE.CanvasTexture {
+  const size = 64;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d")!;
+  const gradient = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  gradient.addColorStop(0, "rgba(0,0,0,0.95)");
+  gradient.addColorStop(0.55, "rgba(0,0,0,0.45)");
+  gradient.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, size, size);
+  return new THREE.CanvasTexture(canvas);
+}
+
+/** Ствол: усечённый конус с расширением у корня. */
+function trunkGeometry(): THREE.BufferGeometry {
+  const geometry = new THREE.CylinderGeometry(0.55, 1, 1, 8, 4);
+  const position = geometry.attributes.position;
+  for (let i = 0; i < position.count; i++) {
+    const t = position.getY(i) + 0.5; // 0 у земли, 1 у кроны
+    if (t < 0.16) {
+      const flare = 1 + (1 - t / 0.16) * 0.55;
+      position.setX(i, position.getX(i) * flare);
+      position.setZ(i, position.getZ(i) * flare);
+    }
+  }
+  geometry.translate(0, 0.5, 0);
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+interface PlantEntry {
+  point: PlantingPoint3D;
+  look: PlantLook;
+  jitter: PlantJitter;
+}
+
+function tint(base: string, jitter: PlantJitter): THREE.Color {
+  return new THREE.Color(base).offsetHSL(jitter.hue, jitter.saturation, jitter.lightness);
+}
+
+/** Деревья и кусты одним проходом: форма, размер и цвет каждого — по его породе
+ * (lib/plantLook.ts), диаметр кроны — реальный из плана. Один `InstancedMesh` на
+ * форму кроны и вариант формы, один на стволы и один на тени, цвет — на экземпляр
+ * (`setColorAt`), так что число вызовов отрисовки не зависит ни от числа посадок,
+ * ни от числа пород. */
+function buildPlants(points: PlantingPoint3D[], plantingType: "tree" | "shrub", season: Season, disposables: Disposable[]): THREE.Object3D[] {
   if (points.length === 0) return [];
 
-  const trunkGeometry = new THREE.CylinderGeometry(1, 1, 1, 8);
-  const trunkMaterial = new THREE.MeshStandardMaterial({ color: TRUNK_COLOR });
-  const trunkMesh = new THREE.InstancedMesh(trunkGeometry, trunkMaterial, points.length);
-  disposables.push({ geometry: trunkGeometry, material: trunkMaterial });
+  const byForm = new Map<CrownForm, PlantEntry[][]>();
+  const trunked: PlantEntry[] = [];
+  for (const point of points) {
+    const look = lookOf(point.species, plantingType, point.crownClass);
+    const entry: PlantEntry = { point, look, jitter: plantJitter(point) };
+    const variant = Math.min(CROWN_VARIANTS - 1, Math.floor(hashToUnit(point.x * 0.37 + point.y * 0.91 + 5.5) * CROWN_VARIANTS));
+    let buckets = byForm.get(look.form);
+    if (!buckets) {
+      buckets = Array.from({ length: CROWN_VARIANTS }, () => []);
+      byForm.set(look.form, buckets);
+    }
+    buckets[variant].push(entry);
+    if (look.trunkShare > 0) trunked.push(entry);
+  }
 
-  const conicalGeometry = new THREE.ConeGeometry(1, 1, 10);
-  const roundedGeometry = new THREE.SphereGeometry(1, 8, 6);
-  const canopyMaterial = new THREE.MeshStandardMaterial({ color: canopyColor });
-  disposables.push({ geometry: conicalGeometry, material: canopyMaterial });
-  disposables.push({ geometry: roundedGeometry, material: canopyMaterial });
-
-  const conicalCount = points.filter((p) => hashToUnit(p.x * 0.1013 + p.y * 0.0721) < 0.5).length;
-  const conicalMesh = new THREE.InstancedMesh(conicalGeometry, canopyMaterial, conicalCount);
-  const roundedMesh = new THREE.InstancedMesh(roundedGeometry, canopyMaterial, points.length - conicalCount);
-
+  const objects: THREE.Object3D[] = [];
   const matrix = new THREE.Matrix4();
   const quaternion = new THREE.Quaternion();
   const yAxis = new THREE.Vector3(0, 1, 0);
-  let trunkIndex = 0;
-  let conicalIndex = 0;
-  let roundedIndex = 0;
-  for (const point of points) {
-    const isConical = hashToUnit(point.x * 0.1013 + point.y * 0.0721) < 0.5;
-    const { sizeJitter, rotationY } = plantStyle(point, 0);
+  const position = new THREE.Vector3();
+  const scale = new THREE.Vector3();
 
-    const trunkHeight = point.canopyRadius * 1.5 * sizeJitter;
-    const trunkRadius = point.canopyRadius * 0.15 * sizeJitter;
-    const canopyHeight = point.canopyRadius * 2 * sizeJitter;
-    const canopyRadius = point.canopyRadius * sizeJitter;
-
-    matrix.compose(
-      new THREE.Vector3(point.x, PLANTING_BASE_Y + trunkHeight / 2, -point.y),
-      quaternion.identity(),
-      new THREE.Vector3(trunkRadius, trunkHeight, trunkRadius)
-    );
-    trunkMesh.setMatrixAt(trunkIndex++, matrix);
-
-    matrix.compose(
-      new THREE.Vector3(point.x, PLANTING_BASE_Y + trunkHeight + canopyHeight / 2, -point.y),
-      quaternion.setFromAxisAngle(yAxis, rotationY),
-      new THREE.Vector3(canopyRadius, canopyHeight, canopyRadius)
-    );
-    if (isConical) conicalMesh.setMatrixAt(conicalIndex++, matrix);
-    else roundedMesh.setMatrixAt(roundedIndex++, matrix);
+  // Мягкая тень под каждым растением: кусты в изгороди перекрываются, поэтому у них слабее.
+  {
+    const geometry = new THREE.CircleGeometry(1, 20);
+    geometry.rotateX(-Math.PI / 2);
+    const texture = groundBlobTexture();
+    const material = new THREE.MeshBasicMaterial({
+      map: texture,
+      transparent: true,
+      opacity: plantingType === "tree" ? 0.5 : 0.3,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -2,
+    });
+    const mesh = new THREE.InstancedMesh(geometry, material, points.length);
+    disposables.push({ geometry, material, texture });
+    points.forEach((point, index) => {
+      const radius = point.canopyRadius * plantJitter(point).size * (plantingType === "tree" ? 1.2 : 1.1);
+      matrix.compose(position.set(point.x, PLANTING_BASE_Y + 0.03, -point.y), quaternion.identity(), scale.set(radius, 1, radius));
+      mesh.setMatrixAt(index, matrix);
+    });
+    mesh.instanceMatrix.needsUpdate = true;
+    mesh.renderOrder = 1;
+    mesh.userData.decor = true;
+    objects.push(mesh);
   }
-  trunkMesh.instanceMatrix.needsUpdate = true;
-  conicalMesh.instanceMatrix.needsUpdate = true;
-  roundedMesh.instanceMatrix.needsUpdate = true;
 
-  return [trunkMesh, conicalMesh, roundedMesh];
+  // Стволы: сужающийся конус с коркой, цвет по породе (у берёзы белый).
+  if (trunked.length > 0) {
+    const geometry = trunkGeometry();
+    const texture = barkTexture();
+    const material = new THREE.MeshStandardMaterial({ color: 0xffffff, map: texture, roughness: 1 });
+    const mesh = new THREE.InstancedMesh(geometry, material, trunked.length);
+    disposables.push({ geometry, material, texture });
+    trunked.forEach(({ point, look, jitter }, index) => {
+      const diameter = point.canopyRadius * 2 * jitter.size;
+      const height = diameter * look.heightRatio * jitter.height;
+      const trunkHeight = height * look.trunkShare;
+      const radius = Math.max(diameter * 0.045, 0.1);
+      matrix.compose(position.set(point.x, PLANTING_BASE_Y, -point.y), quaternion.setFromAxisAngle(yAxis, jitter.rotationY), scale.set(radius, trunkHeight, radius));
+      mesh.setMatrixAt(index, matrix);
+      mesh.setColorAt(index, new THREE.Color(look.trunkColor).offsetHSL(0, 0, jitter.lightness * 0.5));
+    });
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    mesh.userData.castShadow = true;
+    mesh.userData.entries = trunked;
+    objects.push(mesh);
+  }
+
+  let foliage: THREE.CanvasTexture | null = null;
+  for (const [form, buckets] of byForm) {
+    const total = buckets.reduce((sum, bucket) => sum + bucket.length, 0);
+    const detail = crownDetail(total);
+    // Текстура листвы — только там, где крона достаточно детальна, чтобы её было видно.
+    if (detail >= 1 && !foliage) foliage = foliageTexture();
+    const material = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: detail >= 1 ? foliage : null,
+      vertexColors: true,
+      flatShading: detail <= 0,
+      roughness: 0.92,
+      metalness: 0,
+    });
+    let materialOwned = false;
+    buckets.forEach((entries, variant) => {
+      if (entries.length === 0) return;
+      const geometry = crownGeometry(form, detail, variant);
+      const mesh = new THREE.InstancedMesh(geometry, material, entries.length);
+      // Материал на форму один: освобождается вместе с первой геометрией, остальные — только геометрия.
+      disposables.push(materialOwned ? { geometry } : { geometry, material, texture: foliage && detail >= 1 ? foliage : undefined });
+      materialOwned = true;
+      entries.forEach(({ point, look, jitter }, index) => {
+        const diameter = point.canopyRadius * 2 * jitter.size;
+        const height = diameter * look.heightRatio * jitter.height;
+        const trunkHeight = height * look.trunkShare;
+        // Крона начинается чуть ниже верха ствола — иначе между ними виден зазор.
+        const crownBottom = trunkHeight * 0.85;
+        const crownHeight = Math.max(height - crownBottom, diameter * 0.3);
+        // Кусты и можжевельник чуть заглублены, чтобы не висели над газоном.
+        const centerY = PLANTING_BASE_Y + crownBottom + crownHeight / 2 - (look.trunkShare === 0 ? crownHeight * 0.06 : 0);
+        matrix.compose(
+          position.set(point.x, centerY, -point.y),
+          quaternion.setFromAxisAngle(yAxis, jitter.rotationY),
+          scale.set(diameter / 2, crownHeight / 2, diameter / 2)
+        );
+        mesh.setMatrixAt(index, matrix);
+        mesh.setColorAt(index, tint(look.colors[season], jitter));
+      });
+      mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      mesh.userData.castShadow = true;
+      mesh.userData.entries = entries;
+      objects.push(mesh);
+    });
+  }
+  return objects;
 }
 
-/** Shrubs stay a single sphere geometry/InstancedMesh -- unlike trees, their
- * "shape variety" comes entirely from a non-uniform scale per instance
- * (rounder vs. flatter bush) rather than a second geometry, since a sphere
- * squashed on Y already reads as a distinct silhouette without the extra
- * draw call a real second shape would cost. */
-function buildShrubs(points: PlantingPoint3D[], shrubColor: string, disposables: Disposable[]): THREE.Object3D[] {
-  if (points.length === 0) return [];
+/** Что показывает подсказка при наведении на дерево или куст. Размер кроны —
+ * данные плана; высота — оценка по породе (см. plantLook.ts), и подпись «≈» это
+ * прямо говорит. */
+interface PlantHover {
+  x: number;
+  y: number;
+  title: string;
+  subtitle: string;
+}
 
-  const geometry = new THREE.SphereGeometry(1, 8, 6);
-  const material = new THREE.MeshStandardMaterial({ color: shrubColor });
-  const mesh = new THREE.InstancedMesh(geometry, material, points.length);
-  disposables.push({ geometry, material });
+function plantHoverText(entry: PlantEntry, plantingType: "tree" | "shrub"): { title: string; subtitle: string } {
+  const diameter = entry.point.canopyRadius * 2;
+  const height = diameter * entry.look.heightRatio;
+  const fmt = (m: number) => m.toLocaleString("ru-RU", { maximumFractionDigits: 1 });
+  return {
+    title: entry.point.species ?? PLANTING_TYPE_LABELS[plantingType],
+    subtitle: `${PLANTING_TYPE_LABELS[plantingType]} · крона ${fmt(diameter)} м · высота ≈ ${fmt(height)} м`,
+  };
+}
 
-  const matrix = new THREE.Matrix4();
-  const quaternion = new THREE.Quaternion();
-  points.forEach((point, index) => {
-    const { sizeJitter, rotationY } = plantStyle(point, 97.4);
-    // A second, independent jitter for the vertical squash -- reusing
-    // sizeJitter here would make "bigger" and "flatter" always move
-    // together, which looks less natural than the two varying separately.
-    const squash = 0.75 + hashToUnit(point.x * 0.1013 + point.y * 0.0721 + 141.0) * 0.5;
-    const radius = point.canopyRadius * sizeJitter;
-    matrix.compose(
-      new THREE.Vector3(point.x, PLANTING_BASE_Y + radius * squash, -point.y),
-      quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), rotationY),
-      new THREE.Vector3(radius, radius * squash, radius)
-    );
-    mesh.setMatrixAt(index, matrix);
-  });
-  mesh.instanceMatrix.needsUpdate = true;
+/** Подсказки не считаются на очень больших планах: луч проверяет каждый экземпляр
+ * (в three у InstancedMesh нет пространственного индекса), а подсказка — удобство,
+ * не повод ронять частоту кадров. */
+const HOVER_INSTANCE_LIMIT = 60_000;
+const HOVER_DELAY_MS = 90;
+const FLIGHT_MS = 900;
 
-  return [mesh];
+/** Небо — вертикальный градиент канвас-текстурой как `scene.background`, а не
+ * шейдерная сфера: сфера с собственным ShaderMaterial уже пробовалась и под
+ * logarithmicDepthBuffer рисовалась чёрным многоугольником (см. комментарий о
+ * небе ниже), а фоновая текстура рисуется штатным фоном three без глубины. */
+function skyTexture(top: string, bottom: string): THREE.CanvasTexture {
+  const canvas = document.createElement("canvas");
+  canvas.width = 2;
+  canvas.height = 256;
+  const ctx = canvas.getContext("2d")!;
+  const gradient = ctx.createLinearGradient(0, 0, 0, 256);
+  gradient.addColorStop(0, top);
+  gradient.addColorStop(1, bottom);
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, 2, 256);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
 }
 
 // Remembers where the camera was left, per project -- without this, every
@@ -390,8 +1007,19 @@ function saveStoredCamera(key: string, position: THREE.Vector3, target: THREE.Ve
  * lib/plan3d.ts for how the GeoJSON is turned into local-meter geometry
  * (including what's deliberately left out -- zoning, utilities, real
  * building heights we don't have). */
-export default function ThreeDView({ layers, plan, crsVerified, season = "summer", storageKey }: ThreeDViewProps) {
+export default function ThreeDView({ layers, plan, crsVerified, season = "summer", storageKey, sceneTheme = "day", cameraCommand = null, autoRotate = false, onWalkChange }: ThreeDViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const [hover, setHover] = useState<PlantHover | null>(null);
+  // Что нужно командам камеры и облёту, чтобы не пересобирать сцену ради них:
+  // эффект сцены кладёт сюда живые камеру и управление.
+  const viewRef = useRef<{ flyTo: (pose: CameraPose) => void; controls: OrbitControls } | null>(null);
+  const autoRotateRef = useRef(autoRotate);
+  autoRotateRef.current = autoRotate;
+  // Колбэк живёт дольше рендера (его зовёт обработчик внутри эффекта сцены) —
+  // через реф, чтобы не пересобирать сцену из-за новой функции на каждый рендер.
+  const onWalkChangeRef = useRef(onWalkChange);
+  onWalkChangeRef.current = onWalkChange;
+
   const [norms, setNorms] = useState<PlantingNorms | undefined>(undefined);
   // Distinct from `norms` itself being set -- without this, the very first
   // render (before the fetch below resolves) would already have `data`
@@ -435,7 +1063,7 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     if (!container || !data || overItemLimit) return;
 
     const disposables: Disposable[] = [];
-    const palette = SEASON_PALETTES[season];
+    const palette = applySceneTheme(SEASON_PALETTES[season], sceneTheme);
 
     const scene = new THREE.Scene();
     // A flat per-season sky color, not a gradient sphere: a custom
@@ -447,7 +1075,8 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     // gradient) -- see docs/decision_log.md. This is the same
     // scene.background mechanism the view used before season support, just
     // keyed off the season palette now.
-    scene.background = new THREE.Color(palette.skyTop);
+    const sky = skyTexture(palette.skyTop, palette.skyBottom);
+    scene.background = sky;
 
     // near=0.5 (not the more typical 0.1) and a far plane sized to the actual
     // scene (not a fixed huge fallback) both matter for a non-logarithmic
@@ -457,21 +1086,36 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     const camera = new THREE.PerspectiveCamera(55, 1, 0.5, 20_000);
     const renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    textureAnisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+    // Тени — только на сцене, где их стоит считать (см. SHADOW_ITEM_LIMIT).
+    const shadows = data.totalItemCount <= SHADOW_ITEM_LIMIT;
+    if (shadows) {
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFShadowMap;
+    }
     container.appendChild(renderer.domElement);
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.1;
+    // Колесо приближает к тому, что под курсором, а не к центру участка: на улице
+    // в километр иначе к нужному дереву не подойти без долгой панорамы.
+    controls.zoomToCursor = true;
+    // Под землю не заглянуть: у «пола» сцены нет нижней грани.
+    controls.maxPolarAngle = Math.PI / 2 - 0.03;
 
     // A hemisphere light (sky color from above, lawn's own seasonal tone
     // bouncing from below) instead of a flat AmbientLight -- costs nothing
     // extra (still a single Light object) but reads as outdoor daylight
     // rather than a uniform studio fill, and ties naturally into the same
     // per-season palette everything else here already uses.
-    scene.add(new THREE.HemisphereLight(new THREE.Color(palette.skyTop), new THREE.Color(palette.lawn), 0.75));
-    const sun = new THREE.DirectionalLight(0xffffff, 0.9);
-    sun.position.set(1, 1.6, 0.6);
+    const graphite = sceneTheme === "graphite";
+    scene.add(new THREE.HemisphereLight(new THREE.Color(graphite ? "#8fa0b5" : palette.skyBottom), new THREE.Color(palette.lawn), graphite ? 1.0 : 1.5));
+    // Силы света подобраны под физически корректное освещение three (после r155
+    // интенсивность 1 — заметно темнее прежнего «условного» света).
+    const sun = new THREE.DirectionalLight(sceneTheme === "graphite" ? 0xe3ecff : 0xfff4e0, sceneTheme === "graphite" ? 2.0 : 2.4);
     scene.add(sun);
+    scene.add(sun.target);
 
     // Frame the camera around whatever was actually loaded -- plots range
     // from a ~100x80m synthetic square to a real ~1.5x1.5km site (CLAUDE.md),
@@ -500,12 +1144,28 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
       controls.target.set(centerX, 0, -centerY);
     }
     camera.far = diagonal * 3 + 100;
+
+    // Солнце — с юго-запада и повыше, тень падает на северо-восток. Теневая камера
+    // охватывает всю сцену (ортографическая, по диагонали участка): одна карта
+    // 4096² на сцену до порога SHADOW_ITEM_LIMIT даёт на дворе в сотню метров
+    // сантиметровое разрешение.
+    sun.target.position.set(centerX, 0, -centerY);
+    sun.position.set(centerX + diagonal * 0.8, diagonal * 1.2, -centerY + diagonal * 0.5);
+    if (shadows) {
+      sun.castShadow = true;
+      sun.shadow.mapSize.set(4096, 4096);
+      const reach = diagonal * 0.65;
+      Object.assign(sun.shadow.camera, { left: -reach, right: reach, top: reach, bottom: -reach, near: 1, far: diagonal * 4 });
+      sun.shadow.camera.updateProjectionMatrix();
+      sun.shadow.bias = -0.0004;
+      sun.shadow.normalBias = 0.3;
+    }
     // OrbitControls has no distance limit by default -- mouse-wheel dolly
     // could move the camera farther from target than camera.far allows,
     // silently clipping the entire scene at once (found live: objects
     // vanished when zoomed out far enough). Bounding maxDistance well under
     // camera.far means that can't happen regardless of territory size.
-    controls.minDistance = Math.max(diagonal * 0.01, camera.near);
+    controls.minDistance = MIN_CAMERA_DISTANCE_M;
     controls.maxDistance = diagonal * 2.5;
     camera.updateProjectionMatrix();
     controls.update();
@@ -514,7 +1174,9 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     // convention for a seamless horizon) -- also usefully hides the ground
     // pad's own outer edge (see padSize below) and the point where distant
     // trees/buildings would otherwise pop rather than fade at maxDistance.
-    scene.fog = new THREE.Fog(new THREE.Color(palette.skyTop), diagonal * 0.9, diagonal * 3);
+    // Цвет тумана — цвет неба у горизонта: при взгляде сверху горизонт у верхнего
+    // края экрана, где градиент ещё близок к skyTop.
+    scene.fog = new THREE.Fog(new THREE.Color(palette.skyTop).lerp(new THREE.Color(palette.skyBottom), 0.25), diagonal * 0.8, diagonal * 2.2);
 
     // Debounced (not on every "change" event, which OrbitControls fires
     // continuously mid-drag/zoom) -- writing localStorage on every animation
@@ -531,9 +1193,11 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     // A neutral pad under everything, larger than the territory itself, so
     // there's no visible gap/void around a plot with sparse layers (e.g. no
     // existing_greenery at all).
-    const padSize = diagonal * 1.6;
+    // Пол больше, чем всё, что видно сквозь туман (fog far = 2.2·diagonal): край пола
+    // не должен виднеться на фоне неба.
+    const padSize = diagonal * 6;
     const padGeometry = new THREE.PlaneGeometry(padSize, padSize);
-    const padMaterial = new THREE.MeshStandardMaterial({ color: "#e7e5e4" });
+    const padMaterial = new THREE.MeshStandardMaterial({ color: palette.pad });
     const pad = new THREE.Mesh(padGeometry, padMaterial);
     pad.rotation.x = -Math.PI / 2;
     pad.position.set(centerX, -0.05, -centerY);
@@ -553,25 +1217,53 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     // y=TERRITORY_DEPTH_M -- everything else (road/greenery/lawn/buildings/
     // plantings) sits on or above that surface, never inside it.
     for (const polygon of data.territory) {
-      const mesh = extrudedMesh(polygon, ZONE_COLORS.territory, TERRITORY_DEPTH_M, 0);
+      const mesh = extrudedMesh(polygon, palette.ground, TERRITORY_DEPTH_M, 0);
       if (!mesh) continue;
       scene.add(mesh);
       disposables.push({ geometry: mesh.geometry, material: mesh.material as THREE.Material });
     }
-    addFlat(data.roads, ZONE_COLORS.road, ROAD_Y);
-    addFlat(data.existingGreenery, ZONE_COLORS.existing_greenery, EXISTING_GREENERY_Y);
+    addFlat(data.roads, palette.road, ROAD_Y);
+    addFlat(data.existingGreenery, palette.greenery, EXISTING_GREENERY_Y);
     for (const polygon of data.lawns) {
       const mesh = lawnMesh(polygon, palette.lawn, LAWN_Y, disposables);
       if (mesh) scene.add(mesh);
     }
 
+    // Здания — ещё и преграда для луча двойного щелчка (иначе луч уходил сквозь
+    // стену в землю за домом и камера подлетала к стене).
+    const buildingMeshes: THREE.Mesh[] = [];
+    const buildingDim = graphite ? 0.7 : 1;
+    const buildingKit = new BuildingKit(buildingDim, disposables);
     for (const building of data.buildings) {
-      const mesh = buildingMesh(building, ZONE_COLORS.building, TERRITORY_DEPTH_M, disposables);
-      if (mesh) scene.add(mesh);
+      const mesh = buildingMesh(building, buildingKit, TERRITORY_DEPTH_M);
+      if (mesh) {
+        mesh.userData.castShadow = true;
+        scene.add(mesh);
+        buildingMeshes.push(mesh);
+        disposables.push({ geometry: mesh.geometry });
+      }
+    }
+    const roofDetails = buildRoofDetails(data.buildings, TERRITORY_DEPTH_M, buildingDim, disposables);
+    if (roofDetails) {
+      roofDetails.userData.castShadow = true;
+      scene.add(roofDetails);
     }
 
-    for (const object of buildTrees(data.trees, palette.tree, disposables)) scene.add(object);
-    for (const object of buildShrubs(data.shrubs, palette.shrub, disposables)) scene.add(object);
+    // Деревья и кусты, по которым наводится подсказка: меши с `userData.entries`.
+    const plantMeshes: { mesh: THREE.InstancedMesh; plantingType: "tree" | "shrub" }[] = [];
+    for (const [points, plantingType] of [[data.trees, "tree"], [data.shrubs, "shrub"]] as const) {
+      for (const object of buildPlants(points, plantingType, season, disposables)) {
+        scene.add(object);
+        if (object instanceof THREE.InstancedMesh && !object.userData.decor) plantMeshes.push({ mesh: object, plantingType });
+      }
+    }
+
+    // Тени: принимает всё, отбрасывают здания и растения (userData.castShadow).
+    scene.traverse((object) => {
+      if (!(object instanceof THREE.Mesh)) return;
+      object.receiveShadow = shadows;
+      object.castShadow = shadows && Boolean(object.userData.castShadow);
+    });
 
     // A function expression, not `function resize() {}` -- a hoisted
     // declaration would fall outside TypeScript's narrowing of `container`
@@ -588,9 +1280,162 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     const resizeObserver = new ResizeObserver(resize);
     resizeObserver.observe(container);
 
+    // --- ракурсы камеры -------------------------------------------------
+    // Общий вид — тот же кадр, что и при первой загрузке; «сверху» — почти
+    // отвесно (небольшой наклон, чтобы OrbitControls не терял ось «вверх»).
+    // Обход — вплотную к участкам посадок, см. walkPose.
+    const poseOf = (pose: CameraPose): { position: THREE.Vector3; target: THREE.Vector3 } => {
+      if (pose === "top") {
+        return { position: new THREE.Vector3(centerX, diagonal * 1.05, -centerY + diagonal * 0.02), target: new THREE.Vector3(centerX, 0, -centerY) };
+      }
+      return {
+        position: new THREE.Vector3(centerX + cameraDistance, cameraDistance * 0.7 + (bounds?.maxBuildingHeight ?? 0), -centerY + cameraDistance),
+        target: new THREE.Vector3(centerX, 0, -centerY),
+      };
+    };
+    const stops = walkStops([...data.trees, ...data.shrubs]);
+    let walkIndex = -1;
+    const walkPose = (index: number): { position: THREE.Vector3; target: THREE.Vector3 } => {
+      const stop = stops[index];
+      return {
+        target: new THREE.Vector3(stop.x, WALK_TARGET_HEIGHT_M, -stop.y),
+        // Камера за участком, лицом по ходу движения; ось z сцены — минус y плана.
+        position: new THREE.Vector3(stop.x - stop.heading[0] * WALK_BACK_M, WALK_HEIGHT_M, -(stop.y - stop.heading[1] * WALK_BACK_M)),
+      };
+    };
+    onWalkChangeRef.current?.({ index: 0, total: stops.length });
+    let flight: { fromPosition: THREE.Vector3; fromTarget: THREE.Vector3; toPosition: THREE.Vector3; toTarget: THREE.Vector3; startedAt: number } | null = null;
+
+    viewRef.current = {
+      controls,
+      flyTo(pose) {
+        let next: { position: THREE.Vector3; target: THREE.Vector3 };
+        if (pose === "walk-next" || pose === "walk-prev") {
+          if (stops.length === 0) return;
+          // Первое нажатие «вперёд» — первый участок, «назад» — последний; дальше по кругу.
+          walkIndex = walkIndex < 0 ? (pose === "walk-next" ? 0 : stops.length - 1) : (walkIndex + (pose === "walk-next" ? 1 : -1) + stops.length) % stops.length;
+          onWalkChangeRef.current?.({ index: walkIndex + 1, total: stops.length });
+          next = walkPose(walkIndex);
+        } else {
+          walkIndex = -1;
+          onWalkChangeRef.current?.({ index: 0, total: stops.length });
+          next = poseOf(pose);
+        }
+        flight = { fromPosition: camera.position.clone(), fromTarget: controls.target.clone(), toPosition: next.position, toTarget: next.target, startedAt: performance.now() };
+      },
+    };
+    controls.autoRotate = autoRotateRef.current;
+    controls.autoRotateSpeed = 1.2;
+
+    // --- двойной щелчок: подлететь к месту ------------------------------------
+    // Точка — первое растение или здание под курсором, а если там пусто, то земля (плоскость
+    // y=0). Азимут взгляда сохраняется: пользователь не теряет, где у него север,
+    // меняются только расстояние и наклон. Ближайший участок обхода становится
+    // текущим, чтобы ‹ › продолжили путь оттуда, где человек оказался.
+    const ground = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    const flyRaycaster = new THREE.Raycaster();
+    const flyPointer = new THREE.Vector2();
+    const handleDoubleClick = (event: MouseEvent) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      flyPointer.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
+      flyRaycaster.setFromCamera(flyPointer, camera);
+      // На очень больших планах растения под курсором не ищем (как и в подсказке): луч проверяет каждый экземпляр.
+      const candidates: THREE.Object3D[] = [...buildingMeshes];
+      if (plantInstances <= HOVER_INSTANCE_LIMIT) candidates.push(...plantMeshes.map(({ mesh }) => mesh));
+      const solidHit = flyRaycaster.intersectObjects(candidates, false)[0];
+      const point = solidHit ? solidHit.point.clone() : flyRaycaster.ray.intersectPlane(ground, new THREE.Vector3());
+      if (!point) return; // луч ушёл в небо
+      point.y = Math.min(Math.max(point.y, 0), WALK_TARGET_HEIGHT_M);
+      let nearest = -1;
+      let nearestDistance = Infinity;
+      stops.forEach((stop, index) => {
+        const d = Math.hypot(stop.x - point.x, -stop.y - point.z);
+        if (d < nearestDistance) {
+          nearestDistance = d;
+          nearest = index;
+        }
+      });
+      // Щёлкнули по пустой земле вдали от посадок: лететь в пустоту незачем —
+      // подлетаем к ближайшему участку с посадками. «Вдали» меряем до ближайшей
+      // самой посадки, а не до центра участка: участок в 40 м, и до его центра от
+      // крайних кустов бывает далеко.
+      let nearestPlantSq = Infinity;
+      for (const list of [data.trees, data.shrubs]) {
+        for (const plant of list) {
+          const dx = plant.x - point.x;
+          const dz = -plant.y - point.z;
+          const d2 = dx * dx + dz * dz;
+          if (d2 < nearestPlantSq) nearestPlantSq = d2;
+        }
+      }
+      if (!solidHit && nearest >= 0 && nearestPlantSq > FLY_TO_PLANT_REACH_M * FLY_TO_PLANT_REACH_M) {
+        walkIndex = nearest;
+        onWalkChangeRef.current?.({ index: nearest + 1, total: stops.length });
+        const target = walkPose(nearest);
+        flight = { fromPosition: camera.position.clone(), fromTarget: controls.target.clone(), toPosition: target.position, toTarget: target.target, startedAt: performance.now() };
+        return;
+      }
+      const away = new THREE.Vector3(camera.position.x - controls.target.x, 0, camera.position.z - controls.target.z);
+      if (away.lengthSq() < 1e-6) away.set(1, 0, 1);
+      away.normalize();
+      const distance = Math.max(Math.min(FLY_TO_DISTANCE_M, camera.position.distanceTo(point)), 6);
+      const toPosition = point.clone().addScaledVector(away, distance * Math.cos(FLY_TO_ELEVATION));
+      toPosition.y += distance * Math.sin(FLY_TO_ELEVATION);
+      flight = { fromPosition: camera.position.clone(), fromTarget: controls.target.clone(), toPosition, toTarget: point, startedAt: performance.now() };
+      if (nearest >= 0) {
+        walkIndex = nearest;
+        onWalkChangeRef.current?.({ index: nearest + 1, total: stops.length });
+      }
+    };
+    renderer.domElement.addEventListener("dblclick", handleDoubleClick);
+
+    // --- подсказка при наведении на дерево/куст ----------------------------
+    const plantInstances = plantMeshes.reduce((sum, { mesh }) => sum + mesh.count, 0);
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    let hoverTimer: ReturnType<typeof setTimeout> | undefined;
+    const handlePointerMove = (event: PointerEvent) => {
+      clearTimeout(hoverTimer);
+      // Тянут камеру или облёт идёт — подсказка не нужна и мешала бы.
+      if (event.buttons !== 0 || controls.autoRotate) {
+        setHover(null);
+        return;
+      }
+      if (plantInstances > HOVER_INSTANCE_LIMIT) return;
+      const rect = renderer.domElement.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      hoverTimer = setTimeout(() => {
+        pointer.set((x / rect.width) * 2 - 1, -(y / rect.height) * 2 + 1);
+        raycaster.setFromCamera(pointer, camera);
+        const hit = raycaster.intersectObjects(plantMeshes.map(({ mesh }) => mesh), false)[0];
+        const entry = hit && hit.instanceId !== undefined ? (hit.object.userData.entries as PlantEntry[] | undefined)?.[hit.instanceId] : undefined;
+        if (!hit || !entry) {
+          setHover(null);
+          return;
+        }
+        const plantingType = plantMeshes.find(({ mesh }) => mesh === hit.object)?.plantingType ?? "tree";
+        setHover({ x, y, ...plantHoverText(entry, plantingType) });
+      }, HOVER_DELAY_MS);
+    };
+    const hideHover = () => {
+      clearTimeout(hoverTimer);
+      setHover(null);
+    };
+    renderer.domElement.addEventListener("pointermove", handlePointerMove);
+    renderer.domElement.addEventListener("pointerleave", hideHover);
+    renderer.domElement.addEventListener("pointerdown", hideHover);
+
     let frameId = 0;
     const animate = () => {
       frameId = requestAnimationFrame(animate);
+      if (flight) {
+        const k = Math.min((performance.now() - flight.startedAt) / FLIGHT_MS, 1);
+        const eased = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+        camera.position.lerpVectors(flight.fromPosition, flight.toPosition, eased);
+        controls.target.lerpVectors(flight.fromTarget, flight.toTarget, eased);
+        if (k >= 1) flight = null;
+      }
       controls.update();
       renderer.render(scene, camera);
     };
@@ -599,19 +1444,39 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     return () => {
       cancelAnimationFrame(frameId);
       clearTimeout(saveTimeout);
+      clearTimeout(hoverTimer);
+      renderer.domElement.removeEventListener("dblclick", handleDoubleClick);
+      renderer.domElement.removeEventListener("pointermove", handlePointerMove);
+      renderer.domElement.removeEventListener("pointerleave", hideHover);
+      renderer.domElement.removeEventListener("pointerdown", hideHover);
+      viewRef.current = null;
+      setHover(null);
       controls.removeEventListener("change", handleControlsChange);
       resizeObserver.disconnect();
       controls.dispose();
       for (const { geometry, material, texture } of disposables) {
-        geometry.dispose();
-        material.dispose();
+        geometry?.dispose();
+        material?.dispose();
         texture?.dispose();
       }
+      sky.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode === container) container.removeChild(renderer.domElement);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- overItemLimit is derived from `data`, not an independent input
-  }, [data, overItemLimit, season, storageKey]);
+  }, [data, overItemLimit, season, sceneTheme, storageKey]);
+
+  // Команда ракурса: перелёт без пересборки сцены. seq в зависимостях — повторное
+  // нажатие того же ракурса тоже должно сработать.
+  useEffect(() => {
+    if (cameraCommand) viewRef.current?.flyTo(cameraCommand.pose);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cameraCommand?.seq]);
+  useEffect(() => {
+    if (viewRef.current) viewRef.current.controls.autoRotate = autoRotate;
+    if (autoRotate) setHover(null);
+  }, [autoRotate]);
+
 
   if (!plan) {
     return <div className="flex h-full w-full items-center justify-center text-sm text-stone-500">Нет плана для 3D-просмотра.</div>;
@@ -623,5 +1488,19 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
       </div>
     );
   }
-  return <div ref={containerRef} className="h-full w-full" />;
+  return (
+    <div className="relative h-full w-full">
+      <div ref={containerRef} className="h-full w-full" />
+      {hover && (
+        <div
+          role="tooltip"
+          style={{ left: Math.min(hover.x + 14, (containerRef.current?.clientWidth ?? 9999) - 250), top: hover.y + 14 }}
+          className="pointer-events-none absolute z-10 w-[240px] rounded-lg border border-gp-border bg-gp-float px-3 py-2 text-gp-text shadow-[0_10px_28px_rgba(0,0,0,.45)]"
+        >
+          <p className="m-0 text-sm font-medium">{hover.title}</p>
+          <p className="m-0 mt-0.5 text-xs text-gp-text-2">{hover.subtitle}</p>
+        </div>
+      )}
+    </div>
+  );
 }
