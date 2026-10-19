@@ -8,11 +8,21 @@ from fastapi.concurrency import run_in_threadpool
 
 from backend.app.api.deps import PlanDep, ProjectDep, get_project_or_404
 from backend.app.db.models import Plan
-from backend.app.schemas.plan import GenerateJobOut, GenerateJobStatus, GenerateRequest, PlanOut, PlanSummary
-from backend.app.services import generation_jobs
+from backend.app.schemas.plan import (
+    EstimateOut,
+    GenerateCancelOut,
+    GenerateJobOut,
+    GenerateJobStatus,
+    GeneratePartialOut,
+    GenerateRequest,
+    PlanOut,
+    PlanSummary,
+)
+from backend.app.services import estimate_service, generation_jobs
 from backend.app.services.geo_io import display_crs, planting_items_to_feature_collection
 from backend.app.services.pipeline_service import CurrentPlanDeletionError, MissingTerritoryError, delete_plan, generate_plan
 from geo_engine.candidates import TooManyCandidatesError
+from geo_engine.planner import GenerationCancelled
 
 router = APIRouter(prefix="/api/projects/{project_id}", tags=["plans"])
 logger = logging.getLogger(__name__)
@@ -60,8 +70,13 @@ async def _run_generate_job(
             tree_rows=tree_rows,
             trees_in_paving=trees_in_paving,
             on_progress=lambda ptype, done, total: generation_jobs.update_progress(job_id, ptype, done, total),
+            on_items=lambda ptype, items: generation_jobs.add_partial(job_id, ptype, items),
+            should_stop=lambda: generation_jobs.should_stop(job_id),
         )
         generation_jobs.mark_done(job_id, plan.id)
+    except GenerationCancelled:
+        # Статус уже `cancelled` (его выставил сам запрос остановки), план не сохранён.
+        logger.info("Plan generation cancelled by the user (job_id=%s)", job_id)
     except (MissingTerritoryError, TooManyCandidatesError) as exc:
         generation_jobs.mark_error(job_id, str(exc))
     except HTTPException as exc:
@@ -98,6 +113,14 @@ async def generate(request: GenerateRequest, project: ProjectDep) -> GenerateJob
     return GenerateJobOut(job_id=job_id)
 
 
+@router.post("/estimate", response_model=EstimateOut)
+async def estimate(request: GenerateRequest, project: ProjectDep) -> EstimateOut:
+    """«Ожидается» до генерации: диапазон числа посадок по настройкам, без
+    расчёта плана (estimate_service.py). Те же поля, что у POST /generate."""
+    result = await run_in_threadpool(estimate_service.estimate, project, request)
+    return EstimateOut(**result)
+
+
 @router.get("/generate/{job_id}", response_model=GenerateJobStatus)
 async def generate_status(project_id: str, job_id: str) -> GenerateJobStatus:
     # No project lookup here on purpose -- this route gets polled every
@@ -106,7 +129,46 @@ async def generate_status(project_id: str, job_id: str) -> GenerateJobStatus:
     job = generation_jobs.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Задача генерации не найдена — возможно, сервер перезапускался.")
-    return GenerateJobStatus(status=job.status, plan_id=job.plan_id, error=job.error, stage=job.stage, progress=job.progress)
+    return GenerateJobStatus(
+        status=job.status,
+        plan_id=job.plan_id,
+        error=job.error,
+        stage=job.stage,
+        progress=job.progress,
+        partial_counts=generation_jobs.partial_counts(job),
+        partial_version=job.partial_version,
+    )
+
+
+def _partial_features(project, job: generation_jobs.GenerationJob):
+    """Посадки уже посчитанных типов — в координатах карты, без обоснований."""
+    from backend.app.services.geo_io import domain_item_to_row  # noqa: PLC0415 — рядом с единственным использованием
+
+    rows = [domain_item_to_row("partial", item) for items in dict(job.partial).values() for item in items]
+    return planting_items_to_feature_collection(rows, display_crs(project))
+
+
+@router.get("/generate/{job_id}/partial", response_model=GeneratePartialOut)
+async def generate_partial(project: ProjectDep, job_id: str) -> GeneratePartialOut:
+    """Что уже расставлено, пока план ещё считается: фронт подмешивает это в
+    карту по мере готовности типов. Версия — чтобы не тянуть то же дважды."""
+    job = generation_jobs.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Задача генерации не найдена — возможно, сервер перезапускался.")
+    version = job.partial_version
+    features = await run_in_threadpool(_partial_features, project, job)
+    return GeneratePartialOut(version=version, counts=generation_jobs.partial_counts(job), features=features)
+
+
+@router.post("/generate/{job_id}/cancel", response_model=GenerateCancelOut)
+async def generate_cancel(job_id: str) -> GenerateCancelOut:
+    """«Остановить»: задача сразу `cancelled`, расчёт останавливается на ближайшей
+    точке опроса (в параллельной ветке — убиваются воркеры), план не сохраняется.
+    У уже готовой задачи отменять нечего — вернётся её статус."""
+    status = generation_jobs.request_cancel(job_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Задача генерации не найдена — возможно, сервер перезапускался.")
+    return GenerateCancelOut(status=status)
 
 
 @router.get("/plans", response_model=list[PlanSummary])

@@ -95,6 +95,74 @@ def _blocked_by(points: np.ndarray, geometries: list[BaseGeometry], distance: fl
     return mask
 
 
+@dataclass
+class _Masks:
+    """Что и в какой мере закрывает точки: маска «закрыто этим» по каждому
+    ограничению, нужный отступ (м) там, где он есть, и подписи."""
+
+    masks: dict[str, np.ndarray]
+    required_m: dict[str, float]
+    labels: dict[str, str]
+
+    def blocked(self, size: int) -> np.ndarray:
+        blocked = np.zeros(size, dtype=bool)
+        for mask in self.masks.values():
+            blocked |= mask
+        return blocked
+
+
+def _blocker_masks(
+    points: np.ndarray,
+    territory: BaseGeometry,
+    utilities: list[Utility],
+    zones: list[Zone],
+    planting_type: str,
+    norms: PlantingNorms,
+    species: Species | None,
+    crown_reference_diameter_m: float,
+) -> _Masks:
+    """Одна и та же раскладка «кто закрывает точку» — и для доли в объяснении
+    площади, и для слоя на карте: числа панели и картинка не должны расходиться."""
+    by_type: dict[str, list[BaseGeometry]] = {}
+    for utility in utilities:
+        by_type.setdefault(utility.object_type, []).append(utility.geometry)
+    for zone in zones:
+        if zone.zone_type in norms.setbacks_m:
+            by_type.setdefault(zone.zone_type, []).append(zone.geometry)
+
+    masks: dict[str, np.ndarray] = {}
+    required_m: dict[str, float] = {}
+    for object_type, geometries in by_type.items():
+        required = norms.resolve_setback(object_type, planting_type, species, crown_reference_diameter_m).required_m
+        required_m[object_type] = float(required)
+        geometries = [g for g in geometries if g is not None and not g.is_empty]
+        if object_type == "sidewalk" and norms.paving_plantable(planting_type):
+            geometries = [g.boundary if g.geom_type in ("Polygon", "MultiPolygon") else g for g in geometries]
+        masks[object_type] = _blocked_by(points, geometries, required)
+
+    margin = norms.territory_margin_for(planting_type)
+    if margin > 0:
+        boundary = territory.boundary
+        shapely.prepare(boundary)
+        masks[TERRITORY_MARGIN_KEY] = shapely.dwithin(boundary, points, margin)
+        required_m[TERRITORY_MARGIN_KEY] = float(margin)
+    hard = [
+        z.geometry
+        for z in zones
+        if z.zone_type in HARD_OBSTACLE_ZONE_TYPES
+        and not (z.zone_type == "sidewalk" and norms.paving_plantable(planting_type))
+        and z.geometry.geom_type in ("Polygon", "MultiPolygon")
+    ]
+    masks[HARD_OBSTACLES_KEY] = _blocked_by(points, hard, 0.0)
+
+    labels = {
+        **OBJECT_LABELS_RU,
+        TERRITORY_MARGIN_KEY: "отступ от границы участка",
+        HARD_OBSTACLES_KEY: "существующие здания, покрытия и зелень",
+    }
+    return _Masks(masks=masks, required_m=required_m, labels=labels)
+
+
 def area_budget(
     territory: BaseGeometry,
     utilities: list[Utility],
@@ -110,47 +178,12 @@ def area_budget(
     if len(points) == 0:
         return None
 
-    by_type: dict[str, list[BaseGeometry]] = {}
-    for utility in utilities:
-        by_type.setdefault(utility.object_type, []).append(utility.geometry)
-    for zone in zones:
-        if zone.zone_type in norms.setbacks_m:
-            by_type.setdefault(zone.zone_type, []).append(zone.geometry)
-
-    masks: dict[str, np.ndarray] = {}
-    for object_type, geometries in by_type.items():
-        required = norms.resolve_setback(object_type, planting_type, species, crown_reference_diameter_m).required_m
-        geometries = [g for g in geometries if g is not None and not g.is_empty]
-        if object_type == "sidewalk" and norms.paving_plantable(planting_type):
-            geometries = [g.boundary if g.geom_type in ("Polygon", "MultiPolygon") else g for g in geometries]
-        masks[object_type] = _blocked_by(points, geometries, required)
-
-    margin = norms.territory_margin_for(planting_type)
-    if margin > 0:
-        boundary = territory.boundary
-        shapely.prepare(boundary)
-        masks[TERRITORY_MARGIN_KEY] = shapely.dwithin(boundary, points, margin)
-    hard = [
-        z.geometry
-        for z in zones
-        if z.zone_type in HARD_OBSTACLE_ZONE_TYPES
-        and not (z.zone_type == "sidewalk" and norms.paving_plantable(planting_type))
-        and z.geometry.geom_type in ("Polygon", "MultiPolygon")
-    ]
-    masks[HARD_OBSTACLES_KEY] = _blocked_by(points, hard, 0.0)
-
-    blocked = np.zeros(len(points), dtype=bool)
-    for mask in masks.values():
-        blocked |= mask
-    labels = {
-        **OBJECT_LABELS_RU,
-        TERRITORY_MARGIN_KEY: "отступ от границы участка",
-        HARD_OBSTACLES_KEY: "существующие здания, покрытия и зелень",
-    }
+    found = _blocker_masks(points, territory, utilities, zones, planting_type, norms, species, crown_reference_diameter_m)
+    blocked = found.blocked(len(points))
     blockers = sorted(
         (
-            Blocker(object_type=key, label=labels.get(key, key), share=float(mask.mean()))
-            for key, mask in masks.items()
+            Blocker(object_type=key, label=found.labels.get(key, key), share=float(mask.mean()))
+            for key, mask in found.masks.items()
             if mask.any()
         ),
         key=lambda b: -b.share,
@@ -161,5 +194,113 @@ def area_budget(
         territory_m2=float(territory.area),
         usable_m2=usable * cell_m2,
         usable_share=usable / len(points),
+        blockers=blockers,
+    )
+
+
+# Слой на карте мельче сетки объяснения площади: там нужна доля (20 тысяч точек
+# дают процент), здесь — картинка, на которой полоса теплосети в 2 м не должна
+# превращаться в мозаику по 2 м. 400 тысяч ячеек — полметра на дворе в 10 га и
+# метр на 40 га; запрос ближайшего объекта по ним векторизован.
+_MAX_ZONE_SAMPLES = 400_000
+_MIN_ZONE_CELL_M = 0.5
+
+
+@dataclass
+class ZoneBlocker:
+    key: str
+    label: str
+    required_m: float | None
+    share: float  # доля участка, закрытая этим ограничением
+    exclusive_m2: float  # площадь, закрытая ТОЛЬКО им — освободится, если его убрать
+    mask: np.ndarray = field(repr=False)
+
+
+@dataclass
+class ZoneMasks:
+    """Растр «где можно / что закрыло» на сетке с началом в (minx, maxy):
+    строка 0 — верх (север), как у картинки. Маски — bool[height, width]."""
+
+    minx: float
+    miny: float
+    maxx: float
+    maxy: float
+    cell_m: float
+    territory_m2: float
+    usable_m2: float
+    usable_share: float
+    allowed: np.ndarray = field(repr=False)
+    blockers: list[ZoneBlocker] = field(default_factory=list)
+
+
+def area_zone_masks(
+    territory: BaseGeometry,
+    utilities: list[Utility],
+    zones: list[Zone],
+    planting_type: str,
+    norms: PlantingNorms,
+    species: Species | None = None,
+    crown_reference_diameter_m: float = 5.0,
+    max_samples: int = _MAX_ZONE_SAMPLES,
+) -> ZoneMasks | None:
+    """Те же ограничения, что в `area_budget`, но растром по всей рамке участка —
+    для слоя «где можно сажать» (картинка на карте)."""
+    if territory is None or territory.is_empty or territory.area <= 0:
+        return None
+    minx, miny, maxx, maxy = territory.bounds
+    cell = max(_MIN_ZONE_CELL_M, (territory.area / max_samples) ** 0.5)
+    xs = minx + cell / 2 + cell * np.arange(int(np.ceil((maxx - minx) / cell)))
+    ys = maxy - cell / 2 - cell * np.arange(int(np.ceil((maxy - miny) / cell)))  # сверху вниз
+    height, width = len(ys), len(xs)
+    if height == 0 or width == 0:
+        return None
+    gx, gy = np.meshgrid(xs, ys)
+    flat_x, flat_y = gx.ravel(), gy.ravel()
+    shapely.prepare(territory)
+    inside = shapely.contains_xy(territory, flat_x, flat_y)
+    if not inside.any():
+        return None
+    points = shapely.points(flat_x[inside], flat_y[inside])
+
+    found = _blocker_masks(points, territory, utilities, zones, planting_type, norms, species, crown_reference_diameter_m)
+    blocked = found.blocked(len(points))
+    cell_m2 = cell * cell
+
+    def scatter(values: np.ndarray) -> np.ndarray:
+        grid = np.zeros(height * width, dtype=bool)
+        grid[np.flatnonzero(inside)] = values
+        return grid.reshape(height, width)
+
+    count = len(points)
+    # Сколько ограничений закрывает каждую точку: «только это» — ровно одно.
+    cover = np.zeros(count, dtype=np.int32)
+    for mask in found.masks.values():
+        cover += mask
+    blockers = sorted(
+        (
+            ZoneBlocker(
+                key=key,
+                label=found.labels.get(key, key),
+                required_m=found.required_m.get(key),
+                share=float(mask.mean()),
+                exclusive_m2=float((mask & (cover == 1)).sum() * cell_m2),
+                mask=scatter(mask),
+            )
+            for key, mask in found.masks.items()
+            if mask.any()
+        ),
+        key=lambda b: -b.share,
+    )
+    usable = int((~blocked).sum())
+    return ZoneMasks(
+        minx=minx,
+        miny=miny,
+        maxx=maxx,
+        maxy=maxy,
+        cell_m=cell,
+        territory_m2=float(territory.area),
+        usable_m2=float(territory.area) * usable / count,
+        usable_share=usable / count,
+        allowed=scatter(~blocked),
         blockers=blockers,
     )

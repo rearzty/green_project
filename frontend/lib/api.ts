@@ -291,9 +291,13 @@ export async function getLayersRaster(projectId: string): Promise<LayersRaster> 
 }
 
 export interface GenerateJobStatus {
-  status: "pending" | "done" | "error";
+  status: "pending" | "done" | "error" | "cancelled";
   plan_id: string | null;
   error: string | null;
+  /** Сколько посадок каждого типа уже посчитано и растёт ли это: частичный
+   * результат перечитывается, только когда `partial_version` сменилась. */
+  partial_counts?: Record<string, number>;
+  partial_version?: number;
   /** Best-effort: which planting_type most recently finished ("Готово:
    * Кустарники (2 из 3)"), null before the backend has anything to report. */
   stage: string | null;
@@ -326,6 +330,64 @@ function startGenerate(
   });
 }
 
+/** Пользователь нажал «Остановить»: план не построен и не изменился. Не сбой —
+ * вызывающие показывают нейтральное уведомление, а не красное. */
+export class GenerationCancelledError extends ApiError {
+  constructor() {
+    super("Генерация остановлена — план остался прежним.", 0);
+    this.name = "GenerationCancelledError";
+  }
+}
+
+/** Что уже расставлено, пока план считается: места и типы для предпросмотра на
+ * карте — не редактируемый план (без id и обоснований). */
+export interface GeneratePartial {
+  version: number;
+  counts: Record<string, number>;
+  features: GeoJSONFeatureCollection;
+}
+
+export async function getGeneratePartial(projectId: string, jobId: string): Promise<GeneratePartial> {
+  return request(`/api/projects/${projectId}/generate/${jobId}/partial`);
+}
+
+/** «Остановить»: сервер сразу отмечает задачу отменённой, расчёт останавливается
+ * на ближайшей точке опроса, план не сохраняется. */
+export async function cancelGeneration(projectId: string, jobId: string): Promise<void> {
+  await request(`/api/projects/${projectId}/generate/${jobId}/cancel`, { method: "POST" });
+}
+
+/** «Ожидается»: диапазон числа посадок по настройкам до генерации. */
+export interface EstimateItem {
+  planting_type: PlantingType;
+  low: number;
+  high: number;
+  /** items — штуки (деревья, кусты), m2 — площадь (газон). */
+  unit: "items" | "m2";
+  /** plan — от открытого плана (точнее), area — по допустимой площади (грубо). */
+  basis: "plan" | "area";
+}
+
+export async function estimatePlan(
+  projectId: string,
+  settings: { plantingTypes: PlantingType[]; treeSpacingM?: number; shrubSpacingM?: number; treeRows: number; treesInPaving: boolean },
+  signal?: AbortSignal
+): Promise<EstimateItem[]> {
+  const { estimates } = await request<{ estimates: EstimateItem[] }>(`/api/projects/${projectId}/estimate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      planting_types: settings.plantingTypes,
+      tree_spacing_m: settings.treeSpacingM,
+      shrub_spacing_m: settings.shrubSpacingM,
+      tree_rows: settings.treeRows,
+      trees_in_paving: settings.treesInPaving,
+    }),
+    signal,
+  });
+  return estimates;
+}
+
 function getGenerateStatus(projectId: string, jobId: string): Promise<GenerateJobStatus> {
   return request(`/api/projects/${projectId}/generate/${jobId}`);
 }
@@ -348,6 +410,10 @@ export async function generatePlan(
   options?: {
     signal?: AbortSignal;
     onPoll?: (status: GenerateJobStatus) => void;
+    /** Идентификатор задачи — чтобы «Остановить» знало, что останавливать. */
+    onJob?: (jobId: string) => void;
+    /** Уже расставленные посадки — каждый раз, когда посчитан очередной тип. */
+    onPartial?: (partial: GeneratePartial) => void;
     treeSpacingM?: number;
     shrubSpacingM?: number;
     treeRows?: number;
@@ -365,13 +431,31 @@ export async function generatePlan(
     options?.treesInPaving,
     options?.useOrderBoundary
   );
-  for (;;) {
-    if (options?.signal?.aborted) throw new ApiError("Генерация отменена.", 0);
-    const status = await getGenerateStatus(projectId, job_id);
-    options?.onPoll?.(status);
-    if (status.status === "error") throw new ApiError(status.error ?? "Не удалось сгенерировать план.", 0);
-    if (status.status === "done" && status.plan_id) return getPlan(projectId, status.plan_id);
-    await new Promise((resolve) => setTimeout(resolve, GENERATE_POLL_INTERVAL_MS));
+  options?.onJob?.(job_id);
+  let partialVersion = 0;
+  let finished = false;
+  try {
+    for (;;) {
+      if (options?.signal?.aborted) throw new ApiError("Генерация отменена.", 0);
+      const status = await getGenerateStatus(projectId, job_id);
+      options?.onPoll?.(status);
+      if (status.status === "cancelled") throw new GenerationCancelledError();
+      if (status.status === "error") throw new ApiError(status.error ?? "Не удалось сгенерировать план.", 0);
+      if (status.status === "done" && status.plan_id) return await getPlan(projectId, status.plan_id);
+      // Частичный результат тянем только когда он вырос; запрос не ждём — опрос
+      // идёт дальше, а запоздавший ответ после конца задачи отбрасывается.
+      if (options?.onPartial && status.partial_version && status.partial_version !== partialVersion) {
+        partialVersion = status.partial_version;
+        getGeneratePartial(projectId, job_id)
+          .then((partial) => {
+            if (!finished) options.onPartial?.(partial);
+          })
+          .catch(() => undefined);
+      }
+      await new Promise((resolve) => setTimeout(resolve, GENERATE_POLL_INTERVAL_MS));
+    }
+  } finally {
+    finished = true;
   }
 }
 
@@ -450,6 +534,110 @@ export async function moveItems(projectId: string, planId: string, ids: string[]
   return result.items;
 }
 
+export interface ItemsRespaceResult {
+  /** Снимки прежних посадок ряда — для отмены (delete + restore). */
+  previous_items: GeoJSONFeature[];
+  /** Новые посадки ряда с другим шагом. */
+  items: GeoJSONFeature[];
+  item_count: number;
+}
+
+/** «Изменить интервал» у ряда: посадки выстраиваются в линию и раскладываются
+ * заново с шагом `pitchM` (метры). Сервер отказывает (400) для шага меньше нормы
+ * по классу кроны и для не-ряда — текст ошибки готов для уведомления. */
+export async function respaceItems(projectId: string, planId: string, ids: string[], pitchM: number): Promise<ItemsRespaceResult> {
+  return postJson(`/api/projects/${projectId}/plans/${planId}/items/respace`, { ids, pitch_m: pitchM });
+}
+
+// «Исправить нарушение в один клик» (backend/app/services/fix_service.py).
+
+export type FixKind = "move" | "retype" | "delete";
+
+export interface FixOption {
+  kind: FixKind;
+  /** Лучший по мнению сервиса; стоит только когда есть из чего выбирать. */
+  recommended: boolean;
+  /** move: новая точка в координатах остальной геометрии (WGS84 или метры чертежа). */
+  to?: LngLat | null;
+  shift_m?: number | null;
+  /** Расстояние до нарушенного ограничения после сдвига, м. */
+  clearance_m?: number | null;
+  /** Остаётся ли посадка в линии своего ряда; null — она не из ряда. */
+  keeps_row?: boolean | null;
+  /** retype */
+  type?: PlantingType | null;
+  valid?: boolean | null;
+  required_m?: number | null;
+  /** delete: пропуск, который останется в ряду, м. */
+  gap_m?: number | null;
+}
+
+export async function getItemFixes(projectId: string, planId: string, itemId: string, signal?: AbortSignal): Promise<FixOption[]> {
+  const { options } = await request<{ item_id: string; options: FixOption[] }>(
+    `/api/projects/${projectId}/plans/${planId}/items/${encodeURIComponent(itemId)}/fixes`,
+    { signal }
+  );
+  return options;
+}
+
+export interface FixesApplyResult {
+  /** Снимки прежних посадок — для отмены. */
+  previous_items: GeoJSONFeature[];
+  /** Сдвинутые и пересаженные (id прежние; удалённых среди них нет). */
+  items: GeoJSONFeature[];
+  /** Те, у кого нужного варианта нет. */
+  skipped_ids: string[];
+  item_count: number;
+}
+
+/** «Исправить все так же»: лучший вариант вида `kind` у каждой из `ids`. */
+export async function applyFixes(projectId: string, planId: string, ids: string[], kind: FixKind): Promise<FixesApplyResult> {
+  return postJson(`/api/projects/${projectId}/plans/${planId}/fixes/apply`, { ids, kind });
+}
+
+// Охранные зоны рядом с точкой — слой, который проступает при перетаскивании
+// посадки (backend/app/services/constraints_service.py).
+
+export interface NearbyConstraint {
+  kind: "constraint" | "neighbour";
+  /** Только у соседнего дерева. */
+  id?: string | null;
+  object_type: string;
+  object_label: string;
+  required_m: number;
+  /** Сам объект (линия сети, полигон здания, точка соседа). */
+  geometry: GeoJSONGeometry | null;
+  /** Его охранная зона — геометрия, раздутая на required_m. */
+  zone: GeoJSONGeometry;
+}
+
+/** Ограничения в `radius` м от точки (x, y) — координаты отображения, как и ответ.
+ * `itemId` — какую посадку тянут: от породы зависят и отступы, и интервал до соседей. */
+export async function getNearbyConstraints(
+  projectId: string,
+  planId: string,
+  query: { x: number; y: number; radius?: number; plantingType: PlantingType; itemId?: string }
+): Promise<NearbyConstraint[]> {
+  const params = new URLSearchParams({ x: String(query.x), y: String(query.y), planting_type: query.plantingType });
+  if (query.radius) params.set("radius", String(query.radius));
+  if (query.itemId) params.set("item_id", query.itemId);
+  const { features } = await request<{ radius_m: number; features: NearbyConstraint[] }>(
+    `/api/projects/${projectId}/plans/${planId}/constraints/near?${params}`
+  );
+  return features;
+}
+
+/** Alt при перетаскивании: ближайшая допустимая точка для посадки, если её
+ * поставить у (x, y). null — рядом места нет (сервер отвечает 404). */
+export async function getNearestAllowed(projectId: string, planId: string, itemId: string, at: LngLat): Promise<{ to: LngLat; shift_m: number } | null> {
+  try {
+    return await request(`/api/projects/${projectId}/plans/${planId}/items/${encodeURIComponent(itemId)}/nearest-allowed?x=${at.x}&y=${at.y}`);
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return null;
+    throw e;
+  }
+}
+
 /** Undo's counterpart to deletion -- recreates the exact items given (same
  * id, geometry, type, species, score, rationale). Returns only the plan's
  * fresh item count: the caller already has the exact features it just asked
@@ -486,8 +674,52 @@ interface ExportJobStatus {
   error: string | null;
 }
 
-function startDxfExport(projectId: string, planId: string): Promise<{ job_id: string }> {
-  return request(`/api/projects/${projectId}/plans/${planId}/export-dxf`, { method: "POST" });
+/** Что уйдёт в файл (диалог «Перед экспортом»). Без параметров — как раньше:
+ * все слои плана, план поверх исходного чертежа, отчёт обоснования. */
+export interface ExportOptions {
+  /** Слои результата; undefined — все. «violations» — кольца вокруг нарушений. */
+  layers?: ExportLayerKey[];
+  includeBase?: boolean;
+  includeReport?: boolean;
+}
+
+export type ExportLayerKey = "tree" | "shrub" | "lawn" | "violations";
+
+function startDxfExport(projectId: string, planId: string, options?: ExportOptions): Promise<{ job_id: string }> {
+  if (!options) return request(`/api/projects/${projectId}/plans/${planId}/export-dxf`, { method: "POST" });
+  return postJson(`/api/projects/${projectId}/plans/${planId}/export-dxf`, {
+    layers: options.layers,
+    include_base: options.includeBase ?? true,
+    include_report: options.includeReport ?? true,
+  });
+}
+
+export interface ExportSummaryLayer {
+  key: ExportLayerKey;
+  /** Имя слоя в DXF — ровно то, что пишет экспорт. */
+  name: string;
+  count: number;
+  /** Только у газона, м². */
+  area_m2: number | null;
+}
+
+export interface ExportSummary {
+  total_items: number;
+  /** Посадок, не прошедших проверку отступов (те же, что в отчёте). */
+  violations: number;
+  /** Ссылки на нормы, у которых число взято не из текста акта. */
+  unverified_citations: { citation: string; items: number; item_ids: string[] }[];
+  layers: ExportSummaryLayer[];
+  /** Исходный чертёж доступен — план ляжет на подоснову в тех же координатах. */
+  base_available: boolean;
+  /** Сколько слоёв исходного чертежа прочиталось; null — неизвестно. */
+  base_layer_count: number | null;
+}
+
+/** Сводка для диалога «Перед экспортом». Считается на сервере тем же
+ * обоснованием, что пишется в отчёт, — числа совпадают с файлом. */
+export async function getExportSummary(projectId: string, planId: string): Promise<ExportSummary> {
+  return request(`/api/projects/${projectId}/plans/${planId}/export-summary`);
 }
 
 function getDxfExportStatus(projectId: string, planId: string, jobId: string): Promise<ExportJobStatus> {
@@ -505,8 +737,12 @@ const EXPORT_POLL_INTERVAL_MS = 700;
  * from the URL (see useProjectSession.ts::handleExportDxf) so a
  * multi-hundred-MB file streams straight to disk instead of through a JS
  * blob. */
-export async function exportDxf(projectId: string, planId: string, options?: { signal?: AbortSignal }): Promise<string> {
-  const { job_id } = await startDxfExport(projectId, planId);
+export async function exportDxf(
+  projectId: string,
+  planId: string,
+  options?: { signal?: AbortSignal; export?: ExportOptions }
+): Promise<string> {
+  const { job_id } = await startDxfExport(projectId, planId, options?.export);
   for (;;) {
     if (options?.signal?.aborted) throw new ApiError("Экспорт отменён.", 0);
     const status = await getDxfExportStatus(projectId, planId, job_id);
@@ -514,6 +750,42 @@ export async function exportDxf(projectId: string, planId: string, options?: { s
     if (status.status === "done") return `${API_URL}/api/projects/${projectId}/plans/${planId}/export-dxf/${job_id}/download`;
     await new Promise((resolve) => setTimeout(resolve, EXPORT_POLL_INTERVAL_MS));
   }
+}
+
+// Слой «где нормы разрешают сажать» (backend/app/services/zones_service.py):
+// допустимая площадь и зоны, закрытые каждым ограничением, — растром.
+
+export interface ZoneGroup {
+  /** "allowed" — допустимая площадь; иначе тип ограничения (heat_network, building…). */
+  key: string;
+  kind: "allowed" | "blocker";
+  /** Уже с нормой: «Теплосеть 2 м». */
+  label: string;
+  color: string;
+  /** Доля участка (доли ограничений перекрываются, их сумма может быть больше 1). */
+  share: number;
+  required_m: number | null;
+  /** Площадь, закрытая только этим ограничением, м². */
+  exclusive_m2: number;
+}
+
+export interface PlanZones {
+  planting_type: PlantingType;
+  bounds: [[number, number], [number, number]];
+  territory_m2: number;
+  usable_m2: number;
+  usable_share: number;
+  interval_m: number;
+  groups: ZoneGroup[];
+  advice: { key: string; label: string; exclusive_m2: number; extra_items: number } | null;
+}
+
+export async function getPlanZones(projectId: string, planId: string, plantingType: PlantingType): Promise<PlanZones> {
+  return request(`/api/projects/${projectId}/plans/${planId}/zones?planting_type=${plantingType}`);
+}
+
+export function zoneImageUrl(projectId: string, planId: string, plantingType: PlantingType, group: string): string {
+  return `${API_URL}/api/projects/${projectId}/plans/${planId}/zones/image?planting_type=${plantingType}&group=${encodeURIComponent(group)}`;
 }
 
 export interface SpeciesSpacing {

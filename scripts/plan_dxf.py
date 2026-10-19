@@ -30,7 +30,7 @@ from geo_engine.io.dxf_reader import (
     read_dxf_bundle,
     resolve_bundle_inputs,
 )
-from geo_engine.io.dxf_writer import RESULT_LAYER_PREFIX, write_dxf
+from geo_engine.io.dxf_writer import RESULT_LAYER_PREFIX, violation_marks_for, write_dxf
 from geo_engine.norms import load_norms
 from geo_engine.planner import (
     CROWN_SPACING_TYPES,
@@ -550,7 +550,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
             else:
                 print(f"     основа: {base.name} (главный чертёж не читается)")
-        write_dxf(items, args.output, base_dxf=base, records=records, prefix=args.prefix)
+        write_dxf(
+            items,
+            args.output,
+            base_dxf=base,
+            records=records,
+            prefix=args.prefix,
+            violation_marks=violation_marks_for(items, records),
+        )
         if base == main_drawing and references:
             original_main, original_members = discover_bundle_members(Path(args.input))
             copied = copy_references(original_main, original_members, args.output.parent)

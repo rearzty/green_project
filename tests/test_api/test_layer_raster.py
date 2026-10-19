@@ -241,6 +241,77 @@ class TestRenderLayerRaster:
         assert not (-1 < west < east < 1)
 
 
+class TestGraphitePalette:
+    """Палитра графитовой темы (редизайн, фаза 1): подоснова приглушённая, а то,
+    что должно читаться поверх неё, — читается. Пиксели считаются той же
+    формулой, что использует сам модуль (границы территории +- контекстный
+    отступ, затем масштаб до _MAX_CANVAS_PX), а не угадываются."""
+
+    @staticmethod
+    def _to_px(territory: Polygon):
+        margin = layer_raster_module._CONTEXT_MARGIN_M
+        minx, miny, maxx, maxy = territory.bounds
+        minx, miny, maxx, maxy = minx - margin, miny - margin, maxx + margin, maxy + margin
+        scale = layer_raster_module._MAX_CANVAS_PX / max(maxx - minx, maxy - miny)
+        return lambda x, y: (round((x - minx) * scale), round((maxy - y) * scale))
+
+    @staticmethod
+    def _image(result, key):
+        group = next(g for g in result.groups if g.key == key)
+        return Image.open(__import__("io").BytesIO(group.png))
+
+    def test_ground_is_painted_first_and_the_work_boundary_last(self):
+        layers = [
+            _layer(id="territory", kind="zone", object_type="territory", geometry=shape_to_db(TERRITORY)),
+            _layer(id="building", kind="zone", object_type="building", geometry=shape_to_db(BUILDING)),
+            _layer(id="road", kind="zone", object_type="road", geometry=shape_to_db(Polygon([(30, 30), (30, 40), (60, 40), (60, 30)]))),
+            _layer(id="gas", kind="utility", object_type="gas_pipe", geometry=shape_to_db(GAS_PIPE)),
+        ]
+        keys = [g.key for g in render_layer_raster(layers, source_crs=None).groups]
+
+        # Позднее рисуется поверх раннего: здания не должны оказаться под дорогой
+        # или подкраской, граница работ (без сплошной заливки) — поверх всего.
+        assert keys.index("existing_greenery") < keys.index("road") < keys.index("building") < keys.index("utility")
+        assert keys[-1] == "territory"
+
+    def test_building_polygon_uses_the_map_fill_not_a_translucent_tint(self):
+        layers = [
+            _layer(id="territory", kind="zone", object_type="territory", geometry=shape_to_db(TERRITORY)),
+            _layer(id="building", kind="zone", object_type="building", geometry=shape_to_db(BUILDING)),
+        ]
+        result = render_layer_raster(layers, source_crs=None)
+        image = self._image(result, "building")
+
+        assert image.getpixel(self._to_px(TERRITORY)(15, 15)) == (0x32, 0x38, 0x34, 255)
+
+    def test_work_boundary_is_a_dashed_line_not_a_solid_one(self):
+        layers = [_layer(id="territory", kind="zone", object_type="territory", geometry=shape_to_db(TERRITORY))]
+        result = render_layer_raster(layers, source_crs=None)
+        image = self._image(result, "territory")
+        to_px = self._to_px(TERRITORY)
+
+        # Верхнее ребро (y = 100) обходим пиксель за пикселем: штрих -- пробел --
+        # штрих. Сплошной контур дал бы одну непрерывную полосу без пробелов.
+        x_start, y_edge = to_px(0, 100)
+        x_end, _ = to_px(100, 100)
+        painted = [any(image.getpixel((x, y_edge + dy))[3] > 40 for dy in (-2, -1, 0, 1, 2)) for x in range(x_start + 1, x_end - 1)]
+        runs = sum(1 for before, now in zip(painted, painted[1:]) if now and not before)
+
+        assert runs >= 3, "контур границы работ должен быть пунктиром"
+        assert not all(painted), "в пунктире есть пробелы"
+
+    def test_zoning_is_a_faint_backdrop_not_a_loud_fill(self):
+        layers = [
+            _layer(id="territory", kind="zone", object_type="territory", geometry=shape_to_db(TERRITORY)),
+            _layer(id="zoning", kind="zone", object_type="zoning", geometry=shape_to_db(TERRITORY), attrs={"zoning_category": "residential"}),
+        ]
+        result = render_layer_raster(layers, source_crs=None)
+        image = self._image(result, "zoning:residential")
+
+        alpha = image.getpixel(self._to_px(TERRITORY)(50, 50))[3]
+        assert 0 < alpha <= layer_raster_module._FILL_ALPHA // 2
+
+
 class TestParallelRendering:
     """Real projects (>=_PARALLEL_RENDER_THRESHOLD geometries) render each
     legend group in its own process instead of one thread doing them in

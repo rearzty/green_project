@@ -3,8 +3,10 @@
 import { useEffect, useRef, useState } from "react";
 
 import {
+  cancelGeneration,
   deletePlan,
   exportDxf,
+  type ExportOptions,
   generatePlan,
   getLayersRaster,
   getPlan,
@@ -14,6 +16,7 @@ import {
   uploadProject,
   type GeoJSONFeature,
   type GenerateJobStatus,
+  type GeneratePartial,
   type LayersRaster,
   type PlanOut,
   type PlanSummary,
@@ -120,6 +123,11 @@ export function useProjectSession() {
   const [generating, setGenerating] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<JobProgress | null>(null);
   const [generateProgress, setGenerateProgress] = useState<JobProgress | null>(null);
+  // Что уже расставлено, пока план ещё считается (карта показывает это
+  // предпросмотром), и задача, которую «Остановить» должно остановить.
+  const [generatePartial, setGeneratePartial] = useState<GeneratePartial | null>(null);
+  const generateJobRef = useRef<{ projectId: string; jobId: string } | null>(null);
+  const [stopping, setStopping] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [restoring, setRestoring] = useState(true);
   // Сервер ответил, что открытого проекта у него больше нет (перезапуск —
@@ -246,10 +254,15 @@ export function useProjectSession() {
     if (!project) return;
     setGenerating(true);
     setGenerateProgress(null);
+    setGeneratePartial(null);
     try {
       const generated = await generatePlan(project.id, plantingTypes, scoringMode, {
         ...spacing,
         onPoll: (status) => setGenerateProgress(progressFromStatus(status)),
+        onJob: (jobId) => {
+          generateJobRef.current = { projectId: project.id, jobId };
+        },
+        onPartial: setGeneratePartial,
       });
       // До applyPlan: страница восстанавливает поля панели из рецепта плана,
       // как только он на экране (app/page.tsx). Пропущенные поля — те же
@@ -269,6 +282,23 @@ export function useProjectSession() {
     } finally {
       setGenerating(false);
       setGenerateProgress(null);
+      setGeneratePartial(null);
+      generateJobRef.current = null;
+      setStopping(false);
+    }
+  }
+
+  /** «Остановить» при генерации: сервер сразу отмечает задачу отменённой, а
+   * `generatePlan` на ближайшем опросе бросает GenerationCancelledError. */
+  async function handleStopGenerate() {
+    const job = generateJobRef.current;
+    if (!job || stopping) return;
+    setStopping(true);
+    try {
+      await cancelGeneration(job.projectId, job.jobId);
+    } catch (e) {
+      setStopping(false);
+      throw e;
     }
   }
 
@@ -278,11 +308,11 @@ export function useProjectSession() {
    * simple <a href> anymore (the previous design): writing a real-scale
    * plan can take minutes, too long for a link the browser might time out
    * waiting on. */
-  async function handleExportDxf() {
+  async function handleExportDxf(options?: ExportOptions) {
     if (!project || !plan) return;
     setExporting(true);
     try {
-      const downloadUrl = await exportDxf(project.id, plan.plan_id);
+      const downloadUrl = await exportDxf(project.id, plan.plan_id, { export: options });
       const link = document.createElement("a");
       link.href = downloadUrl;
       document.body.appendChild(link);
@@ -339,6 +369,8 @@ export function useProjectSession() {
     generating,
     uploadProgress,
     generateProgress,
+    generatePartial,
+    stopping,
     exporting,
     restoring,
     projectLost,
@@ -349,6 +381,7 @@ export function useProjectSession() {
     refreshPlans,
     handleUpload,
     handleGenerate,
+    handleStopGenerate,
     handleExportDxf,
     handleSelectPlan,
     handleDeletePlan,

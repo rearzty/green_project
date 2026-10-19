@@ -38,7 +38,7 @@ class GenerateJobOut(BaseModel):
     job_id: str
 
 
-GenerateJobState = Literal["pending", "done", "error"]
+GenerateJobState = Literal["pending", "done", "error", "cancelled"]
 
 
 class GenerateJobStatus(BaseModel):
@@ -50,6 +50,41 @@ class GenerateJobStatus(BaseModel):
     # that most recently finished; `progress` is types-done/types-total.
     stage: str | None = None
     progress: float | None = None
+    # Сколько посадок каждого типа уже посчитано и растёт ли это: фронт
+    # перечитывает частичный результат (GET .../generate/{job_id}/partial),
+    # только когда `partial_version` сменилась.
+    partial_counts: dict[str, int] = {}
+    partial_version: int = 0
+
+
+class EstimateItemOut(BaseModel):
+    planting_type: PlantingType
+    low: int
+    high: int
+    # items — штуки (деревья, кусты), m2 — площадь (газон).
+    unit: Literal["items", "m2"]
+    # plan — от открытого плана (точнее), area — по допустимой площади (грубо).
+    basis: Literal["plan", "area"]
+
+
+class EstimateOut(BaseModel):
+    """«Ожидается» на вкладке «План»: диапазон по каждому запрошенному типу.
+    Типа нет в списке, если оценить не из чего."""
+
+    estimates: list[EstimateItemOut]
+
+
+class GeneratePartialOut(BaseModel):
+    """То, что уже расставлено, пока план считается: только места и типы для
+    предпросмотра на карте — не редактируемый план (ни id, ни обоснований)."""
+
+    version: int
+    counts: dict[str, int]
+    features: GeoJSONFeatureCollection
+
+
+class GenerateCancelOut(BaseModel):
+    status: GenerateJobState
 
 
 class ExportJobOut(BaseModel):
@@ -60,6 +95,53 @@ class ExportJobOut(BaseModel):
     backend/app/services/export_jobs.py."""
 
     job_id: str
+
+
+ExportLayerKey = Literal["tree", "shrub", "lawn", "violations"]
+
+
+class ExportOptionsIn(BaseModel):
+    """Что уйдёт в файл (диалог «Перед экспортом»). Всё необязательное: пустое
+    тело — прежний экспорт целиком."""
+
+    # Слои результата; None — все. «violations» — кольца вокруг нарушений.
+    layers: list[ExportLayerKey] | None = None
+    # План поверх исходного чертежа (и файлы его внешних ссылок рядом). Без
+    # подосновы план пишется отдельным чертежом.
+    include_base: bool = True
+    # plan.report.json и plan.trace.csv — обоснование каждой посадки.
+    include_report: bool = True
+
+
+class ExportLayerOut(BaseModel):
+    key: ExportLayerKey
+    # Имя слоя в DXF — ровно то, что пишет экспорт (geo_engine/io/dxf_writer.py).
+    name: str
+    count: int
+    # Только у газона: площадь, м².
+    area_m2: float | None = None
+
+
+class UnverifiedCitationOut(BaseModel):
+    citation: str
+    items: int
+    # Посадки, у которых решающее ограничение держится на этой ссылке (не
+    # больше MAX_UNVERIFIED_ITEM_IDS) — чтобы показать их на карте.
+    item_ids: list[str]
+
+
+class ExportSummaryOut(BaseModel):
+    """Сводка для диалога «Перед экспортом»: считается тем же `explain_items`,
+    что пишет отчёт, — числа в диалоге и в скачанном файле не расходятся."""
+
+    total_items: int
+    violations: int
+    unverified_citations: list[UnverifiedCitationOut]
+    layers: list[ExportLayerOut]
+    # Исходный чертёж доступен: план ляжет на подоснову в тех же координатах.
+    base_available: bool
+    # Сколько слоёв исходного чертежа прочиталось (None — неизвестно).
+    base_layer_count: int | None = None
 
 
 ExportJobState = Literal["pending", "done", "error"]
@@ -74,6 +156,38 @@ class AreaBlockerOut(BaseModel):
     object_type: str
     label: str
     share: float
+
+
+class ZoneGroupOut(BaseModel):
+    """Одна полоса слоя «где можно сажать»: допустимая площадь или зона,
+    закрытая одним ограничением."""
+
+    key: str
+    kind: Literal["allowed", "blocker"]
+    label: str
+    color: str
+    share: float
+    required_m: float | None = None
+    # Площадь, закрытая только этим ограничением, м² — освободится, если его убрать.
+    exclusive_m2: float = 0.0
+
+
+class ZonesAdviceOut(BaseModel):
+    key: str
+    label: str
+    exclusive_m2: float
+    extra_items: int
+
+
+class PlanZonesOut(BaseModel):
+    planting_type: PlantingType
+    bounds: tuple[tuple[float, float], tuple[float, float]]
+    territory_m2: float
+    usable_m2: float
+    usable_share: float
+    interval_m: float
+    groups: list[ZoneGroupOut]
+    advice: ZonesAdviceOut | None = None
 
 
 class AreaBudgetOut(BaseModel):
@@ -136,6 +250,108 @@ class ItemsDeleteResult(BaseModel):
 
     deleted_items: list[GeoJSONFeature]
     item_count: int
+
+
+class ItemsRespaceRequest(BaseModel):
+    """Перерасставить ряд с другим шагом (метры). Нижняя граница — не норматив
+    (его проверяет сервис по породе), а защита от шага в сантиметры, который
+    раздул бы ряд в тысячи точек."""
+
+    ids: list[str]
+    pitch_m: float = Field(ge=0.3, le=30.0)
+
+
+class ItemsRespaceResult(BaseModel):
+    """`previous_items` — снимки прежних посадок ряда (для отмены через
+    delete+restore), `items` — новые; `item_count` — свежее число посадок плана."""
+
+    previous_items: list[GeoJSONFeature]
+    items: list[GeoJSONFeature]
+    item_count: int
+
+
+FixKind = Literal["move", "retype", "delete"]
+
+
+class FixPointOut(BaseModel):
+    """Точка в тех же координатах, что и остальная геометрия ответов (WGS84,
+    если СК проекта подтверждена, иначе метры чертежа)."""
+
+    x: float
+    y: float
+
+
+class FixOptionOut(BaseModel):
+    """Один способ исправить нарушение — см. backend/app/services/fix_service.py.
+    Поля вида (`to`/`shift_m`/…, `type`/`valid`/…, `gap_m`) заполнены только у
+    своего `kind`."""
+
+    kind: FixKind
+    # Лучший по мнению сервиса; ставится только когда есть из чего выбирать.
+    recommended: bool = False
+    # move
+    to: FixPointOut | None = None
+    shift_m: float | None = None
+    # Расстояние до нарушенного ограничения после сдвига, м.
+    clearance_m: float | None = None
+    # Остаётся ли посадка в линии своего ряда; None — она не из ряда.
+    keeps_row: bool | None = None
+    # retype
+    type: PlantingType | None = None
+    valid: bool | None = None
+    required_m: float | None = None
+    # delete: пропуск, который останется в ряду, м.
+    gap_m: float | None = None
+
+
+class ItemFixesOut(BaseModel):
+    item_id: str
+    options: list[FixOptionOut]
+
+
+class FixesApplyRequest(BaseModel):
+    """«Исправить все так же»: применить к этим посадкам лучший вариант вида `kind`."""
+
+    ids: list[str] = Field(min_length=1, max_length=500)
+    kind: FixKind
+
+
+class FixesApplyResult(BaseModel):
+    """`previous_items` — снимки прежних посадок (для отмены), `items` — сдвинутые
+    и пересаженные (id прежние; удалённых среди них нет), `skipped_ids` — те, у
+    кого нужного варианта нет; `item_count` — свежее число посадок плана."""
+
+    previous_items: list[GeoJSONFeature]
+    items: list[GeoJSONFeature]
+    skipped_ids: list[str]
+    item_count: int
+
+
+class NearbyConstraintOut(BaseModel):
+    """Ограничение рядом с перетаскиваемой посадкой: что это, сколько до него
+    нужно и где оно лежит. Геометрия — в координатах отображения (как всё
+    остальное); расстояние до неё считает клиент на каждом кадре."""
+
+    kind: Literal["constraint", "neighbour"]
+    # Только у соседнего дерева: чтобы не считать за ограничение саму группу, которую тянут.
+    id: str | None = None
+    object_type: str
+    object_label: str
+    required_m: float
+    geometry: GeoJSONGeometry | None = None
+    # Охранная зона: геометрия, раздутая на required_m.
+    zone: GeoJSONGeometry
+
+
+class NearbyConstraintsOut(BaseModel):
+    radius_m: float
+    features: list[NearbyConstraintOut]
+
+
+class NearestAllowedOut(BaseModel):
+    to: FixPointOut
+    # Расстояние от запрошенной точки до допустимой, м.
+    shift_m: float
 
 
 class ItemTypeChange(BaseModel):

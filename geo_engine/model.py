@@ -39,6 +39,11 @@ class PlantingCandidate:
     clearance_m: float  # distance to the nearest exclusion boundary
     area_m2: float | None = None  # relevant for lawn candidates
     zoning: str | None = None
+    # К какой группе посадок относится место: ряд вдоль одного ориентира, одна
+    # куртина, одна группа деревьев. None — россыпь и солитер (у них группы нет).
+    # Нужно интерфейсу: «Выделить похожие → весь ряд» выделяет ровно точки одной
+    # группы, а не «всё рядом по расстоянию».
+    group: str | None = None
 
 
 @dataclass
@@ -51,3 +56,8 @@ class PlantingItem:
     score: float
     rationale: str
     is_manual_edit: bool = False
+    # Идентификатор группы посадок (см. PlantingCandidate.group); у россыпи и
+    # солитера None. Стабилен между пересчётами одного плана: id выводятся из
+    # номера ориентира и положения ядра, а не из счётчика, который пережил бы
+    # прошлую генерацию в этом же процессе.
+    group_id: str | None = None

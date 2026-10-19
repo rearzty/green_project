@@ -34,6 +34,7 @@ concern is moot.
 from __future__ import annotations
 
 import io
+import math
 import os
 import threading
 from collections import OrderedDict
@@ -63,42 +64,90 @@ class _LayerLike(Protocol):
 # These are now the only source of truth for legend color/label — the
 # frontend's own copy (mapStyle.ts's old ZONE_COLORS/LAYER_TYPE_LABELS) was
 # deleted when vector rendering gave way to this server-rendered raster (see
-# this module's docstring); ControlPanel.tsx just displays whatever `label`/
+# this module's docstring); the "Слои" popover / DraftPanel just display whatever `label`/
 # `color` render_layer_raster() computed below, nothing to keep in sync
 # against anymore.
-_UTILITY_COLOR = "#b91c1c"
+# Палитра графитовой темы (GREENPROJECT_REDESIGN.md §2, «Цвета — карта»):
+# подоснова приглушённая, ярко рисуются только посадки, нарушения, выделение
+# и граница работ — а они живут на стороне фронтенда (lib/mapStyle.ts,
+# app/globals.css), поверх этих PNG. Значение здесь — цвет «образца» в
+# легенде и линий; заливка/обводка полигонов — в _POLYGON_STYLES ниже.
+_UTILITY_COLOR = "#A994E8"
 _ZONE_COLORS = {
-    "building": "#78716c",
-    "road": "#57534e",
-    "territory": "#0ea5e9",
-    "order_boundary": "#7dd3fc",
-    # Deliberately teal, not the same green family as PLANTING_COLORS.tree
-    # (#15803d) / .shrub (#65a30d) in mapStyle.ts. Was #16a34a -- close enough
-    # to tree's #15803d that on a real street where existing_greenery is
-    # mostly individual small tree-canopy polygons (thousands of small
-    # polygons, not one big patch), it rendered as small green marks
-    # indistinguishable from the plan's own newly-generated tree dots. Keep
-    # in sync with mapStyle.ts's own ZONE_COLORS.existing_greenery (used by
-    # ThreeDView's 3D extrusion) if this changes again.
-    "existing_greenery": "#0d9488",
+    "building": "#59615B",
+    "road": "#555D58",
+    "territory": "#B5E07A",
+    "order_boundary": "#868F89",
+    # Существующая зелень (твёрдое препятствие) темнее и холоднее нового газона
+    # плана и заметно тусклее посадок #7BD389 — иначе существующие деревья
+    # снова сольются с деревьями самого плана (живая жалоба «не рисуется то,
+    # что уже есть»: тогда цвета были почти одинаковы). Её же берёт ThreeDView
+    # через mapStyle.ts::ZONE_COLORS.existing_greenery.
+    "existing_greenery": "#3F6B58",
     # Заливки.dwg's asphalt/tile sidewalk fills (layer_rules.py's АБ ТР/ПЛ ТР
-    # patterns) -- a lighter stone than road/building so it reads as related
-    # hardscape without being mistaken for either.
-    "sidewalk": "#a8a29e",
-    "sidewalk_kerb": "#78716c",
-    # Existing lawn (Заливки.dwg's "гзн" surface-fill code) -- deliberately a
-    # paler lime than existing_greenery's forest-green: this is real ground
-    # cover, not a hard obstacle (see layer_rules.py), and shouldn't read as
-    # the same "don't plant here" category on the map.
-    "existing_lawn": "#bef264",
+    # patterns) — светлее проезжей части, но тоже подоснова.
+    "sidewalk": "#4F5752",
+    "sidewalk_kerb": "#59615B",
+    # Existing lawn (Заливки.dwg's "гзн" surface-fill code): настоящий
+    # покров земли, не препятствие (см. layer_rules.py), поэтому — полосы
+    # зелени карты #304033, а не тёмный «нельзя» существующей зелени.
+    "existing_lawn": "#4C6B50",
+    "lighting_pole": "#C8B68A",
+    "slope_toe": "#7A6A58",
+    "retaining_wall": "#8A6F5A",
+    "tram_track": "#7A7F8C",
+    "school_kindergarten": "#8F7A5E",
+    "preserved_tree": "#5FAE78",
+    "stairs": "#6E7570",
+    # Неопознанная графика чертежа (рамки, штриховки, выноски) — едва
+    # заметная: в расчёте отступов она не участвует.
+    "unknown": "#434A45",
 }
 _ZONING_CATEGORY_COLORS = {
-    "residential": "#a78bfa",
-    "recreational": "#2dd4bf",
-    "public": "#818cf8",
-    "industrial": "#f97316",
-    "transport": "#64748b",
+    "residential": "#7C77A8",
+    "recreational": "#4A9A8E",
+    "public": "#7078AE",
+    "industrial": "#B07A45",
+    "transport": "#667282",
 }
+# Заливка (RGBA) и обводка (RGB) полигонов группы, если они не «цвет группы
+# при прозрачности _FILL_ALPHA». None в заливке — без заливки. Значения —
+# дословно из макетов: здания fill #323834 / stroke #59615B, полосы зелени
+# #304033, тротуар #343A36, проезжая часть #3C433F.
+_POLYGON_STYLES: dict[str, tuple[tuple[int, int, int, int] | None, tuple[int, int, int]]] = {
+    "building": ((0x32, 0x38, 0x34, 255), (0x59, 0x61, 0x5B)),
+    "road": ((0x3C, 0x43, 0x3F, 255), (0x55, 0x5D, 0x58)),
+    "sidewalk": ((0x34, 0x3A, 0x36, 255), (0x4F, 0x57, 0x52)),
+    "existing_lawn": ((0x30, 0x40, 0x33, 255), (0x3F, 0x5A, 0x44)),
+    "existing_greenery": ((0x2E, 0x45, 0x3A, 255), (0x3F, 0x6B, 0x58)),
+    # Граница работ — только пунктир; едва заметная заливка (alpha 12 из 255)
+    # оставлена, чтобы дырки территории (дворы, выведенные из работы) по-
+    # прежнему отличались от самой площадки — см. тест про дырку.
+    "territory": ((0xB5, 0xE0, 0x7A, 12), (0xB5, 0xE0, 0x7A)),
+    "order_boundary": (None, (0x86, 0x8F, 0x89)),
+}
+# Группы, чей контур рисуется пунктиром, и сам пунктир: штрих/пробел, px.
+# Граница работ в макете — пунктир 1.5px rgba(181,224,122,.7).
+_DASHED_OUTLINE_GROUPS = {"territory": (0.7, 9.0, 6.0), "order_boundary": (0.55, 9.0, 6.0)}
+# Порядок наложения PNG на карте: подоснова снизу, затем здания, сети, а
+# граница работ — поверх всего (у неё нет сплошной заливки, ничего не закроет).
+_PAINT_RANK = {
+    "existing_lawn": 10,
+    "existing_greenery": 20,
+    "unknown": 25,
+    "sidewalk": 30,
+    "sidewalk_kerb": 35,
+    "road": 40,
+    "building": 60,
+    "retaining_wall": 62,
+    "utility": 70,
+    "lighting_pole": 75,
+    "preserved_tree": 80,
+    "order_boundary": 90,
+    "territory": 100,
+}
+_DEFAULT_PAINT_RANK = 50
+_ZONING_PAINT_RANK = 5  # зонирование — самая нижняя подкраска, под всем
 # Подпись обязана быть у КАЖДОГО типа, который может произвести чтение
 # чертежа, иначе легенда показывает сырой ключ. Пользователь это и увидел:
 # «Территория 1, lighting_pole 1159, slope_toe 1742, unknown 6888, Дороги
@@ -173,7 +222,7 @@ _CONTEXT_MARGIN_M = 150.0
 # fix was tried and rejected as unsafe). A LineString at the default 2px reads
 # as a stray scribble; at wall-like thickness it reads as what it is -- a real
 # wall the survey drew, just one this reader couldn't close into a shape.
-_LINE_WIDTH_PX = {"utility": 3, "building": 4}
+_LINE_WIDTH_PX = {"utility": 2, "building": 4}
 _DEFAULT_LINE_WIDTH_PX = 2
 _POINT_RADIUS_PX = 3
 _FILL_ALPHA = 115  # ~0.45 opacity, matching MapView.tsx's layerStyle fillOpacity
@@ -193,6 +242,7 @@ _FILL_ALPHA = 115  # ~0.45 opacity, matching MapView.tsx's layerStyle fillOpacit
 # than groups buys nothing, and one very large group (e.g. a pile of
 # unrecognised "unknown" symbol-block primitives) still bounds the wall
 # time of the whole render on its own, however many cores are free.
+_ZONING_FILL_ALPHA = 38  # ~15%
 _PARALLEL_RENDER_THRESHOLD = 20_000
 _MAX_RENDER_WORKERS = 6
 
@@ -348,6 +398,49 @@ def _make_pixel_transform(minx: float, miny: float, maxx: float, maxy: float, ma
     return to_px, px_w, px_h, scale
 
 
+# Толщина пунктирного контура в пикселях растра (на 6000 px холста это доли
+# метра, на экране — тонкая линия, толще при приближении).
+_DASH_WIDTH_PX = 5
+
+
+def _draw_dashed_ring(draw: ImageDraw.ImageDraw, points: list[tuple[float, float]], rgb: tuple[int, int, int], group_key: str) -> None:
+    """Пунктир по замкнутому контуру: штрих/пробел идут непрерывно вдоль
+    периметра, а не начинаются заново на каждом ребре (иначе у частых
+    вершин пунктир превращался бы в сплошную линию)."""
+    opacity, dash, gap = _DASHED_OUTLINE_GROUPS[group_key]
+    rgba = (*rgb, round(255 * opacity))
+    ring = list(points)
+    if ring[0] != ring[-1]:
+        ring.append(ring[0])
+    drawing = True
+    remaining = dash
+    for (x0, y0), (x1, y1) in zip(ring, ring[1:]):
+        length = math.hypot(x1 - x0, y1 - y0)
+        if length == 0:
+            continue
+        ux, uy = (x1 - x0) / length, (y1 - y0) / length
+        travelled = 0.0
+        while travelled < length:
+            step = min(remaining, length - travelled)
+            if drawing:
+                draw.line(
+                    [(x0 + ux * travelled, y0 + uy * travelled), (x0 + ux * (travelled + step), y0 + uy * (travelled + step))],
+                    fill=rgba,
+                    width=_DASH_WIDTH_PX,
+                )
+            travelled += step
+            remaining -= step
+            if remaining <= 1e-9:
+                drawing = not drawing
+                remaining = dash if drawing else gap
+
+
+def _paint_rank(key: str) -> int:
+    if key.startswith(_ZONING_PREFIX):
+        return _ZONING_PAINT_RANK
+    return _PAINT_RANK.get(key, _DEFAULT_PAINT_RANK)
+
+
 def _draw_geometry(draw: ImageDraw.ImageDraw, geom: BaseGeometry, to_px, color: tuple[int, int, int], group_key: str) -> None:
     gtype = geom.geom_type
     if gtype == "Point":
@@ -360,25 +453,42 @@ def _draw_geometry(draw: ImageDraw.ImageDraw, geom: BaseGeometry, to_px, color: 
             width = _LINE_WIDTH_PX.get(group_key, _DEFAULT_LINE_WIDTH_PX)
             draw.line(points, fill=color, width=width)
     elif gtype == "Polygon":
+        fill, outline = _POLYGON_STYLES.get(group_key) or (
+            # Зонирование — фон-контекст, а не препятствие: на тёмной карте
+            # заливка в 45% прозрачности (как у остальных групп) кричала бы
+            # на пол-участка лиловым и бирюзовым.
+            ((*color, _ZONING_FILL_ALPHA), color)
+            if group_key.startswith(_ZONING_PREFIX)
+            else ((*color, _FILL_ALPHA), color)
+        )
+        dashed = group_key in _DASHED_OUTLINE_GROUPS
         points = [to_px(x, y) for x, y in geom.exterior.coords]
         if len(points) >= 3:
-            draw.polygon(points, fill=(*color, _FILL_ALPHA), outline=color)
+            if dashed:
+                # PIL не умеет пунктирный контур полигона: заливка отдельно,
+                # контур — своим проходом по периметру.
+                if fill is not None:
+                    draw.polygon(points, fill=fill)
+                _draw_dashed_ring(draw, points, outline, group_key)
+            else:
+                draw.polygon(points, fill=fill, outline=outline)
         # Interior rings ARE punched out -- live case, «1. Олимпийская
         # деревня»: territory_polygon() now genuinely returns a Polygon
         # with 8 real holes (courtyards excluded from the work scope, see
         # geo_engine/territory.py::_combine_with_holes), not the solid blob
         # this used to assume was the common case. Drawing on an RGBA
         # canvas, fill=(0,0,0,0) actually clears those pixels back to
-        # transparent (not just "no-op paint") -- since "territory" paints
-        # first (see the bottom of this module), a hole here lets whatever
-        # real content another group draws for that courtyard (building/
-        # road/lawn) show through unobstructed by the blue tint, instead of
-        # painting blue first and hoping a later, unrelated group happens
-        # to fully cover it.
+        # transparent (not just "no-op paint") -- each group is its own PNG
+        # overlay, so a hole here lets whatever real content another group
+        # draws for that courtyard (building/road/lawn) show through
+        # unobstructed by this group's tint, instead of relying on paint
+        # order to cover it up.
         for interior in geom.interiors:
             hole_points = [to_px(x, y) for x, y in interior.coords]
             if len(hole_points) >= 3:
                 draw.polygon(hole_points, fill=(0, 0, 0, 0))
+                if dashed:
+                    _draw_dashed_ring(draw, hole_points, outline, group_key)
     elif gtype.startswith("Multi") or gtype == "GeometryCollection":
         for part in geom.geoms:
             _draw_geometry(draw, part, to_px, color, group_key)
@@ -538,17 +648,17 @@ def render_layer_raster(layers: list[_LayerLike], source_crs: str | None) -> Lay
     # Paint order, not just list order: MapView.tsx renders one <ImageOverlay>
     # per group in this exact array order, and later ImageOverlays paint over
     # earlier ones. Plain alphabetical-by-label sorting put "Территория"
-    # (blue solid fill over the whole work boundary) after "Здания" on real
+    # (a solid fill over the whole work boundary) after "Здания" on real
     # data -- the territory wash then painted OVER the building outlines,
-    # visually burying them under a uniform blue even though buildable_area()
-    # correctly excludes them from the actual generated plan underneath.
-    # Found live: a user screenshot showing a big blue rectangle with no
-    # visible buildings, right where the real "Проектное решение" reference
-    # plan shows two building footprints. Territory is a backdrop -- it must
-    # paint first (bottom), same idea as a basemap sitting under everything
-    # else -- everything else keeps its existing alphabetical order among
-    # itself, only territory's position is pinned.
-    groups.sort(key=lambda g: (g.key != "territory", g.label))
+    # visually burying them even though buildable_area() correctly excludes
+    # them from the generated plan underneath. Found live: a user screenshot
+    # showing a big blue rectangle with no visible buildings, right where the
+    # real "Проектное решение" reference plan shows two building footprints.
+    # Теперь порядок задаёт _PAINT_RANK: подоснова (газон, зелень, тротуары,
+    # проезжая часть) снизу, затем здания и сети, граница работ — поверх
+    # всего (у неё нет сплошной заливки, она ничего не закроет); внутри
+    # одного ранга — по подписи, как раньше.
+    groups.sort(key=lambda g: (_paint_rank(g.key), g.label))
     return LayerRaster(bounds=bounds, groups=groups)
 
 

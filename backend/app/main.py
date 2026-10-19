@@ -12,6 +12,7 @@ from backend.app.api import (
     routes_export,
     routes_generate,
     routes_projects,
+    routes_zones,
 )
 from backend.app.core.config import settings
 
@@ -46,3 +47,4 @@ app.include_router(routes_export.router)
 app.include_router(routes_config.router)
 app.include_router(routes_assistant.router)
 app.include_router(routes_compliance.router)
+app.include_router(routes_zones.router)

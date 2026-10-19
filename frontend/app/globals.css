@@ -7,15 +7,47 @@ body {
   height: 100%;
 }
 
+/* Нативные чекбоксы, select и полосы прокрутки рисуются тёмными: тема
+   графитовая, и светлый системный чекбокс на панели резал глаз. */
+html {
+  color-scheme: dark;
+}
+
+/* Тонкие тёмные полосы прокрутки в панелях: белые системные на графите
+   выглядели чужеродно. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #3a403c transparent;
+}
+
+/* Видимый фокус для управления с клавиатуры (спека §6, доступность): рамка
+   цвета gp-selection, чтобы не путалась ни с акцентом, ни с нарушением.
+   Только :focus-visible — клик мышью рамку не рисует. В слое base, а не
+   обычным правилом: иначе она бьёт по специфичности и порядку любое
+   `outline-none` из утилит (поле ввода Юны внутри своей рамки получало
+   вторую, синюю). */
+@layer base {
+  :focus-visible {
+    outline: 2px solid #8ab4ff;
+    outline-offset: 2px;
+  }
+}
+
 .leaflet-container {
   height: 100%;
   width: 100%;
-  /* Only visible in the brief pre-tile-load gap or the out-of-world-bounds
-     gutter -- the tiles themselves stay their normal light OSM colors. */
-  background: #0c0a09;
+  /* Только в короткий зазор до загрузки тайлов и за краем мира. Цвет —
+     gp-map: карта чуть светлее панелей и читается приглушённой подосновой.
+     !important — по той же причине, что у .gp-neutral-map-bg ниже:
+     leaflet.css подключается из компонента, позже этого файла, и с равной
+     специфичностью его `background: #ddd` побеждал по порядку — карта
+     проекта с проверенной СК (где нет нашей сетки-подложки) оставалась
+     светло-серой, пока тайлы не загрузились (или не загрузились вовсе). */
+  background: #2a302c !important;
+  font-family: inherit;
 }
 
-/* Stands in for the OpenStreetMap tile layer when the project's CRS isn't
+/* Stands in for the basemap tile layer when the project's CRS isn't
    verified (MapView.tsx omits <TileLayer> entirely rather than show a real
    street map under coordinates we don't actually know the position of --
    see backend's Project.crs_verified). A faint CAD-style grid, not a plain
@@ -31,17 +63,40 @@ body {
    rule's fate; caught live here specifically because omitting <TileLayer>
    for an unverified CRS means nothing else paints over the gray. */
 .gp-neutral-map-bg {
-  background-color: #0c0a09 !important;
+  background-color: #2a302c !important;
   background-image:
-    linear-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.045) 1px, transparent 1px) !important;
+    linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px) !important;
   background-size: 32px 32px !important;
 }
 
-/* Plan items (tree/shrub points) -- a 16px hit area around a 10px dot, so a
-   dot is easy to grab without looking bigger. State classes are toggled
-   imperatively on the marker element by MapView (no remount per selection
-   change). Selection is blue, norm violations red: both can apply at once. */
+/* Тайлы OSM приглушены до тёмной подосновы фильтром (MapView.tsx::BASEMAP_URL):
+   инверсия + разворот оттенка возвращает цвета к естественным (вода остаётся
+   синей), яркость и насыщенность опущены, чтобы подоснова не спорила с
+   посадками. Фильтр только на tile-pane: растровая подложка чертежа и
+   маркеры лежат в других панах и остаются как есть. */
+.gp-dark-basemap .leaflet-tile-pane {
+  filter: invert(1) hue-rotate(180deg) brightness(0.78) contrast(0.8) saturate(0.45);
+}
+
+/* Атрибуция OSM обязательна (условия использования тайлов), но не
+   обязана светиться белой плашкой на тёмной карте. Ссылки остаются
+   читаемыми и кликабельными. */
+.leaflet-container .leaflet-control-attribution {
+  background: rgba(34, 38, 36, 0.82);
+  color: #868f89;
+  font-size: 11px;
+}
+.leaflet-container .leaflet-control-attribution a {
+  color: #a9b1ab;
+}
+
+/* Plan items (tree/shrub points) -- a hit area a few px wider than the dot,
+   so a dot is easy to grab without looking bigger. State classes are
+   toggled imperatively on the marker element by MapView (no remount per
+   selection change). Selection is blue, norm violations orange: both can
+   apply at once. Цвет точки (дерево/кустарник) задаёт сама иконка — тут
+   только обводка цвета фона карты, которая отрывает соседей друг от друга. */
 .gp-plan-dot {
   /* block + margin, not a flex-centered parent: leaflet.css forces
      `.leaflet-marker-icon { display: block }` on the marker element, and an
@@ -50,12 +105,10 @@ body {
   margin: 3px;
   width: 10px;
   height: 10px;
+  box-sizing: border-box;
   border-radius: 9999px;
-  border: 1px solid #fff;
-  box-shadow: 0 0 1px rgba(0, 0, 0, 0.6);
-  transition:
-    transform 0.12s ease-out,
-    box-shadow 0.12s ease-out;
+  box-shadow: 0 0 0 1.5px #2a302c;
+  transition: box-shadow 0.12s ease-out;
 }
 .gp-plan-marker.leaflet-interactive {
   cursor: grab;
@@ -63,20 +116,40 @@ body {
 .gp-plan-marker.gp-violation {
   z-index: 100000 !important; /* above ordinary dots, which Leaflet stacks by latitude */
 }
-.gp-plan-marker.gp-violation .gp-plan-dot {
-  background: #dc2626 !important;
+/* Нарушение — ПУСТОЕ кольцо, а не оранжевая точка (спека, п. 10): форма
+   читается и при дальтонизме, и на чёрно-белой печати, где цветная точка
+   сливалась с соседями. Толщину кольца иконка задаёт сама (--gp-ring:
+   на мелком кусте 3.5 px съели бы всю точку). Фон перебивает inline-цвет
+   иконки, отсюда !important. */
+.gp-plan-marker.gp-violation .gp-plan-dot,
+.gp-plan-marker.gp-drag-violation .gp-plan-dot {
+  background: transparent !important;
+  border: var(--gp-ring, 3px) solid #ff9351;
   box-shadow:
-    0 0 0 2px rgba(220, 38, 38, 0.3),
-    0 0 1px rgba(0, 0, 0, 0.6);
+    0 0 0 1.5px #2a302c,
+    0 0 0 6px rgba(255, 147, 81, 0.28);
 }
 .gp-plan-marker.gp-selected {
   z-index: 200000 !important;
 }
 .gp-plan-marker.gp-selected .gp-plan-dot {
-  transform: scale(1.2);
   box-shadow:
-    0 0 0 1.5px #fff,
-    0 0 0 3.5px #2563eb;
+    0 0 0 2px #2a302c,
+    0 0 0 4px #8ab4ff;
+}
+/* Наведение (подсказка по посадке, MapView.tsx::HoverTooltipController). */
+.gp-plan-marker.gp-hover .gp-plan-dot {
+  box-shadow:
+    0 0 0 2px #2a302c,
+    0 0 0 4px #eceeea;
+}
+
+/* «Где можно сажать»: посадки плана — под цветными зонами приглушены, чтобы
+   зоны читались, но видно, что и где стоит. Только пан точек и SVG-газон плана;
+   подоснова (ImageOverlay — <img>) и выделение не трогаются. */
+.gp-plan-dim .leaflet-marker-pane,
+.gp-plan-dim .leaflet-overlay-pane svg {
+  opacity: 0.35;
 }
 
 /* Selection mode: the map stops panning under a left-drag, so the cursor says so. */
@@ -90,23 +163,24 @@ body {
 
 /* Cluster bubbles (MapView.tsx::ClusteredMarkers) -- a neutral stand-in for
    however many real plan-item dots fall in the same screen cell at the
-   current zoom. Deliberately not colored by planting type (see
-   ControlPanel's earlier discussion): the point is "how many objects are
-   here", not "what's the mix" -- a single flat color keeps that reading
-   unambiguous. Not selectable/draggable (no data-item-id, see
-   ClusteredMarkers) -- clicking one zooms in instead, same as most map UIs'
-   cluster bubbles. */
+   current zoom. Deliberately not colored by planting type: the point is
+   "how many objects are here", not "what's the mix" -- a single flat color
+   keeps that reading unambiguous. Not selectable/draggable (no
+   data-item-id, see ClusteredMarkers) -- clicking one zooms in instead,
+   same as most map UIs' cluster bubbles. */
 .gp-cluster-bubble {
   display: flex;
   align-items: center;
   justify-content: center;
   border-radius: 9999px;
-  background: rgba(15, 23, 42, 0.88);
-  border: 2px solid #64748b;
-  color: #e2e8f0;
+  background: rgba(34, 38, 36, 0.92);
+  border: 2px solid #868f89;
+  color: #eceeea;
   font:
-    600 11px/1 ui-sans-serif,
-    system-ui;
+    500 11px/1 "JetBrains Mono",
+    ui-monospace,
+    monospace;
+  font-variant-numeric: tabular-nums;
   cursor: zoom-in;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
 }
@@ -114,9 +188,9 @@ body {
    bubbles, see MapView.tsx::MAX_SELECTED_UNCLUSTERED) -- the same blue as a
    selected dot, so "what got selected" stays visible zoomed out. */
 .gp-cluster-marker.gp-cluster-selected .gp-cluster-bubble {
-  border-color: #2563eb;
+  border-color: #8ab4ff;
   box-shadow:
-    0 0 0 2px rgba(37, 99, 235, 0.45),
+    0 0 0 2px rgba(138, 180, 255, 0.4),
     0 1px 3px rgba(0, 0, 0, 0.5);
 }
 
@@ -135,9 +209,10 @@ body {
   animation: gp-pop-in 0.16s ease-out;
 }
 
-/* ControlPanel.tsx's ProgressBar -- indeterminate state (no countable total
-   yet) for a long-running upload/generate job, same idea as a native
-   <progress> element with no `value`. */
+/* Полоса прогресса панелей (components/panel/ProgressBar.tsx) --
+   indeterminate state (no countable total yet) for a long-running
+   upload/generate job, same idea as a native <progress> element with no
+   `value`. */
 @keyframes progress-indeterminate {
   0% {
     transform: translateX(-100%);
@@ -145,4 +220,42 @@ body {
   100% {
     transform: translateX(300%);
   }
+}
+
+/* Подпись предпросмотра исправления («сюда · 2,1 м»): моно, зелёным, без
+   стрелки-клюва Leaflet — подпись стоит рядом с кольцом, а не указывает на него. */
+.leaflet-tooltip.gp-fix-label {
+  background: #1c201e;
+  border: 1px solid #3a403c;
+  border-radius: 6px;
+  color: #7bd389;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 16px;
+  padding: 2px 7px;
+  box-shadow: none;
+}
+.leaflet-tooltip.gp-fix-label::before {
+  display: none;
+}
+
+/* Нормы при перетаскивании (MapView.tsx::DragNormsController). Штриховка
+   теплосети — узор из SVG-<defs> того же контроллера (CSS-fill перебивает
+   атрибут Leaflet). Подпись зоны — как подпись предпросмотра исправления. */
+path.gp-zone-hatch {
+  fill: url(#gp-hatch-heat);
+  fill-opacity: 1;
+}
+.leaflet-tooltip.gp-zone-label {
+  background: #1c201e;
+  border: 1px solid #3a403c;
+  border-radius: 6px;
+  color: #eceeea;
+  font-size: 12px;
+  line-height: 16px;
+  padding: 2px 7px;
+  box-shadow: none;
+}
+.leaflet-tooltip.gp-zone-label::before {
+  display: none;
 }

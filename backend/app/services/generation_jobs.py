@@ -14,6 +14,12 @@ single uvicorn process (no --workers>1); a multi-process/multi-replica
 deployment would need a real queue (e.g. Celery/RQ + Redis) instead. Bounded
 by _MAX_JOBS so a long session of repeated generate clicks can't grow this
 forever.
+
+Остановка и частичные результаты (п. 8 редизайна): «Остановить» сразу переводит
+задачу в `cancelled` (интерфейс освобождается мгновенно), а сам расчёт доходит
+до ближайшей точки опроса `should_stop` и бросает `GenerationCancelled`;
+результат не сохраняется. Посадки каждого типа складываются в `partial` по мере
+готовности — фронт подмешивает их в карту, пока план ещё считается.
 """
 
 from __future__ import annotations
@@ -24,7 +30,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Literal
 
-JobStatus = Literal["pending", "done", "error"]
+JobStatus = Literal["pending", "done", "error", "cancelled"]
 
 _MAX_JOBS = 200
 
@@ -43,6 +49,13 @@ class GenerationJob:
     stage: str | None = None
     progress: float | None = None
     created_at: float = field(default_factory=time.monotonic)
+    # «Остановить» нажато: расчёт (в потоке или в чужих процессах) смотрит на это.
+    cancel_requested: bool = False
+    # Посадки уже посчитанных типов (доменные PlantingItem, до пост-обработки):
+    # тип -> список. Версия растёт с каждым новым типом — фронт перечитывает
+    # частичный результат только когда она сменилась.
+    partial: dict[str, list] = field(default_factory=dict)
+    partial_version: int = 0
 
 
 def create_job() -> str:
@@ -65,18 +78,60 @@ def update_progress(job_id: str, planting_type: str, done: int, total: int) -> N
     job.progress = (done / total) if total > 0 else None
 
 
+def add_partial(job_id: str, planting_type: str, items: list) -> None:
+    """Вызывается из потока расчёта; присваивание в dict и рост версии — под GIL."""
+    job = _jobs.get(job_id)
+    if job is None or job.cancel_requested:
+        return
+    job.partial[planting_type] = items
+    job.partial_version += 1
+
+
+def partial_counts(job: GenerationJob) -> dict[str, int]:
+    return {planting_type: len(items) for planting_type, items in dict(job.partial).items()}
+
+
+def _release_partial(job: GenerationJob) -> None:
+    """Частичный результат больше не нужен (план готов, остановлен, упал):
+    это десятки тысяч доменных объектов, держать их до вытеснения задачи — зря."""
+    job.partial = {}
+
+
 def mark_done(job_id: str, plan_id: str) -> None:
     job = _jobs.get(job_id)
-    if job is not None:
+    if job is not None and job.status == "pending":
         job.status = "done"
         job.plan_id = plan_id
+        _release_partial(job)
 
 
 def mark_error(job_id: str, error: str) -> None:
     job = _jobs.get(job_id)
-    if job is not None:
+    if job is not None and job.status == "pending":
         job.status = "error"
         job.error = error
+        _release_partial(job)
+
+
+def request_cancel(job_id: str) -> str | None:
+    """«Остановить». Возвращает статус задачи после вызова (None — задачи нет).
+    Остановить можно только идущую: у готовой план уже в проекте. Вызывается на
+    цикле событий, так же как и фиксация плана в `generate_plan` (от проверки
+    `should_stop` до добавления в проект там нет ни одного await), поэтому
+    «остановлено, но план всё же появился» невозможно."""
+    job = _jobs.get(job_id)
+    if job is None:
+        return None
+    if job.status == "pending":
+        job.cancel_requested = True
+        job.status = "cancelled"
+        _release_partial(job)
+    return job.status
+
+
+def should_stop(job_id: str) -> bool:
+    job = _jobs.get(job_id)
+    return job is None or job.cancel_requested
 
 
 def get_job(job_id: str) -> GenerationJob | None:

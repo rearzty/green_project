@@ -38,6 +38,14 @@ RESULT_LAYER_PREFIX = "GREEN_AI"
 LAYER_SUFFIX_BY_TYPE = {"tree": "ДЕРЕВЬЯ", "shrub": "КУСТАРНИКИ", "lawn": "ГАЗОН"}
 COLOR_BY_TYPE = {"tree": 3, "shrub": 5, "lawn": 2}  # ACI color codes: green, blue, yellow
 
+# Отдельный слой нарушений: кольцо вокруг каждой посадки, не прошедшей проверку
+# отступов. Эксперт, выключив слои деревьев и кустарника, видит только то, что
+# надо исправить, — а отчёт обоснований тот же перечень называет построчно.
+VIOLATION_LAYER_SUFFIX = "НАРУШЕНИЯ"
+VIOLATION_COLOR = 30  # ACI: оранжевый
+VIOLATION_RING_EXTRA_M = 0.6  # кольцо шире символа посадки на столько
+DEFAULT_VIOLATION_RING_M = 1.5
+
 # Rough symbol radius (m) for point plantings, used only for the DXF glyph —
 # not to be confused with the canopy_radius_m used by the placement algorithm.
 SYMBOL_RADIUS_M = {"tree": 1.5, "shrub": 0.6}
@@ -57,6 +65,29 @@ class ResultLayerCollisionError(RuntimeError):
 
 def result_layer_name(planting_type: str, prefix: str = RESULT_LAYER_PREFIX) -> str:
     return f"{prefix}${LAYER_SUFFIX_BY_TYPE.get(planting_type, planting_type.upper())}"
+
+
+def violation_layer_name(prefix: str = RESULT_LAYER_PREFIX) -> str:
+    return f"{prefix}${VIOLATION_LAYER_SUFFIX}"
+
+
+def violation_marks_for(items: list[PlantingItem], records: list | None) -> list[tuple[float, float, float]]:
+    """Кольца нарушений для `write_dxf`: по записи обоснования на каждую посадку,
+    которая не прошла проверку (`record.compliant` — те же нарушения, что в отчёте
+    и в панели «Проверка»). Центр — сама посадка, радиус — символ посадки плюс
+    запас, чтобы кольцо читалось вокруг кружка, а не сливалось с ним; у газона —
+    центроид полигона."""
+    if not records:
+        return []
+    marks: list[tuple[float, float, float]] = []
+    for item, record in zip(items, records):
+        if record.compliant:
+            continue
+        geometry = item.geometry
+        centre = geometry if geometry.geom_type == "Point" else geometry.representative_point()
+        base = SYMBOL_RADIUS_M.get(item.planting_type, DEFAULT_VIOLATION_RING_M - VIOLATION_RING_EXTRA_M)
+        marks.append((centre.x, centre.y, base + VIOLATION_RING_EXTRA_M))
+    return marks
 
 
 def _set_explanation(entity, doc, record) -> None:
@@ -200,8 +231,12 @@ def write_dxf(
     base_dxf: str | Path | None = None,
     records: list | None = None,
     prefix: str = RESULT_LAYER_PREFIX,
+    violation_marks: list[tuple[float, float, float]] | None = None,
 ) -> None:
     """Write `items` to `path`.
+
+    `violation_marks` — (x, y, radius) кольца нарушений: пишутся на отдельный слой
+    `<prefix>$НАРУШЕНИЯ`, и только если список не пуст (нет нарушений — нет слоя).
 
     With `base_dxf`, the source drawing is loaded and the plan added on new
     layers; everything already in the drawing is left exactly as it was. Without
@@ -212,7 +247,7 @@ def write_dxf(
     matching `items`; when given, each entity carries its justification as XDATA.
     """
     if base_dxf is None:
-        _fill_and_save(ezdxf.new(setup=True), set(), items, path, records, prefix)
+        _fill_and_save(ezdxf.new(setup=True), set(), items, path, records, prefix, violation_marks)
         return
 
     # Сначала обычное чтение: на тяжёлом главном чертеже («3. 3-я Парковая»,
@@ -222,7 +257,7 @@ def write_dxf(
     # упали, всё повторяется через него.
     try:
         doc = ezdxf.readfile(str(base_dxf))
-        _fill_and_save(doc, {layer.dxf.name for layer in doc.layers}, items, path, records, prefix)
+        _fill_and_save(doc, {layer.dxf.name for layer in doc.layers}, items, path, records, prefix, violation_marks)
         return
     except ResultLayerCollisionError:
         raise
@@ -243,16 +278,26 @@ def write_dxf(
     if auditor.has_errors:
         print(f"  ! в исходном чертеже исправлено структурных ошибок: {len(auditor.errors)}")
     existing = {layer.dxf.name for layer in doc.layers}
-    _fill_and_save(doc, existing, items, path, records, prefix)
+    _fill_and_save(doc, existing, items, path, records, prefix, violation_marks)
 
 
-def _fill_and_save(doc, existing: set[str], items: list[PlantingItem], path, records, prefix: str) -> None:
+def _fill_and_save(
+    doc,
+    existing: set[str],
+    items: list[PlantingItem],
+    path,
+    records,
+    prefix: str,
+    violation_marks: list[tuple[float, float, float]] | None = None,
+) -> None:
     """Слои результата и посадки — в уже открытый документ, затем сохранение."""
     msp = doc.modelspace()
 
     needed = {result_layer_name(t, prefix) for t in {i.planting_type for i in items}} or {
         result_layer_name("tree", prefix)
     }
+    if violation_marks:
+        needed.add(violation_layer_name(prefix))
     collisions = sorted(needed & existing)
     if collisions:
         raise ResultLayerCollisionError(
@@ -261,10 +306,20 @@ def _fill_and_save(doc, existing: set[str], items: list[PlantingItem], path, rec
             + ". Задайте другой префикс (prefix=...), иначе исходные данные будут перезаписаны."
         )
 
+    # Только слои тех типов, что действительно пишутся: снятая в диалоге
+    # экспорта галочка должна убрать слой из файла, а не оставить пустую строку
+    # в таблице слоёв, которую эксперт увидит в списке и заподозрит потерю.
     for planting_type in LAYER_SUFFIX_BY_TYPE:
         name = result_layer_name(planting_type, prefix)
-        if name not in doc.layers:
+        if name in needed and name not in doc.layers:
             doc.layers.add(name=name, color=COLOR_BY_TYPE[planting_type])
+
+    if violation_marks:
+        mark_layer = violation_layer_name(prefix)
+        if mark_layer not in doc.layers:
+            doc.layers.add(name=mark_layer, color=VIOLATION_COLOR)
+        for x, y, radius in violation_marks:
+            msp.add_circle(center=(x, y), radius=radius, dxfattribs={"layer": mark_layer})
 
     if records is not None:
         doc.appids.add(prefix)

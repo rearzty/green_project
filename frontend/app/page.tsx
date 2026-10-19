@@ -3,9 +3,16 @@
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ArrowRight,
+  Box,
   CheckCheck,
-  PanelLeftClose,
-  PanelLeftOpen,
+  Download,
+  FileText,
+  HelpCircle,
+  ListChecks,
+  Map as MapIcon,
+  MousePointer2,
+  PanelLeft,
   Redo2,
   Shrub,
   SquareDashedMousePointer,
@@ -14,23 +21,42 @@ import {
   Undo2,
   X,
 } from "lucide-react";
+import type { Map as LeafletMap } from "leaflet";
 
 import { AssistantChat } from "@/components/AssistantChat";
+import { CheckPanel } from "@/components/CheckPanel";
+import { CommandPalette } from "@/components/CommandPalette";
+import { CompareBar } from "@/components/CompareBar";
 import { ContextMenu, type ContextMenuEntry } from "@/components/ContextMenu";
-import { ControlPanel } from "@/components/ControlPanel";
-import { InspectorCard, type InspectedItem } from "@/components/InspectorCard";
-import type { MapFitRequest } from "@/components/MapView";
-import { PlanSummaryCard } from "@/components/PlanSummaryCard";
+import { DraftPanel } from "@/components/DraftPanel";
+import { ExportDialog } from "@/components/ExportDialog";
+import type { FixPreview } from "@/components/FixPanel";
+import { Header, type Stage } from "@/components/Header";
+import { InspectorPanel, type InspectedItem } from "@/components/InspectorPanel";
+import { MapToolbar } from "@/components/map/MapToolbar";
+import { SelectionBar } from "@/components/map/SelectionBar";
+import { StatusBar, type LegendItem } from "@/components/map/StatusBar";
+import { ViewControls } from "@/components/map/ViewControls";
+import { ZoomControls } from "@/components/map/ZoomControls";
+import type { FixPreviewMark, HoverInfo, MapFitRequest } from "@/components/MapView";
+import { PlanPanel } from "@/components/PlanPanel";
 import { Toaster } from "@/components/Toaster";
+import { ZonesPanel } from "@/components/ZonesPanel";
 import {
   fetchComplianceReport,
   getItemsCompliance,
+  getNearbyConstraints,
+  getNearestAllowed,
   getProjectLayers3d,
   PROJECT_GONE_MESSAGE,
   type AssistantAction,
   type AssistantCommand,
   type AssistantGenerationSettings,
   type AssistantSelection,
+  type ExportOptions,
+  type FixKind,
+  type FixOption,
+  GenerationCancelledError,
   type GeoJSONFeatureCollection,
   type ItemCompliance,
   type PlantingType,
@@ -48,20 +74,25 @@ import {
   PLANTING_GEN,
   selectedText,
   settingsFromAction,
+  suggestionChips,
   violationsSelectedText,
   type CommandResult,
   type SelectTarget,
   type UiAction,
 } from "@/lib/assistantCommands";
-import { countLabel, OBJECT_FORMS } from "@/lib/format";
+import { countLabel, CROWN_LABELS, formatMeters, OBJECT_FORMS, PLANTING_TYPE_LABELS, pluralRu } from "@/lib/format";
+import { useCompareVersions } from "@/lib/hooks/useCompareVersions";
 import { useKeyboardShortcuts } from "@/lib/hooks/useKeyboardShortcuts";
 import { usePlanEdits } from "@/lib/hooks/usePlanEdits";
 import { useProjectSession } from "@/lib/hooks/useProjectSession";
 import { useSelection } from "@/lib/hooks/useSelection";
+import { useZonesLayer } from "@/lib/hooks/useZonesLayer";
 import type { Season } from "@/lib/mapStyle";
 import { boundsOfItems } from "@/lib/planIndex";
 import { recipeForPlan } from "@/lib/planRecipes";
 import { computePlanStats } from "@/lib/planStats";
+import type { Command } from "@/lib/commands";
+import { similarOptions, type SimilarOption } from "@/lib/similar";
 import { errorMessage, toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
@@ -74,11 +105,12 @@ const ThreeDView = dynamic(() => import("@/components/ThreeDView"), { ssr: false
 const NO_PLAN = "Плана ещё нет — сначала сгенерируйте его.";
 const NOTHING_SELECTED = "Ничего не выделено — выделите посадки на карте или попросите, например, «выдели все деревья».";
 const EDIT_BUSY = "Ещё сохраняется предыдущая правка — попробуйте через пару секунд.";
+const COMPARING = "Открыто сравнение версий — правки и генерация сейчас выключены. Закройте сравнение (Esc) и повторите просьбу.";
 const OTHER_OPERATION = "Сейчас идёт другая операция — попробуйте через пару секунд.";
 const UNKNOWN_COMMAND = "Эту команду я пока не умею выполнять.";
 const SELECTION_CHANGED = "Выделение изменилось, пока Юна отвечала, — правка не выполнена. Повторите просьбу.";
 const NEEDS_ORDER_BOUNDARY_CONSENT =
-  "План не построен: границы работ в поставке нет, строить по границе заказа на съёмку можно только с вашего согласия. Настройки — в панели слева, подтвердите там «Да, по границе заказа».";
+  "План не построен: границы работ в поставке нет, строить по границе заказа на съёмку можно только с вашего согласия. Настройки — на вкладке «План» слева, подтвердите там «Да, по границе заказа».";
 /** Правка стартует в ближайшем рендере; не видно её и через это время —
  * runEdit отказался начинать (уже шла другая), ждать нечего. */
 const EDIT_START_TIMEOUT_MS = 3000;
@@ -88,10 +120,6 @@ const EDIT_FINISH_TIMEOUT_MS = 120_000;
  * держим, нарушения всё равно покажет сводка плана. */
 const VALIDATION_TIMEOUT_MS = 20_000;
 const NO_IDS: ReadonlySet<string> = new Set();
-
-/** Карточки над картой справа (сводка плана, выделение): right-4 + w-72 и
- * зазор до чата — столько чат Юны оставляет им у правого края окна. */
-const CARDS_RESERVED_PX = 16 + 288 + 8;
 
 function sameIds(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
   if (a === b) return true;
@@ -132,9 +160,9 @@ export default function Home() {
       cancelled = true;
     };
   }, [view3d, project, layers3d?.projectId]);
-  // Lifted out of ControlPanel (used to be its own local state) so
+  // Lifted out of the settings panel (used to be its own local state) so
   // AssistantChat can read and change the same generation recipe Юна talks
-  // about -- see ControlPanel.tsx's own comment on why this moved.
+  // about -- see PlanPanel.tsx's props on why this lives here.
   const [plantingTypes, setPlantingTypes] = useState<PlantingType[]>(["tree", "shrub", "lawn"]);
   const [scoringMode, setScoringMode] = useState<ScoringMode>("heuristic");
   // undefined = not overridden -- generate omits the field and the backend
@@ -147,7 +175,7 @@ export default function Home() {
   // «Покажи эти объекты» для карты — Юна выделила группу (selectByAssistant).
   const [fitRequest, setFitRequest] = useState<MapFitRequest | null>(null);
   // Юну попросили построить план, а нужен ответ на вопрос панели о границе
-  // заказа (ControlPanel.tsx::consentRequest) — счётчик, каждый — новый вопрос.
+  // заказа (PlanPanel.tsx::consentRequest) — счётчик, каждый — новый вопрос.
   const [consentRequest, setConsentRequest] = useState(0);
   // Defaults open (matches the always-visible panel this replaces) and is
   // corrected once on mount for phones -- SSR has no window to check, so a
@@ -156,6 +184,84 @@ export default function Home() {
 
   useEffect(() => {
     if (!window.matchMedia("(min-width: 768px)").matches) setSidebarOpen(false);
+  }, []);
+
+  // Вкладка этапа в шапке. По умолчанию следует за ходом работы: нет проекта —
+  // «Чертёж», проект без плана — «План», готовый план — «Проверка»; дальше
+  // пользователь ходит по вкладкам сам. Первая проверка срабатывает на смену
+  // проекта (в том числе на восстановление сессии: проект приходит раньше
+  // плана), вторая — когда план появляется впервые (восстановление, генерация).
+  // Переключение между версиями одного проекта вкладку не трогает.
+  const [stage, setStage] = useState<Stage>("draft");
+  useEffect(() => {
+    setStage(project ? (plan ? "check" : "plan") : "draft");
+    // plan читаем из текущего рендера: нужна лишь смена проекта
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project?.id]);
+  const hadPlanRef = useRef(false);
+  useEffect(() => {
+    const hasPlanNow = plan !== null;
+    if (hasPlanNow && !hadPlanRef.current) setStage("check");
+    hadPlanRef.current = hasPlanNow;
+  }, [plan]);
+
+  function handleStageChange(next: Stage) {
+    // Слой ограничений живёт на вкладке «Проверка»; уйдя с неё, забывать его
+    // на карте незачем, но и держать там без панели, которая им управляет, нельзя.
+    if (next !== "check") zones.close();
+    setStage(next);
+    // Вкладку выбрали — панель должна быть видна (свёрнутая на десктопе,
+    // закрытая шторка на телефоне).
+    setSidebarOpen(true);
+  }
+
+  // Юна — правая колонка, открывается кнопкой в шапке; точка у кнопки — ответ
+  // пришёл, пока колонка была закрыта.
+  const [assistantOpen, setAssistantOpen] = useState(false);
+  const [assistantUnread, setAssistantUnread] = useState(false);
+  function toggleAssistant() {
+    setAssistantOpen((v) => !v);
+    setAssistantUnread(false);
+  }
+  function openAssistant() {
+    setAssistantOpen(true);
+    setAssistantUnread(false);
+  }
+
+  // Диалог «Перед экспортом» и палитра команд Ctrl+K. Пока любая открыта,
+  // хоткеи карты молчат (useKeyboardShortcuts: suspended).
+  const [exportOpen, setExportOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  // Вопрос Юне из палитры: каждый новый seq — одно сообщение (AssistantChat).
+  const [askRequest, setAskRequest] = useState<{ text: string; seq: number } | null>(null);
+
+  function askYuna(text: string) {
+    setAssistantOpen(true);
+    setAssistantUnread(false);
+    setAskRequest((prev) => ({ text, seq: (prev?.seq ?? 0) + 1 }));
+  }
+
+  // Название выделения, полученного из «Выделить похожие» («Ряд», «Той же
+  // породы · …»). Привязано к САМОМУ множеству выделения (его ссылка меняется
+  // при любом новом выделении), а не к числу объектов: иначе после клика на
+  // другую группу такого же размера показалось бы чужое имя.
+  const pendingSelectionName = useRef<{ name: string; key: SimilarOption["key"] } | null>(null);
+  const [namedSelection, setNamedSelection] = useState<{ set: ReadonlySet<string>; name: string; key: SimilarOption["key"] } | null>(null);
+
+  // Leaflet-карта наружу (MapView.tsx::MapBridge): ей пользуются зум и
+  // статус-строка вне контейнера карты. В 3D — null.
+  const [leafletMap, setLeafletMap] = useState<LeafletMap | null>(null);
+
+  // Подпись клавиши палитры команд в шапке: на Mac это ⌘K (работают обе).
+  const [paletteHint, setPaletteHint] = useState("Ctrl K");
+  useEffect(() => {
+    if (/Mac|iPhone|iPad/.test(navigator.platform)) setPaletteHint("⌘K");
+  }, []);
+
+  // Подсказка при наведении — только там, где есть наведение (не тач).
+  const [hoverCapable, setHoverCapable] = useState(false);
+  useEffect(() => {
+    setHoverCapable(window.matchMedia("(hover: hover) and (pointer: fine)").matches);
   }, []);
   // Sourced from the raster endpoint's own grouping now, not recomputed from
   // project.layers on the client -- layer_raster.py already walks every
@@ -185,7 +291,88 @@ export default function Home() {
   );
   const selection = useSelection(planIndex, planRevision, editing.violationIds);
 
-  // Обоснование ("Почему здесь?", ControlPanel.tsx) -- только для ровно одной
+  // Сравнение версий и слой «Где можно сажать» — режимы просмотра поверх
+  // того же плана: в обоих план только читают, а слева вместо обычной панели
+  // своя. Состояние каждого — в своём хуке (lib/hooks).
+  const geographicCrs = Boolean(project?.crs_verified && project?.source_crs);
+  const compare = useCompareVersions({
+    projectId: project?.id,
+    plan,
+    plans,
+    geographic: geographicCrs,
+    currentViolations: editing.violations ? editing.violationIds.size : null,
+    onSelectPlan: session.handleSelectPlan,
+  });
+  const zones = useZonesLayer(project?.id, plan);
+
+  // «Как исправить» в раскрытой строке нарушения (CheckPanel/FixPanel): выбранный
+  // вариант — предпросмотром на карте, пока строка раскрыта.
+  const [fixPreview, setFixPreview] = useState<FixPreview | null>(null);
+  const mapFixPreview = useMemo<FixPreviewMark | null>(() => {
+    if (!fixPreview) return null;
+    const { itemId, option } = fixPreview;
+    if (option.kind === "move" && option.to) {
+      return {
+        at: [option.to.y, option.to.x],
+        label: option.clearance_m != null ? `сюда · ${formatMeters(option.clearance_m)}` : "сюда",
+        tone: "ok",
+      };
+    }
+    const item = planIndex?.get(itemId);
+    return item ? { at: [(item.minLat + item.maxLat) / 2, (item.minLng + item.maxLng) / 2], tone: "violation" } : null;
+    // planRevision: planIndex правится на месте при локальной правке
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fixPreview, planIndex, planRevision]);
+  const fixBanner = useMemo(() => {
+    if (!fixPreview) return null;
+    const type = planIndex?.get(fixPreview.itemId)?.type;
+    const noun = type === "shrub" ? "куст" : type === "lawn" ? "газон" : "дерево";
+    switch (fixPreview.option.kind) {
+      case "move":
+        return `Предпросмотр: ${noun} встанет сюда`;
+      case "retype":
+        return "Предпросмотр: дерево станет кустом";
+      default:
+        return `Предпросмотр: ${noun === "дерево" ? "дерево будет удалено" : noun === "куст" ? "куст будет удалён" : "газон будет удалён"}`;
+    }
+  }, [fixPreview, planIndex]);
+
+  // Нормы при перетаскивании: запросы привязаны к открытому плану.
+  const loadNearbyConstraints = useCallback(
+    async (query: { x: number; y: number; radius: number; plantingType: PlantingType; itemId: string }) => {
+      const { project: current, plan: currentPlan } = runtimeRef.current.session;
+      if (!current || !currentPlan) return [];
+      return getNearbyConstraints(current.id, currentPlan.plan_id, query);
+    },
+    []
+  );
+  const loadNearestAllowed = useCallback(async (itemId: string, at: { x: number; y: number }) => {
+    const { project: current, plan: currentPlan } = runtimeRef.current.session;
+    if (!current || !currentPlan) return null;
+    const found = await getNearestAllowed(current.id, currentPlan.plan_id, itemId, at);
+    return found ? found.to : null;
+  }, []);
+
+  /** «Применить» в «Как исправить»: тем же путём, что кнопки панели выделения —
+   * поэтому одна запись в истории и Ctrl+Z возвращает как было. */
+  function applyFix(itemId: string, option: FixOption) {
+    if (!plan || !planIndex) return;
+    if (option.kind === "move" && option.to) {
+      const feature = plan.features.features.find((f) => (f.properties as { id?: string }).id === itemId);
+      const coordinates = feature?.geometry.coordinates as [number, number] | undefined;
+      if (!coordinates) return;
+      editing.handleMoveItems([itemId], { x: coordinates[0], y: coordinates[1] }, option.to);
+    } else if (option.kind === "retype") {
+      editing.handleRetypeSelection(new Set([itemId]), planIndex, "shrub");
+    } else if (option.kind === "delete") {
+      editing.handleDeleteSelection(new Set([itemId]));
+    }
+  }
+  function fixAll(ids: string[], kind: FixKind) {
+    editing.handleApplyFixes(ids, kind);
+  }
+
+  // Обоснование ("Почему здесь?", InspectorPanel.tsx) -- только для ровно одной
   // выделенной точки: geo_engine.compliance.explain_items не зависит от
   // остальных посадок, так что запрашивать его для группы бессмысленно (что
   // показывать -- обоснование какой из них?). Тот же id, что уже выделен на
@@ -252,7 +439,7 @@ export default function Home() {
       setView3d(false);
       return;
     }
-    if (!plan) return;
+    if (!plan || compare.active) return;
     setView3d(true);
   }
 
@@ -274,7 +461,7 @@ export default function Home() {
       setContextMenu(null);
       return;
     }
-    if (!plan) return;
+    if (!plan || compare.active) return;
     if (!showPlan) {
       toast.info("Включите отображение плана, чтобы выделять объекты.");
       return;
@@ -283,28 +470,81 @@ export default function Home() {
     setContextMenu(null);
   }
 
+  /** «Выбор» (V): обычный режим карты — выйти из рамки; включать нечего. */
+  function selectTool() {
+    if (selection.selectMode) toggleSelectMode();
+  }
+
   function handleEscape() {
     if (contextMenu) setContextMenu(null);
+    else if (compare.active) compare.exit();
     else if (selection.selectedIds.size > 0) selection.clear();
     else if (selection.selectMode) selection.setSelectMode(false);
+  }
+
+  /** «Сравнить версии»: только чтение, поэтому выделение, рамка, меню и 3D сбрасываются. */
+  function startCompare() {
+    if (!plan || plans.length < 2) {
+      toast.info("Для сравнения нужно хотя бы две версии плана.");
+      return;
+    }
+    selection.clear();
+    selection.setSelectMode(false);
+    setContextMenu(null);
+    setView3d(false);
+    setShowPlan(true);
+    zones.close();
+    compare.start();
   }
 
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
   const handleContextMenu = useCallback((x: number, y: number) => setContextMenu({ x, y }), []);
 
   useKeyboardShortcuts({
-    undo: () => editing.undo(),
-    redo: editing.redo,
+    // При сравнении версий план только читают: правки и отмена молчат.
+    undo: () => {
+      if (!compare.active) editing.undo();
+    },
+    redo: () => {
+      if (!compare.active) editing.redo();
+    },
     deleteSelection: () => editing.handleDeleteSelection(selection.selectedIds),
     retype: (type) => editing.handleRetypeSelection(selection.selectedIds, planIndex, type),
     toggleSelectMode,
+    selectTool,
     selectAll: selection.selectAll,
     escape: handleEscape,
-    hasPlan: plan !== null,
-    hasSelection: selection.selectedIds.size > 0,
+    openPalette: () => setPaletteOpen((open) => !open),
+    nextViolation: goToNextViolation,
+    hasPlan: plan !== null && !compare.active,
+    hasSelection: selection.selectedIds.size > 0 && !compare.active,
+    suspended: exportOpen || paletteOpen,
   });
 
   const hasSelection = selection.selectedIds.size > 0;
+
+  // «Выделить похожие» на одну посадку — считаем только когда это нужно (меню
+  // или палитра открыты): один проход по всему плану, на сотнях тысяч посадок
+  // это десятки миллисекунд, и делать его на каждый рендер незачем.
+  const similarNeeded = (contextMenu !== null || paletteOpen) && singleSelectedId !== undefined;
+  const similar = useMemo<SimilarOption[]>(
+    () => (similarNeeded && plan && singleSelectedId ? similarOptions(plan.features.features, singleSelectedId, editing.violationIds) : []),
+    // planRevision: plan.features правится на месте при локальной правке
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [similarNeeded, plan, planRevision, singleSelectedId, editing.violationIds]
+  );
+
+  function selectSimilar(option: SimilarOption) {
+    pendingSelectionName.current = { name: option.name, key: option.key };
+    showOnMap(option.ids);
+  }
+  // Новое выделение уже в состоянии — привязываем к нему название.
+  useEffect(() => {
+    if (pendingSelectionName.current === null) return;
+    const pending = pendingSelectionName.current;
+    pendingSelectionName.current = null;
+    setNamedSelection({ set: selection.selectedIds, name: pending.name, key: pending.key });
+  }, [selection.selectedIds]);
 
   const planStats = useMemo(
     // Градусы — только если карта и правда в WGS84: та же проверка, что
@@ -313,7 +553,7 @@ export default function Home() {
     [plan, project?.crs_verified, project?.source_crs]
   );
 
-  // Properties of the single selected feature for InspectorCard (species,
+  // Properties of the single selected feature for InspectorPanel (species,
   // crown, rationale) -- looked up in the current plan.features, which every
   // edit path keeps in sync, rather than a separately-stale copy.
   const inspectedItem = useMemo<InspectedItem | undefined>(() => {
@@ -321,6 +561,55 @@ export default function Home() {
     const feature = plan.features.features.find((f) => (f.properties as { id?: string }).id === singleSelectedId);
     return feature?.properties as InspectedItem | undefined;
   }, [plan, singleSelectedId]);
+
+  // --- подсказка при наведении на посадку (п. 4) ---
+  //
+  // Данные — то же обоснование, что открывает инспектор (getItemsCompliance),
+  // кеш по plan_id + planRevision + id: правка, тронувшая посадку, меняет
+  // расстояния и ревизию, и запись устаревает вместе с ней. Повторное
+  // наведение отвечает из кеша мгновенно (peek), параллельные наведения на
+  // одну точку делят один запрос. Неудачный запрос в кеш не кладём.
+  const hoverCacheRef = useRef(new Map<string, HoverInfo | null>());
+  const hoverInflightRef = useRef(new Map<string, Promise<HoverInfo | null>>());
+  const hoverKey = (id: string) => `${plan?.plan_id}:${planRevision}:${id}`;
+
+  function peekHoverInfo(id: string): HoverInfo | null | undefined {
+    return hoverCacheRef.current.get(hoverKey(id));
+  }
+
+  function loadHoverInfo(id: string): Promise<HoverInfo | null> {
+    const key = hoverKey(id);
+    const cached = hoverCacheRef.current.get(key);
+    if (cached !== undefined) return Promise.resolve(cached);
+    const running = hoverInflightRef.current.get(key);
+    if (running) return running;
+    const projectId = project?.id;
+    const planId = plan?.plan_id;
+    const type = planIndex?.get(id)?.type;
+    // Газон — площадной объект: подсказка есть только у деревьев и кустов.
+    if (!projectId || !planId || !type || type === "lawn") return Promise.resolve(null);
+    const props = plan?.features.features.find((f) => (f.properties as { id?: string }).id === id)?.properties as InspectedItem | undefined;
+    const promise = getItemsCompliance(projectId, planId, [id])
+      .then((items): HoverInfo => {
+        const checks = [...(items[0]?.checks ?? [])].sort((a, b) => a.actual_m - a.required_m - (b.actual_m - b.required_m));
+        const tightest = checks[0];
+        return {
+          title: props?.species && props.species !== "default" ? props.species : PLANTING_TYPE_LABELS[type],
+          subtitle: `${PLANTING_TYPE_LABELS[type]}${props?.crown && CROWN_LABELS[props.crown] ? ` · ${CROWN_LABELS[props.crown]}` : ""}`,
+          nearest: tightest
+            ? { label: tightest.object_label || tightest.object_type, actualM: tightest.actual_m, requiredM: tightest.required_m, satisfied: tightest.satisfied }
+            : null,
+        };
+      })
+      .then((info) => {
+        hoverCacheRef.current.set(key, info);
+        return info;
+      })
+      .catch(() => null)
+      .finally(() => hoverInflightRef.current.delete(key));
+    hoverInflightRef.current.set(key, promise);
+    return promise;
+  }
 
   // --- Юна: исполнение её команд ---
   //
@@ -339,7 +628,7 @@ export default function Home() {
     tree_rows: treeRows,
     trees_in_paving: treesInPaving,
   };
-  const runtime = { session, editing, selection, planStats, view3d, settings: generationSettings };
+  const runtime = { session, editing, selection, planStats, view3d, settings: generationSettings, comparing: compare.active };
   const runtimeRef = useRef(runtime);
   runtimeRef.current = runtime;
 
@@ -435,8 +724,9 @@ export default function Home() {
    * показывают то, что поставила Юна. Отмена — обратно к плану, который был
    * на экране до команды, и к прежним полям панели. */
   async function applySettingsByAssistant(action: AssistantAction): Promise<CommandResult> {
-    const { session: current, editing: edits, settings: prev } = runtimeRef.current;
+    const { session: current, editing: edits, settings: prev, comparing } = runtimeRef.current;
     if (!current.project) return { ok: false, text: "Сначала загрузите чертёж — план строить не на чем." };
+    if (comparing) return { ok: false, text: COMPARING };
     if (current.generating) return { ok: false, text: "Уже идёт генерация — дождитесь её." };
     if (edits.editBusy) return { ok: false, text: EDIT_BUSY };
     const next = settingsFromAction(action, prev);
@@ -447,6 +737,7 @@ export default function Home() {
     // построит именно то, о чём просили в чате.
     if (current.project.territory_source === "order_boundary" && !current.project.use_order_boundary) {
       applyGenerationSettings(next);
+      setStage("plan");
       setSidebarOpen(true);
       setConsentRequest((n) => n + 1);
       return { ok: false, text: NEEDS_ORDER_BOUNDARY_CONSENT };
@@ -510,9 +801,10 @@ export default function Home() {
   }
 
   async function deleteByAssistant(ids: ReadonlySet<string>): Promise<CommandResult> {
-    const { session: current, editing: edits } = runtimeRef.current;
+    const { session: current, editing: edits, comparing } = runtimeRef.current;
     const index = current.planIndex;
     if (!current.plan || !index) return { ok: false, text: NO_PLAN };
+    if (comparing) return { ok: false, text: COMPARING };
     const targets = [...ids].filter((id) => index.has(id));
     if (targets.length === 0) return { ok: false, text: NOTHING_SELECTED };
     if (edits.editBusy) return { ok: false, text: EDIT_BUSY };
@@ -529,9 +821,10 @@ export default function Home() {
   }
 
   async function retypeByAssistant(ids: ReadonlySet<string>, type: "tree" | "shrub"): Promise<CommandResult> {
-    const { session: current, editing: edits } = runtimeRef.current;
+    const { session: current, editing: edits, comparing } = runtimeRef.current;
     const index = current.planIndex;
     if (!current.plan || !index) return { ok: false, text: NO_PLAN };
+    if (comparing) return { ok: false, text: COMPARING };
     const targets = [...ids].filter((id) => index.has(id));
     if (targets.length === 0) return { ok: false, text: NOTHING_SELECTED };
     const noun = type === "tree" ? "деревья" : "кусты";
@@ -720,6 +1013,15 @@ export default function Home() {
     : undefined;
 
   const contextMenuEntries: ContextMenuEntry[] = [
+    ...(singleSelectedId
+      ? [
+          {
+            label: "Почему здесь?",
+            icon: HelpCircle,
+            onSelect: () => askYuna("Почему эта посадка здесь?"),
+          },
+        ]
+      : []),
     {
       label: "Сделать деревом",
       hotkey: "1",
@@ -734,6 +1036,20 @@ export default function Home() {
       disabled: !hasSelection || editing.editBusy,
       onSelect: () => editing.handleRetypeSelection(selection.selectedIds, planIndex, "shrub"),
     },
+    ...(similar.length > 0
+      ? [
+          {
+            label: "Выделить похожие",
+            icon: ListChecks,
+            // Число справа — сколько будет выделено, вместе с этой посадкой.
+            submenu: similar.map((option) => ({
+              label: option.label,
+              hotkey: option.ids.length.toLocaleString("ru-RU"),
+              onSelect: () => selectSimilar(option),
+            })),
+          },
+        ]
+      : []),
     {
       label: "Удалить",
       hotkey: "Del",
@@ -757,166 +1073,588 @@ export default function Home() {
     },
   ];
 
-  // Карточки над картой справа — сводка плана (и в 3D) и выделение (только 2D).
-  const cardsShown = planStats !== null || (!view3d && selection.summary !== null);
+  const canEditPlan = plan !== null && !editing.editBusy && !compare.active;
+  const violationPlants = editing.violations ? editing.violationIds.size : null;
+
+  // --- экспорт: диалог «Перед экспортом» ---
+
+  function openExport() {
+    if (plan) setExportOpen(true);
+  }
+
+  async function exportWithOptions(options: ExportOptions) {
+    try {
+      await session.handleExportDxf(options);
+    } catch (e) {
+      toast.error(errorMessage(e));
+    }
+  }
+
+  /** Показать на 2D-карте с включённым планом — выделение видно только там. */
+  function showOnMap(ids: string[]) {
+    const index = planIndex;
+    if (!index || ids.length === 0) return;
+    setShowPlan(true);
+    setView3d(false);
+    selection.setSelection(ids);
+    const box = boundsOfItems(index, ids);
+    if (box) setFitRequest({ box, ids });
+  }
+
+  function fixViolationsFromExport() {
+    setExportOpen(false);
+    setStage("check");
+    setSidebarOpen(true);
+    const first = editing.violations?.[0];
+    if (first) {
+      setShowPlan(true);
+      setView3d(false);
+      selection.focusItem(first.item_id);
+    }
+  }
+
+  // «Версия N» в диалоге — номер плана по времени создания среди версий проекта.
+  const versionNumber = plan ? [...plans].sort((a, b) => a.created_at.localeCompare(b.created_at)).findIndex((p) => p.plan_id === plan.plan_id) + 1 : 0;
+
+  // --- палитра команд (Ctrl+K) ---
+
+  /** N: к следующему нарушению по кругу; если выделено одно из них — к
+   * следующему за ним. */
+  function goToNextViolation() {
+    if (!plan) return;
+    if (editing.violations === null) {
+      toast.info(editing.validating ? "Нормативы ещё проверяются — попробуйте через пару секунд." : "Нормативы ещё не проверены.");
+      return;
+    }
+    // Одна посадка может нарушать норму дважды (отступ и интервал) — в обходе она одна.
+    const ids = [...new Set(editing.violations.map((v) => v.item_id))].filter((id) => planIndex?.has(id));
+    if (ids.length === 0) {
+      toast.info("Нарушений нет — все посадки в норме.");
+      return;
+    }
+    const current = singleSelectedId ? ids.indexOf(singleSelectedId) : -1;
+    setShowPlan(true);
+    setView3d(false);
+    selection.focusItem(ids[(current + 1) % ids.length]);
+  }
+
+  /** «Сгенерировать с текущими настройками» из палитры: те же поля, что у
+   * кнопки панели, и тот же вопрос о границе заказа. На вкладку «План» — чтобы
+   * ход генерации был виден. */
+  async function generateFromPalette() {
+    if (!project) return;
+    setStage("plan");
+    setSidebarOpen(true);
+    if (session.generating) {
+      toast.info("Генерация уже идёт — дождитесь её.");
+      return;
+    }
+    if (project.territory_source === "order_boundary" && !project.use_order_boundary) {
+      setConsentRequest((n) => n + 1);
+      return;
+    }
+    try {
+      await session.handleGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM, treeRows, treesInPaving });
+      setStage("check");
+    } catch (e) {
+      if (e instanceof GenerationCancelledError) toast.info(e.message);
+      else toast.error(errorMessage(e));
+    }
+  }
+
+  const paletteCommands: Command[] = [];
+  if (paletteOpen) {
+    const add = (command: Command | false) => command && paletteCommands.push(command);
+    const has = plan !== null;
+    add(has && Boolean(violationPlants) && {
+      id: "select-violations",
+      title: "Выделить все с нарушениями",
+      keywords: ["нарушения", "ошибки", "проблемы", "выделить"],
+      meta: String(violationPlants),
+      dot: true,
+      run: () => {
+        const picked = selectByAssistant("violations");
+        if (!picked.result.ok) toast.info(picked.result.text);
+      },
+    });
+    add(has && {
+      id: "next-violation",
+      title: "Перейти к следующему нарушению",
+      keywords: ["дальше", "следующее", "нарушения", "ошибка"],
+      meta: "N",
+      icon: ArrowRight,
+      run: goToNextViolation,
+    });
+    add(has && { id: "export", title: "Экспорт DXF…", keywords: ["скачать", "выгрузить", "файл", "чертёж"], icon: Download, run: openExport });
+    add(has && {
+      id: "report-json",
+      title: "Скачать отчёт обоснования посадок (JSON)",
+      keywords: ["отчёт", "обоснование", "нормы"],
+      icon: FileText,
+      run: () => downloadComplianceReport("json").catch((e) => toast.error(errorMessage(e))),
+    });
+    add(has && {
+      id: "report-csv",
+      title: "Скачать отчёт обоснования посадок (CSV для Excel)",
+      keywords: ["отчёт", "обоснование", "таблица", "excel"],
+      icon: FileText,
+      run: () => downloadComplianceReport("csv").catch((e) => toast.error(errorMessage(e))),
+    });
+    add(has && !compare.active && plans.length > 1 && {
+      id: "compare-versions",
+      title: "Сравнить версии плана",
+      keywords: ["версии", "разница", "изменения", "сравнение", "было", "стало"],
+      run: startCompare,
+    });
+    add(compare.active && { id: "compare-exit", title: "Выйти из сравнения версий", keywords: ["версии"], meta: "Esc", run: compare.exit });
+    add(has && !compare.active && zones.types.length > 0 && {
+      id: "zones",
+      title: "Где нормы разрешают сажать",
+      keywords: ["зоны", "ограничения", "отступы", "почему мало", "слой"],
+      run: () => {
+        handleStageChange("check");
+        zones.open();
+      },
+    });
+    add(has && {
+      id: "toggle-3d",
+      title: view3d ? "Вернуться на 2D-карту" : "Показать в 3D",
+      keywords: ["вид", "объём", "карта", "3d", "2d"],
+      icon: view3d ? MapIcon : Box,
+      run: toggleView3d,
+    });
+    add(Boolean(project) && !session.generating && !compare.active && {
+      id: "generate",
+      title: plan ? "Сгенерировать новую версию плана" : "Сгенерировать план",
+      keywords: ["построить", "посадить", "пересчитать", "генерация"],
+      run: () => void generateFromPalette(),
+    });
+    add(has && editing.canUndo && !editing.editBusy && { id: "undo", title: "Отменить", keywords: ["назад", "откатить"], meta: "Ctrl+Z", icon: Undo2, run: () => editing.undo() });
+    add(has && editing.canRedo && !editing.editBusy && { id: "redo", title: "Повторить", keywords: ["вперёд", "вернуть"], meta: "Ctrl+Y", icon: Redo2, run: editing.redo });
+    add(has && hasSelection && canEditPlan && {
+      id: "delete",
+      title: "Удалить выделенное",
+      keywords: ["убрать", "стереть"],
+      meta: "Del",
+      icon: Trash2,
+      run: () => editing.handleDeleteSelection(selection.selectedIds),
+    });
+    add(has && hasSelection && canEditPlan && {
+      id: "to-tree",
+      title: "Сделать выделенное деревом",
+      keywords: ["тип", "дерево"],
+      meta: "1",
+      icon: TreeDeciduous,
+      run: () => editing.handleRetypeSelection(selection.selectedIds, planIndex, "tree"),
+    });
+    add(has && hasSelection && canEditPlan && {
+      id: "to-shrub",
+      title: "Сделать выделенное кустарником",
+      keywords: ["тип", "куст"],
+      meta: "2",
+      icon: Shrub,
+      run: () => editing.handleRetypeSelection(selection.selectedIds, planIndex, "shrub"),
+    });
+    similar.forEach((option) =>
+      add({
+        id: `similar-${option.key}`,
+        title: `Выделить похожие: ${option.label.toLowerCase()}`,
+        keywords: ["выделить", "похожие", "ряд", "порода", "крона"],
+        meta: option.ids.length.toLocaleString("ru-RU"),
+        icon: ListChecks,
+        run: () => selectSimilar(option),
+      })
+    );
+    add(has && { id: "select-all", title: "Выделить всё", meta: "Ctrl+A", icon: CheckCheck, run: selection.selectAll });
+    add(hasSelection && { id: "clear-selection", title: "Снять выделение", meta: "Esc", icon: X, run: selection.clear });
+    add(has && !view3d && {
+      id: "tool-box",
+      title: selection.selectMode ? "Выключить режим рамки" : "Режим рамки: выделять протяжкой",
+      keywords: ["выделение", "инструмент"],
+      meta: "S",
+      icon: SquareDashedMousePointer,
+      run: toggleSelectMode,
+    });
+    add(has && !view3d && selection.selectMode && { id: "tool-select", title: "Инструмент «Выбор»", meta: "V", icon: MousePointer2, run: selectTool });
+    add(Boolean(project) && { id: "stage-draft", title: "Перейти к чертежу", keywords: ["загрузка", "вкладка"], run: () => handleStageChange("draft") });
+    add(Boolean(project) && { id: "stage-plan", title: "Перейти к настройкам плана", keywords: ["генерация", "схема", "вкладка"], run: () => handleStageChange("plan") });
+    add(has && { id: "stage-check", title: "Перейти к проверке", keywords: ["нарушения", "вкладка", "состав"], run: () => handleStageChange("check") });
+    add({ id: "toggle-panel", title: sidebarOpen ? "Скрыть левую панель" : "Показать левую панель", icon: PanelLeft, run: () => setSidebarOpen((v) => !v) });
+    add({
+      id: "toggle-yuna",
+      title: assistantOpen ? "Закрыть Юну" : "Открыть Юну",
+      keywords: ["помощник", "чат"],
+      run: toggleAssistant,
+    });
+  }
+  const paletteQuestions = suggestionChips({
+    hasProject: project !== null && !session.projectLost,
+    hasPlan: plan !== null,
+    settings: generationSettings,
+    planTrees: planStats?.trees ?? 0,
+    violationsCount: violationPlants,
+    selection: assistantSelection,
+  });
+  // Правая колонка: Юна, если открыта, иначе — инспектор выделения (только 2D).
+  // Группа получает не колонку, а панель действий у карты (SelectionBar).
+  const showInspector = !view3d && !compare.active && selection.summary?.single !== undefined && !assistantOpen;
+  const showSelectionBar = !view3d && !compare.active && selection.summary !== null && selection.summary.single === undefined;
+
+  // Пока сравнивают версии, левая панель скрыта (полоса сравнения занимает её место);
+  // sidebarOpen при этом не трогаем — после выхода панель вернётся как была.
+  const panelOpen = sidebarOpen && !compare.active;
+  // Слой ограничений показываем, только пока открыта его панель (вкладка «Проверка»).
+  const zonesShown = zones.active && stage === "check";
+
+  // Легенда статус-строки — только то, что реально есть на экране (спека §3.3).
+  const legend: LegendItem[] = [];
+  if (compare.active) {
+    // Сравнение: на карте не виды посадок, а что изменилось между версиями.
+    if (compare.marks) {
+      legend.push({ key: "cmp-added", label: `Добавлено · ${compare.marks.added.length.toLocaleString("ru-RU")}`, swatch: "added" });
+      legend.push({ key: "cmp-removed", label: `Убрано · ${compare.marks.removed.length.toLocaleString("ru-RU")}`, swatch: "removed" });
+      legend.push({ key: "cmp-same", label: `Без изменений · ${compare.unchanged.toLocaleString("ru-RU")}`, swatch: "same" });
+    }
+  } else if (planStats && showPlan) {
+    if (planStats.trees > 0) legend.push({ key: "tree", label: "Дерево", swatch: "tree" });
+    if (planStats.shrubs > 0) legend.push({ key: "shrub", label: "Кустарник", swatch: "shrub" });
+    if (planStats.lawnAreaM2 > 0) legend.push({ key: "lawn", label: "Газон", swatch: "lawn" });
+    if (violationPlants) legend.push({ key: "violation", label: "Нарушение", swatch: "violation" });
+  }
+  const legendGroup = (key: string) => layerLegend.find((entry) => entry.key === key && entry.count > 0 && !hiddenLayerTypes.has(key));
+  const utilities = legendGroup("utility");
+  if (utilities) legend.push({ key: "utility", label: "Сети", swatch: "dash", color: utilities.color });
+  const boundary = legendGroup("territory");
+  if (boundary) legend.push({ key: "territory", label: "Граница работ", swatch: "dash", color: boundary.color });
 
   return (
-    <main className="flex h-full w-full">
-      <div
-        className={cn(
-          "h-full flex-none overflow-hidden transition-all duration-200 ease-in-out",
-          // Телефон: выезжающая шторка поверх карты — выше всего, что лежит
-          // на карте (контролы Leaflet 1000, карточки 1050, чат Юны 1100), но
-          // ниже уведомлений (1150), чтобы ошибка из панели была видна.
-          "fixed inset-y-0 left-0 z-[1120] md:static md:z-auto",
-          // Ширина обёртки на телефоне — ровно ширина самой панели
-          // (ControlPanel: w-[88vw] max-w-96): прозрачный остаток w-96 на
-          // 390 px экрана закрывал затемнённый фон, и закрыть шторку тапом
-          // было можно только по последним 6 px.
-          sidebarOpen ? "w-[88vw] max-w-96 translate-x-0 md:w-96" : "-translate-x-full md:w-0 md:translate-x-0"
-        )}
-      >
-        <ControlPanel
-          hasProject={project !== null}
-          projectName={project?.name}
-          projectWarnings={session.projectLost ? [PROJECT_GONE_MESSAGE, ...(project?.warnings ?? [])] : project?.warnings}
-          needsOrderBoundaryConsent={project?.territory_source === "order_boundary" && !project?.use_order_boundary}
-          consentRequest={consentRequest}
-          areaBudget={plan?.area_budget}
-          hasPlan={plan !== null}
-          restoring={session.restoring}
-          generating={session.generating}
-          uploadProgress={session.uploadProgress}
-          generateProgress={session.generateProgress}
-          exporting={session.exporting}
-          onUpload={session.handleUpload}
-          onGenerate={session.handleGenerate}
-          plantingTypes={plantingTypes}
-          onPlantingTypesChange={setPlantingTypes}
-          scoringMode={scoringMode}
-          onScoringModeChange={setScoringMode}
-          treeSpacingM={treeSpacingM}
-          onTreeSpacingMChange={setTreeSpacingM}
-          shrubSpacingM={shrubSpacingM}
-          onShrubSpacingMChange={setShrubSpacingM}
-          treeRows={treeRows}
-          onTreeRowsChange={setTreeRows}
-          treesInPaving={treesInPaving}
-          onTreesInPavingChange={setTreesInPaving}
-          onExportDxf={session.handleExportDxf}
-          onDownloadComplianceReport={(format) => {
-            downloadComplianceReport(format).catch((e) => toast.error(errorMessage(e)));
-          }}
-          onClearAll={session.handleClearAll}
-          layerLegend={layerLegend}
-          hiddenLayerTypes={hiddenLayerTypes}
-          onToggleLayerType={handleToggleLayerType}
-          showPlan={showPlan}
-          onToggleShowPlan={handleToggleShowPlan}
-          view3d={view3d}
-          onToggleView3d={toggleView3d}
-          season={season}
-          onSeasonChange={setSeason}
+    <div className="flex h-full w-full flex-col bg-gp-panel text-gp-text">
+      <Header
+        stage={stage}
+        onStageChange={handleStageChange}
+        hasProject={project !== null}
+        hasPlan={plan !== null}
+        projectName={project?.name}
+        versionLabel={plans.length > 1 ? `${plans.length} ${plans.length < 5 ? "версии" : "версий"}` : undefined}
+        violationCount={violationPlants}
+        assistantOpen={assistantOpen}
+        assistantUnread={assistantUnread}
+        onToggleAssistant={toggleAssistant}
+        paletteHint={paletteHint}
+        onExport={openExport}
+        exportDisabled={plan === null}
+        exporting={session.exporting}
+        onNewProject={session.handleClearAll}
+      />
+
+      {compare.active && plan && compare.baseId && (
+        <CompareBar
           plans={plans}
-          currentPlanId={plan?.plan_id}
-          onSelectPlan={session.handleSelectPlan}
-          onDeletePlan={session.handleDeletePlan}
-          editBusy={editing.editBusy}
-          canUndo={editing.canUndo}
-          canRedo={editing.canRedo}
-          onUndo={() => editing.undo()}
-          onRedo={editing.redo}
-          selectMode={selection.selectMode}
-          onToggleSelectMode={toggleSelectMode}
-          selection={selection.summary}
-          onSelectAll={selection.selectAll}
-          validating={editing.validating}
-          violations={editing.violations}
-          onFocusItem={selection.focusItem}
+          baseId={compare.baseId}
+          currentId={plan.plan_id}
+          loading={compare.loading}
+          base={compare.baseStats}
+          current={compare.currentStats}
+          busy={compare.busy || session.generating}
+          onBaseChange={(id) => void compare.changeBase(id)}
+          onCurrentChange={(id) => void compare.changeCurrent(id)}
+          onRevert={() => void compare.revert()}
+          onKeep={compare.exit}
+        />
+      )}
+
+      <div className="flex min-h-0 flex-1">
+        <div
+          className={cn(
+            "flex-none overflow-hidden bg-gp-panel transition-all duration-200 ease-in-out",
+            // Телефон: выезжающая шторка поверх карты (под шапкой) — выше всего,
+            // что лежит на карте (контролы Leaflet 1000, плавающее 1050, правая
+            // шторка 1060), но ниже уведомлений (1150), чтобы ошибка из панели
+            // была видна. Десктоп: колонка в потоке, сворачивается до нуля.
+            "fixed bottom-0 left-0 top-12 z-[1120] md:static md:z-auto",
+            panelOpen ? "w-[88vw] max-w-[340px] translate-x-0 md:w-[340px]" : "-translate-x-full md:w-0 md:translate-x-0"
+          )}
+        >
+          <aside aria-label="Панель этапа" className="flex h-full w-[88vw] max-w-[340px] flex-col border-r border-gp-line bg-gp-panel md:w-[340px] md:max-w-none">
+            {/* Все три панели смонтированы всегда и прячутся атрибутом hidden:
+                форма загрузки и вопрос о границе заказа (PlanPanel,
+                consentRequest) хранят своё состояние между вкладками. */}
+            <div className={cn("min-h-0 flex-1", stage !== "draft" && "hidden")}>
+              <DraftPanel
+                hasProject={project !== null}
+                projectName={project?.name}
+                projectWarnings={session.projectLost ? [PROJECT_GONE_MESSAGE, ...(project?.warnings ?? [])] : project?.warnings}
+                restoring={session.restoring}
+                uploadProgress={session.uploadProgress}
+                onUpload={session.handleUpload}
+                layerLegend={layerLegend}
+                onNext={() => setStage("plan")}
+              />
+            </div>
+            <div className={cn("min-h-0 flex-1", stage !== "plan" && "hidden")}>
+              <PlanPanel
+                hasProject={project !== null}
+                hasPlan={plan !== null}
+                needsOrderBoundaryConsent={project?.territory_source === "order_boundary" && !project?.use_order_boundary}
+                consentRequest={consentRequest}
+                generating={session.generating}
+                generateProgress={session.generateProgress}
+                partialCounts={session.generatePartial?.counts}
+                onStopGenerate={() => void session.handleStopGenerate().catch((e) => toast.error(errorMessage(e)))}
+                stopping={session.stopping}
+                projectId={project?.id}
+                planId={plan?.plan_id}
+                editBusy={editing.editBusy}
+                onGenerate={async (types, mode, spacing) => {
+                  await session.handleGenerate(types, mode, spacing);
+                  setStage("check");
+                }}
+                plantingTypes={plantingTypes}
+                onPlantingTypesChange={setPlantingTypes}
+                scoringMode={scoringMode}
+                onScoringModeChange={setScoringMode}
+                treeSpacingM={treeSpacingM}
+                onTreeSpacingMChange={setTreeSpacingM}
+                shrubSpacingM={shrubSpacingM}
+                onShrubSpacingMChange={setShrubSpacingM}
+                treeRows={treeRows}
+                onTreeRowsChange={setTreeRows}
+                treesInPaving={treesInPaving}
+                onTreesInPavingChange={setTreesInPaving}
+              />
+            </div>
+            {zonesShown && (
+              <div className="min-h-0 flex-1">
+                <ZonesPanel
+                  zones={zones.zones}
+                  loading={zones.loading}
+                  error={zones.error}
+                  plantingType={zones.plantingType}
+                  types={zones.types}
+                  onTypeChange={zones.setPlantingType}
+                  visible={zones.visible}
+                  onToggle={zones.toggle}
+                  onSolo={zones.solo}
+                  onBack={zones.close}
+                />
+              </div>
+            )}
+            {stage === "check" && !zonesShown && (
+              <div className="min-h-0 flex-1">
+                <CheckPanel
+                  projectId={project?.id}
+                  planId={plan?.plan_id}
+                  planRevision={planRevision}
+                  hasPlan={plan !== null}
+                  validating={editing.validating}
+                  violations={editing.violations}
+                  itemCount={plan?.features.features.length ?? 0}
+                  typeOf={(id) => planIndex?.get(id)?.type}
+                  stats={planStats}
+                  areaBudget={plan?.area_budget}
+                  onOpenZones={() => zones.open()}
+                  onCompareVersions={startCompare}
+                  showPlan={showPlan}
+                  selectedItemId={singleSelectedId}
+                  editBusy={editing.editBusy}
+                  onFocusItem={selection.focusItem}
+                  onApplyFix={applyFix}
+                  onFixAll={fixAll}
+                  onPreviewFix={setFixPreview}
+                  plans={plans}
+                  currentPlanId={plan?.plan_id}
+                  onSelectPlan={session.handleSelectPlan}
+                  onDeletePlan={session.handleDeletePlan}
+                  exporting={session.exporting}
+                  onOpenExport={openExport}
+                  onDownloadComplianceReport={(format) => {
+                    downloadComplianceReport(format).catch((e) => toast.error(errorMessage(e)));
+                  }}
+                />
+              </div>
+            )}
+          </aside>
+        </div>
+        {panelOpen && <div className="fixed inset-0 z-[1110] bg-black/40 md:hidden" onClick={() => setSidebarOpen(false)} aria-hidden />}
+
+        <main className="flex min-w-0 flex-1 flex-col bg-gp-map">
+          <div className="relative min-h-0 flex-1 overflow-hidden">
+            {view3d ? (
+              <ThreeDView
+                layers={layers3d?.projectId === project?.id ? layers3d?.layers : undefined}
+                plan={plan?.features}
+                crsVerified={project?.crs_verified}
+                season={season}
+                storageKey={project?.id}
+              />
+            ) : (
+              <MapView
+                layersRaster={layersRaster}
+                crsVerified={project?.crs_verified}
+                plan={plan?.features}
+                planIndex={planIndex}
+                layersKey={project?.id}
+                planId={plan?.plan_id}
+                planRevision={planRevision}
+                hiddenLayerTypes={hiddenLayerTypes}
+                showPlan={showPlan}
+                selectMode={selection.selectMode}
+                selectedIds={selection.selectedIds}
+                violationIds={editing.violationIds}
+                editsLocked={editing.editBusy || compare.active}
+                compareMarks={compare.marks}
+                fixPreview={mapFixPreview}
+                partialPlan={session.generatePartial?.features ?? null}
+                loadNearbyConstraints={loadNearbyConstraints}
+                loadNearestAllowed={loadNearestAllowed}
+                zoneLayers={zonesShown ? zones.layers : null}
+                dimPlan={zonesShown || session.generatePartial !== null}
+                onSelectionChange={selection.setSelection}
+                onMoveItems={editing.handleMoveItems}
+                onContextMenu={handleContextMenu}
+                onViewChange={closeContextMenu}
+                focusRequest={selection.focusRequest}
+                fitRequest={fitRequest}
+                onMapReady={setLeafletMap}
+                hoverEnabled={hoverCapable && plan !== null}
+                loadHoverInfo={loadHoverInfo}
+                peekHoverInfo={peekHoverInfo}
+              />
+            )}
+            {session.generating && session.generatePartial && !view3d && (
+              <div
+                data-map-overlay
+                role="status"
+                className="pointer-events-none absolute left-1/2 top-[18px] z-[1050] max-w-[calc(100%-2rem)] -translate-x-1/2 rounded-lg border border-gp-border bg-gp-panel px-3.5 py-2 text-[13px] text-gp-text shadow-[0_8px_24px_rgba(0,0,0,0.35)]"
+              >
+                {(() => {
+                  const counts = session.generatePartial.counts;
+                  const parts = [
+                    counts.tree ? `${counts.tree.toLocaleString("ru-RU")} ${pluralRu(counts.tree, ["дерево", "дерева", "деревьев"])}` : null,
+                    counts.shrub ? `${counts.shrub.toLocaleString("ru-RU")} ${pluralRu(counts.shrub, ["куст", "куста", "кустов"])}` : null,
+                    counts.lawn ? "газон" : null,
+                  ].filter(Boolean);
+                  return `Уже расставлено ${parts.join(", ")} — план появляется по мере расчёта`;
+                })()}
+              </div>
+            )}
+            {fixBanner && !view3d && (
+              <div
+                data-map-overlay
+                role="status"
+                className="pointer-events-none absolute left-1/2 top-[18px] z-[1050] max-w-[calc(100%-2rem)] -translate-x-1/2 rounded-lg border border-gp-border bg-gp-panel px-3.5 py-2 text-[13px] text-gp-text shadow-[0_8px_24px_rgba(0,0,0,0.35)]"
+              >
+                {fixBanner}
+              </div>
+            )}
+            {/* Всё, что лежит поверх карты, — вне контейнера Leaflet и с
+                data-map-overlay (MapView.tsx::freeMapRects не кладёт под него
+                рамку «выдели …»). */}
+            <MapToolbar
+              panelOpen={panelOpen}
+              onTogglePanel={() => setSidebarOpen((v) => !v)}
+              showTools={!view3d && plan !== null}
+              selectMode={selection.selectMode}
+              onSelectTool={selectTool}
+              onBoxTool={toggleSelectMode}
+              boxDisabled={!showPlan}
+              canUndo={editing.canUndo}
+              canRedo={editing.canRedo}
+              canEdit={canEditPlan}
+              onUndo={() => editing.undo()}
+              onRedo={editing.redo}
+            />
+            <ViewControls
+              view3d={view3d}
+              canShow3d={plan !== null && !compare.active}
+              onSetView3d={(on) => {
+                if (on !== view3d) toggleView3d();
+              }}
+              layerLegend={layerLegend}
+              hiddenLayerTypes={hiddenLayerTypes}
+              onToggleLayerType={handleToggleLayerType}
+              showPlan={showPlan}
+              onToggleShowPlan={handleToggleShowPlan}
+              hasPlan={plan !== null}
+              season={season}
+              onSeasonChange={setSeason}
+            />
+            {!view3d && <ZoomControls map={leafletMap} />}
+            {showSelectionBar && selection.summary && (
+              <SelectionBar
+                summary={selection.summary}
+                name={namedSelection?.set === selection.selectedIds ? namedSelection.name : undefined}
+                onChangeInterval={
+                  // Шаг меняют у ряда, а не у любого выделения: именно ряд — линия с равными промежутками.
+                  namedSelection?.set === selection.selectedIds && namedSelection.key === "row"
+                    ? (pitchM) => {
+                        const label = namedSelection;
+                        editing.handleRespaceRow([...selection.selectedIds], pitchM, () => {
+                          pendingSelectionName.current = { name: label.name, key: label.key };
+                        });
+                      }
+                    : undefined
+                }
+                canEdit={canEditPlan}
+                onRetype={(type) => editing.handleRetypeSelection(selection.selectedIds, planIndex, type)}
+                onDelete={() => editing.handleDeleteSelection(selection.selectedIds)}
+                onClear={selection.clear}
+              />
+            )}
+          </div>
+          <StatusBar
+            map={view3d ? null : leafletMap}
+            crsVerified={Boolean(project?.crs_verified)}
+            legend={legend}
+            hint={!view3d && hoverCapable && plan !== null && showPlan ? "Наведите на посадку, чтобы увидеть ближайшее ограничение" : null}
+          />
+        </main>
+
+        {showInspector && selection.summary && (
+          <InspectorPanel
+            key={singleSelectedId ?? "group"}
+            selection={selection.summary}
+            item={inspectedItem}
+            compliance={complianceForSelection}
+            complianceLoading={complianceLoading}
+            canEdit={canEditPlan}
+            onRetype={(type) => editing.handleRetypeSelection(selection.selectedIds, planIndex, type)}
+            onDelete={() => editing.handleDeleteSelection(selection.selectedIds)}
+            onClear={selection.clear}
+            onAskYuna={openAssistant}
+          />
+        )}
+        <AssistantChat
+          projectId={project?.id}
+          generating={session.generating}
+          settings={generationSettings}
+          planId={plan?.plan_id}
+          selectedItemId={singleSelectedId}
+          selection={assistantSelection}
+          selectedIds={selection.selectedIds}
+          // Посадок с нарушениями, а не записей о нарушениях: у одной посадки
+          // их бывает две (отступ и интервал), а Юна говорит о посадках.
+          violationsCount={violationPlants}
+          view={view3d ? "3d" : "2d"}
+          planTrees={planStats?.trees ?? 0}
+          open={assistantOpen}
+          onClose={() => setAssistantOpen(false)}
+          onUnread={() => setAssistantUnread(true)}
+          selectionLabel={
+            selection.summary?.single
+              ? inspectedItem?.species && inspectedItem.species !== "default"
+                ? inspectedItem.species
+                : PLANTING_TYPE_LABELS[selection.summary.single.type]
+              : selection.summary
+                ? countLabel(selection.summary.total, OBJECT_FORMS)
+                : undefined
+          }
+          askRequest={askRequest}
+          projectLost={session.projectLost}
+          onCommands={handleAssistantCommands}
         />
       </div>
-      {sidebarOpen && (
-        <div className="fixed inset-0 z-[1110] bg-black/40 md:hidden" onClick={() => setSidebarOpen(false)} aria-hidden />
-      )}
-      <button
-        onClick={() => setSidebarOpen((v) => !v)}
-        title={sidebarOpen ? "Скрыть панель" : "Показать панель"}
-        aria-pressed={sidebarOpen}
-        className={cn(
-          // top-24, not top-4 -- Leaflet's own zoom control sits at the
-          // map's top-left corner (~10-74px from the top, confirmed live)
-          // and renders above this button (leaflet's z-index 1000 > our
-          // 500), silently eating clicks at a naive top-4 position.
-          "fixed top-24 rounded-md border border-stone-700 bg-stone-900 p-1.5 text-stone-300 shadow transition-[left] duration-200 ease-in-out hover:bg-stone-800",
-          // Открытая шторка телефона: кнопка — у её правого края (ширина та
-          // же, что у панели) и над затемнением; left-[400px] уводил её за
-          // край 390 px экрана.
-          sidebarOpen ? "left-[calc(min(88vw,24rem)+0.5rem)] z-[1130] md:left-[400px] md:z-[500]" : "left-4 z-[500]"
-        )}
-      >
-        {sidebarOpen ? <PanelLeftClose className="h-4 w-4" aria-hidden /> : <PanelLeftOpen className="h-4 w-4" aria-hidden />}
-      </button>
-      <div className="relative min-w-0 flex-1">
-        {view3d ? (
-          <ThreeDView
-            layers={layers3d?.projectId === project?.id ? layers3d?.layers : undefined}
-            plan={plan?.features}
-            crsVerified={project?.crs_verified}
-            season={season}
-            storageKey={project?.id}
-          />
-        ) : (
-          <MapView
-            layersRaster={layersRaster}
-            crsVerified={project?.crs_verified}
-            plan={plan?.features}
-            planIndex={planIndex}
-            layersKey={project?.id}
-            planId={plan?.plan_id}
-            planRevision={planRevision}
-            hiddenLayerTypes={hiddenLayerTypes}
-            showPlan={showPlan}
-            selectMode={selection.selectMode}
-            selectedIds={selection.selectedIds}
-            violationIds={editing.violationIds}
-            editsLocked={editing.editBusy}
-            onSelectionChange={selection.setSelection}
-            onMoveItems={editing.handleMoveItems}
-            onContextMenu={handleContextMenu}
-            onViewChange={closeContextMenu}
-            focusRequest={selection.focusRequest}
-            fitRequest={fitRequest}
-            sidebarOpen={sidebarOpen}
-          />
-        )}
-        <div className="pointer-events-none absolute bottom-24 right-4 top-4 z-[1050] flex flex-col items-end gap-3">
-          {/* Обе карточки помечены data-map-overlay сами (а не эта колонка во
-              всю высоту): рамка «выдели …» (MapView.tsx::freeMapRects) может
-              лечь и под ними, если там свободно. */}
-          {planStats && (
-            <PlanSummaryCard
-              stats={planStats}
-              violations={editing.violations ? editing.violationIds.size : null}
-              validating={editing.validating}
-              territoryM2={plan?.area_budget?.[0]?.territory_m2}
-              scoringMode={plan?.scoring_mode}
-            />
-          )}
-          {!view3d && selection.summary && (
-            <InspectorCard
-              key={singleSelectedId ?? "group"}
-              selection={selection.summary}
-              item={inspectedItem}
-              compliance={complianceForSelection}
-              complianceLoading={complianceLoading}
-              canEdit={plan !== null && !editing.editBusy}
-              onRetype={(type) => editing.handleRetypeSelection(selection.selectedIds, planIndex, type)}
-              onDelete={() => editing.handleDeleteSelection(selection.selectedIds)}
-              onClear={selection.clear}
-            />
-          )}
-        </div>
-      </div>
+
       {contextMenu && (
         <ContextMenu
           x={contextMenu.x}
@@ -926,25 +1664,30 @@ export default function Home() {
           onClose={closeContextMenu}
         />
       )}
+      {exportOpen && plan && project && (
+        <ExportDialog
+          projectId={project.id}
+          planId={plan.plan_id}
+          versionLabel={versionNumber > 0 ? `Версия ${versionNumber}` : "Версия плана"}
+          exporting={session.exporting}
+          onClose={() => setExportOpen(false)}
+          onFixViolations={fixViolationsFromExport}
+          onShowItems={(ids) => {
+            setExportOpen(false);
+            showOnMap(ids);
+          }}
+          onExport={exportWithOptions}
+        />
+      )}
+      {paletteOpen && (
+        <CommandPalette
+          commands={paletteCommands}
+          questions={paletteQuestions}
+          onAsk={askYuna}
+          onClose={() => setPaletteOpen(false)}
+        />
+      )}
       <Toaster />
-      <AssistantChat
-        projectId={project?.id}
-        generating={session.generating}
-        settings={generationSettings}
-        planId={plan?.plan_id}
-        selectedItemId={singleSelectedId}
-        selection={assistantSelection}
-        selectedIds={selection.selectedIds}
-        // Посадок с нарушениями, а не записей о нарушениях: у одной посадки
-        // их бывает две (отступ и интервал), а Юна говорит о посадках.
-        violationsCount={editing.violations ? editing.violationIds.size : null}
-        view={view3d ? "3d" : "2d"}
-        planTrees={planStats?.trees ?? 0}
-        sidebarOpen={sidebarOpen}
-        reservedRight={cardsShown ? CARDS_RESERVED_PX : 0}
-        projectLost={session.projectLost}
-        onCommands={handleAssistantCommands}
-      />
-    </main>
+    </div>
   );
 }

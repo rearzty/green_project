@@ -22,7 +22,13 @@ export type UndoEntry =
   // Inverse: each item back to its own previous type.
   | { type: "retype_items"; to: PlantingType; previous: { id: string; type: PlantingType }[] }
   // Inverse: restore these exact pre-delete snapshots.
-  | { type: "delete_items"; items: GeoJSONFeature[] };
+  | { type: "delete_items"; items: GeoJSONFeature[] }
+  // Посадки заменены другими: ряд перерасставлен (новые id) либо «исправить все
+  // так же» (id прежние, сдвинутые/пересаженные; удалённых среди `created`
+  // нет). Inverse: удалить `created` и вернуть `previous`; повтор — наоборот.
+  // Снимки обеих сторон хранятся целиком — «пересчитать ряд заново» при
+  // повторе дало бы третий вариант.
+  | { type: "respace_items"; previous: GeoJSONFeature[]; created: GeoJSONFeature[] };
 
 export interface UndoHistory {
   undo: UndoEntry[];
@@ -39,7 +45,7 @@ export function loadUndoHistory(planId: string): UndoHistory {
     if (!raw) return EMPTY_HISTORY;
     const parsed = JSON.parse(raw) as Partial<UndoHistory>;
     const valid = (entries: unknown) =>
-      Array.isArray(entries) ? (entries as UndoEntry[]).filter((e) => ["move_items", "retype_items", "delete_items"].includes(e?.type)) : [];
+      Array.isArray(entries) ? (entries as UndoEntry[]).filter((e) => ["move_items", "retype_items", "delete_items", "respace_items"].includes(e?.type)) : [];
     // Silently drops entries from the old area-based format, if a tab still has them.
     return { undo: valid(parsed.undo), redo: valid(parsed.redo) };
   } catch {
@@ -80,9 +86,13 @@ export function pushCapped<T>(stack: T[], entry: T, limit: number = UNDO_STACK_L
 }
 
 /** Ids an entry touched -- used to re-select them after undo/redo so the
- * user sees what just changed. */
-export function entryItemIds(entry: UndoEntry): string[] {
+ * user sees what just changed. For a respace the answer depends on the
+ * direction: after undo the previous plantings are back, after redo the new
+ * ones. */
+export function entryItemIds(entry: UndoEntry, direction: "undo" | "redo" = "undo"): string[] {
   switch (entry.type) {
+    case "respace_items":
+      return (direction === "undo" ? entry.previous : entry.created).map((item) => String(item.properties.id));
     case "move_items":
       return entry.ids;
     case "retype_items":

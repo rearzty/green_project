@@ -38,6 +38,17 @@ def test_expected_routes_are_registered():
     assert "/api/projects/{project_id}/plans/{plan_id}/items/delete" in paths
     assert "/api/projects/{project_id}/plans/{plan_id}/items/retype" in paths
     assert "/api/projects/{project_id}/plans/{plan_id}/items/move" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/items/respace" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/items/{item_id}/fixes" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/fixes/apply" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/items/{item_id}/nearest-allowed" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/constraints/near" in paths
+    assert "/api/projects/{project_id}/estimate" in paths
+    assert "/api/projects/{project_id}/generate/{job_id}/cancel" in paths
+    assert "/api/projects/{project_id}/generate/{job_id}/partial" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/export-summary" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/zones" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/zones/image" in paths
     assert "/api/projects/{project_id}/plans/{plan_id}/items/restore" in paths
     assert "/api/projects/{project_id}/plans/{plan_id}/validate" in paths
     assert "/api/projects/{project_id}/plans/{plan_id}/validate/items" in paths

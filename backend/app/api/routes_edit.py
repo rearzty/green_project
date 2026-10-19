@@ -9,15 +9,22 @@ from fastapi.concurrency import run_in_threadpool
 from backend.app.api.deps import PlanDep, get_item_or_404
 from backend.app.schemas.geo import GeoJSONFeature
 from backend.app.schemas.plan import (
+    FixesApplyRequest,
+    FixesApplyResult,
+    FixOptionOut,
+    ItemFixesOut,
     ItemIdsRequest,
     ItemPatch,
     ItemsDeleteResult,
     ItemsMoveRequest,
     ItemsMoveResult,
+    ItemsRespaceRequest,
+    ItemsRespaceResult,
     ItemsRestoreRequest,
     ItemsRestoreResult,
     ItemsRetypeRequest,
     ItemsRetypeResult,
+    NearestAllowedOut,
     ValidateItemsRequest,
     ValidateResponse,
     ValidationViolation,
@@ -27,15 +34,18 @@ from backend.app.services.edit_service import (
     ItemsNotFoundError,
     OutOfTerritoryError,
     PlantingTypeGeometryMismatchError,
+    RespaceError,
     apply_item_patch,
     delete_item,
     delete_items,
     move_items,
+    respace_items,
     restore_items,
     retype_items,
     validate_items_scoped,
     validate_plan,
 )
+from backend.app.services.fix_service import apply_fixes, item_fixes, nearest_allowed
 from backend.app.services.geo_io import display_crs, planting_item_to_geojson_feature
 
 router = APIRouter(prefix="/api/projects/{project_id}/plans/{plan_id}", tags=["edit"])
@@ -47,7 +57,7 @@ def _edit_errors() -> Iterator[None]:
     already user-facing Russian text, passed through as `detail`."""
     try:
         yield
-    except (PlantingTypeGeometryMismatchError, OutOfTerritoryError) as exc:
+    except (PlantingTypeGeometryMismatchError, OutOfTerritoryError, RespaceError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (ItemsNotFoundError, ItemsAlreadyExistError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -95,6 +105,47 @@ async def move_items_route(request: ItemsMoveRequest, plan: PlanDep) -> ItemsMov
             display_crs(plan.project),
         )
     return ItemsMoveResult(items=moved)
+
+
+@router.post("/items/respace", response_model=ItemsRespaceResult)
+async def respace_items_route(request: ItemsRespaceRequest, plan: PlanDep) -> ItemsRespaceResult:
+    """«Изменить интервал» у ряда: посадки ряда раскладываются заново с
+    `pitch_m` (см. edit_service.respace_items)."""
+    with _edit_errors():
+        previous, created = respace_items(plan, request.ids, request.pitch_m, display_crs(plan.project))
+    return ItemsRespaceResult(previous_items=previous, items=created, item_count=plan.item_count)
+
+
+@router.get("/items/{item_id}/fixes", response_model=ItemFixesOut)
+async def item_fixes_route(item_id: str, plan: PlanDep) -> ItemFixesOut:
+    """Как исправить нарушение у одной посадки: сдвиг в допустимую точку, куст
+    вместо дерева, удаление — с последствиями (fix_service.item_fixes). Поиск
+    точки — реальная геометрия, поэтому в пуле потоков, а не на цикле событий."""
+    get_item_or_404(plan, item_id)
+    options = await run_in_threadpool(item_fixes, plan, item_id, display_crs(plan.project))
+    return ItemFixesOut(item_id=item_id, options=[FixOptionOut(**option) for option in options])
+
+
+@router.get("/items/{item_id}/nearest-allowed", response_model=NearestAllowedOut)
+async def nearest_allowed_route(item_id: str, x: float, y: float, plan: PlanDep) -> NearestAllowedOut:
+    """Alt при перетаскивании: ближайшая допустимая точка для посадки, если её
+    поставить у (x, y) (координаты отображения). 404 — рядом места нет."""
+    get_item_or_404(plan, item_id)
+    found = await run_in_threadpool(nearest_allowed, plan, item_id, x, y, display_crs(plan.project))
+    if found is None:
+        raise HTTPException(status_code=404, detail="Рядом нет места, где нормы позволяют поставить эту посадку.")
+    return NearestAllowedOut(**found)
+
+
+@router.post("/fixes/apply", response_model=FixesApplyResult)
+async def apply_fixes_route(request: FixesApplyRequest, plan: PlanDep) -> FixesApplyResult:
+    """«Исправить все так же»: лучший вариант выбранного вида у каждой из `ids`
+    (fix_service.apply_fixes). Одним запросом и одним шагом отмены."""
+    with _edit_errors():
+        outcome = await run_in_threadpool(apply_fixes, plan, request.ids, request.kind, display_crs(plan.project))
+    return FixesApplyResult(
+        previous_items=outcome.previous, items=outcome.created, skipped_ids=outcome.skipped, item_count=plan.item_count
+    )
 
 
 @router.post("/items/restore", response_model=ItemsRestoreResult)
