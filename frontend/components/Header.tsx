@@ -78,9 +78,11 @@ export function Header({
   const enabled: Record<Stage, boolean> = { draft: true, plan: hasProject, check: hasPlan };
 
   return (
-    <header className="flex h-12 flex-none items-center gap-2 border-b border-gp-line bg-gp-panel pl-4 pr-3 md:gap-4">
-      <div className="flex min-w-0 flex-1 basis-0 items-center gap-2.5">
-        <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="#B5E07A" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" role="img" aria-label="GreenProject" className="flex-none">
+    <header className="flex h-12 flex-none items-center gap-1 border-b border-gp-line bg-gp-panel pl-3 pr-2 md:gap-4 md:pl-4 md:pr-3">
+      {/* Телефон: имя проекта в шапке не помещается (есть в панели «Чертёж»),
+          вкладки и кнопки сжаты, чтобы «Проверка» с бейджем не наезжала на Юну. */}
+      <div className="flex min-w-0 flex-none items-center gap-2.5 md:flex-1 md:basis-0">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="#B5E07A" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" role="img" aria-label="GreenProject" className="hidden flex-none min-[400px]:block">
           <path d="M3 13C3 7 7 3 13 3c0 6-4 10-10 10z" />
           <path d="M3 13l5-5" />
         </svg>
@@ -89,7 +91,7 @@ export function Header({
           /
         </span>
         {hasProject ? (
-          <div ref={menuRef} className="relative min-w-0">
+          <div ref={menuRef} className="relative hidden min-w-0 md:block">
             <button
               onClick={() => setMenuOpen((v) => !v)}
               aria-haspopup="menu"
@@ -117,12 +119,12 @@ export function Header({
             )}
           </div>
         ) : (
-          <span className="text-sm text-gp-text-3">Новый проект</span>
+          <span className="hidden text-sm text-gp-text-3 md:inline">Новый проект</span>
         )}
         {versionLabel && <span className="hidden whitespace-nowrap text-[13px] text-gp-text-3 lg:inline">· {versionLabel}</span>}
       </div>
 
-      <nav aria-label="Этапы" className="flex h-12 items-stretch">
+      <nav aria-label="Этапы" className="flex h-12 min-w-0 flex-1 items-stretch justify-center md:flex-none">
         {STAGES.map(({ key, label }) => {
           const active = stage === key;
           const badge = key === "check" && violationCount !== null && violationCount > 0;
@@ -133,7 +135,7 @@ export function Header({
               disabled={!enabled[key]}
               aria-current={active ? "page" : undefined}
               className={cn(
-                "relative flex h-12 items-center gap-2 px-2.5 text-sm font-medium transition-colors disabled:cursor-not-allowed md:px-3.5",
+                "relative flex h-12 items-center gap-1.5 px-2 text-[13px] font-medium transition-colors disabled:cursor-not-allowed md:gap-2 md:px-3.5 md:text-sm",
                 !enabled[key] ? "text-gp-text-4" : active ? "text-gp-text" : "text-gp-text-2 hover:text-gp-text"
               )}
             >
@@ -146,13 +148,13 @@ export function Header({
                   {violationCount}
                 </span>
               )}
-              {active && enabled[key] && <span className="absolute inset-x-2.5 -bottom-px h-0.5 bg-gp-accent md:inset-x-3.5" aria-hidden />}
+              {active && enabled[key] && <span className="absolute inset-x-2 -bottom-px h-0.5 bg-gp-accent md:inset-x-3.5" aria-hidden />}
             </button>
           );
         })}
       </nav>
 
-      <div className="flex min-w-0 flex-1 basis-0 items-center justify-end gap-2">
+      <div className="flex min-w-0 flex-none items-center justify-end gap-1.5 md:flex-1 md:basis-0 md:gap-2">
         <button
           onClick={onToggleAssistant}
           aria-pressed={assistantOpen}
@@ -168,7 +170,7 @@ export function Header({
             <span className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-gp-panel bg-gp-warn" aria-label="Есть новый ответ" />
           )}
         </button>
-        <Button size="sm" className="h-[34px] px-3.5 text-[13px] font-semibold" disabled={exportDisabled || exporting} onClick={onExport}>
+        <Button size="sm" className="h-[34px] px-2.5 text-[13px] font-semibold md:px-3.5" disabled={exportDisabled || exporting} onClick={onExport}>
           {exporting ? "Экспорт…" : "Экспорт"}
         </Button>
       </div>

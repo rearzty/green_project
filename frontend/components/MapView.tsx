@@ -14,15 +14,15 @@ import { boundsOfItems, itemsInBox, type LatLngBox, type PlanIndex } from "@/lib
 // an item can be both selected and violating at the same time (colors live in
 // lib/mapStyle.ts next to the tokens they mirror).
 
-/** Тёмная приглушённая подложка для проектов с проверенной СК вместо светлых
- * тайлов OSM (GREENPROJECT_REDESIGN.md §2): карта — подоснова, ярко рисуются
- * только посадки, нарушения и выделение. CARTO Dark Matter; её условия
- * требуют атрибуции (ниже) и бесплатны для некоммерческого использования —
- * для коммерческого запуска нужна лицензия CARTO либо свой источник тайлов
- * (поменять эти две константы). */
-const BASEMAP_URL = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png";
-const BASEMAP_ATTRIBUTION =
-  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>';
+/** Подложка проектов с проверенной СК — обычные тайлы OSM, которые
+ * app/globals.css (`.gp-dark-basemap`) приглушает фильтром до тёмной: карта
+ * должна быть подосновой, ярко рисуются только посадки, нарушения и выделение
+ * (GREENPROJECT_REDESIGN.md §2). Первой пробовали готовую тёмную подложку CARTO
+ * Dark Matter, как предлагало задание, — но без ключа API её тайлы отдают
+ * водяной знак «API KEY REQUIRED» (проверено живьём), а ключ в
+ * репозитории не хранить. Свой источник тайлов — поменять эти две константы. */
+const BASEMAP_URL = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png";
+const BASEMAP_ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
 
 /** Below this much pointer travel a press counts as a click, not a drag. */
 const DRAG_THRESHOLD_PX = 4;
@@ -1531,7 +1531,11 @@ export default function MapView({
       // survey drawing) instead of running them through Web Mercator, which
       // is undefined outside real longitude/latitude ranges and is exactly
       // what produced the Kenya-map bug for a plausible-but-unverified CRS.
-      crs={crsVerified ? undefined : L.CRS.Simple}
+      // Явно EPSG3857, а не `undefined`: react-leaflet отдаёт все пропсы в
+      // `new L.Map(...)` как опции, а Leaflet копирует и значения undefined
+      // поверх своих умолчаний — `crs: undefined` ронял карту проекта с
+      // проверенной СК на первом же setView (`latLngToPoint` of undefined).
+      crs={crsVerified ? L.CRS.EPSG3857 : L.CRS.Simple}
       center={crsVerified ? center : [0, 0]}
       zoom={crsVerified ? zoom : 0}
       // CRS.Simple has no fixed real-world tile size to bottom out at --
@@ -1545,7 +1549,7 @@ export default function MapView({
       // 0.3m, which at zoom 19 is still sub-pixel at Moscow's latitude and
       // needs a couple more zoom levels to actually separate on screen.
       maxZoom={21}
-      className={`h-full w-full ${crsVerified ? "" : "gp-neutral-map-bg"}`}
+      className={`h-full w-full ${crsVerified ? "gp-dark-basemap" : "gp-neutral-map-bg"}`}
       attributionControl={false}
       // Зум «+/−» рисует свой компонент в правом нижнем углу карты
       // (components/map/ZoomControls.tsx): стандартный стоял слева сверху
@@ -1557,7 +1561,13 @@ export default function MapView({
           copyright below stays: that one *is* required by OpenStreetMap's
           tile usage policy for using their tiles at all. */}
       <AttributionControl position="bottomleft" prefix={false} />
-      {crsVerified && <TileLayer attribution={BASEMAP_ATTRIBUTION} url={BASEMAP_URL} subdomains="abcd" maxNativeZoom={20} />}
+      {crsVerified && (
+        // maxZoom равен maxZoom карты (21): у TileLayer умолчание 18, и глубже
+        // тайлы просто исчезали (двор в сотню метров открывается на зуме
+        // 19-20) — maxNativeZoom без maxZoom «растягивать» тайлы не заставляет.
+        // 19 — предел собственных тайлов OSM.
+        <TileLayer attribution={BASEMAP_ATTRIBUTION} url={BASEMAP_URL} maxNativeZoom={19} maxZoom={21} />
+      )}
       <FitBounds fitKey={`${layersKey ?? ""}:${planId ?? ""}`} layersBounds={extentBounds} plan={plan} />
       <FitToRequest request={fitRequest} crsVerified={Boolean(crsVerified)} planIndex={showPlan ? planIndex : undefined} />
       <InvalidateSizeOnResize />

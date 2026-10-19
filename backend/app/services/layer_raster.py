@@ -242,6 +242,7 @@ _FILL_ALPHA = 115  # ~0.45 opacity, matching MapView.tsx's layerStyle fillOpacit
 # than groups buys nothing, and one very large group (e.g. a pile of
 # unrecognised "unknown" symbol-block primitives) still bounds the wall
 # time of the whole render on its own, however many cores are free.
+_ZONING_FILL_ALPHA = 38  # ~15%
 _PARALLEL_RENDER_THRESHOLD = 20_000
 _MAX_RENDER_WORKERS = 6
 
@@ -452,7 +453,14 @@ def _draw_geometry(draw: ImageDraw.ImageDraw, geom: BaseGeometry, to_px, color: 
             width = _LINE_WIDTH_PX.get(group_key, _DEFAULT_LINE_WIDTH_PX)
             draw.line(points, fill=color, width=width)
     elif gtype == "Polygon":
-        fill, outline = _POLYGON_STYLES.get(group_key, ((*color, _FILL_ALPHA), color))
+        fill, outline = _POLYGON_STYLES.get(group_key) or (
+            # Зонирование — фон-контекст, а не препятствие: на тёмной карте
+            # заливка в 45% прозрачности (как у остальных групп) кричала бы
+            # на пол-участка лиловым и бирюзовым.
+            ((*color, _ZONING_FILL_ALPHA), color)
+            if group_key.startswith(_ZONING_PREFIX)
+            else ((*color, _FILL_ALPHA), color)
+        )
         dashed = group_key in _DASHED_OUTLINE_GROUPS
         points = [to_px(x, y) for x, y in geom.exterior.coords]
         if len(points) >= 3:
