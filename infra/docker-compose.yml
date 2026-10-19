@@ -3,9 +3,13 @@ services:
     build:
       context: ..
       dockerfile: infra/Dockerfile.backend
-    restart: on-failure
+    restart: unless-stopped
     environment:
       GREENPROJECT_CORS_ORIGINS: '["http://localhost:3000", "http://127.0.0.1:3000"]'
+      # Публичный сервер: адрес страницы, например ^http://51\.250\.1\.2:3000$ --
+      # задаётся в infra/.env. Пусто -> по умолчанию разрешены только адреса
+      # локальной сети (config.py::cors_origin_regex).
+      GREENPROJECT_CORS_ORIGIN_REGEX: ${GREENPROJECT_CORS_ORIGIN_REGEX:-}
       # Юна (assistant_service.py) -- read from the host's own environment
       # (docker compose substitutes ${VAR} from the shell/.env next to this
       # file), not hardcoded, so the key never lives in version control.
@@ -33,6 +37,7 @@ services:
     # a no-op. frontend/lib/api.ts derives the API host from the page's own
     # hostname at runtime instead, which also means it doesn't need to know
     # this machine's LAN IP up front.
+    restart: unless-stopped
     ports:
       - "3000:3000"
     depends_on:
