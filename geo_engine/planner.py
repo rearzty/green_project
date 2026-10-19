@@ -16,7 +16,7 @@ import sys
 import random
 import zlib
 from collections.abc import Callable, Collection
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from geo_engine.parallel import process_pool
 from concurrent.futures.process import BrokenProcessPool
 
@@ -702,6 +702,7 @@ def _tree_cascade(
     density_per_ha: float | None,
     catalogue: SpeciesCatalogue,
     tree_rows: int,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[PlantingItem]:
     """Деревья каскадом от крупной кроны к мелкой — так рисует проектировщик.
 
@@ -728,6 +729,7 @@ def _tree_cascade(
         classes, planting_type, zones, territory, utilities, norms, keep_spacing_for, catalogue,
         tree_rows=tree_rows, evaluated_out=evaluated,
     )
+    _checkpoint(should_stop)
     user_interval = _user_interval(norms, planting_type, keep_spacing_for)
 
     def class_norms(species: Species) -> PlantingNorms:
@@ -799,6 +801,7 @@ def _tree_cascade(
     best: list[PlantingItem] = []
     best_key: tuple = ()
     for start in range(len(evaluated)):
+        _checkpoint(should_stop)
         trial, canopy = variant(start)
         key = (round(canopy, 6), len(trial))
         if not best_key or key > best_key:
@@ -825,6 +828,34 @@ def _tree_cascade(
     return items
 
 
+class GenerationCancelled(Exception):
+    """Расчёт остановлен пользователем («Остановить» при генерации плана).
+    Не ошибка: вызывающий не показывает её как сбой и ничего не сохраняет."""
+
+
+def _checkpoint(should_stop: Callable[[], bool] | None) -> None:
+    """Точка, где расчёт может остановиться между фазами. Внутри одной фазы
+    (объединение буферов всей съёмки, жадный отбор) его не прервать — такая
+    фаза доходит до конца, а результат отбрасывается."""
+    if should_stop is not None and should_stop():
+        raise GenerationCancelled()
+
+
+def _terminate_pool_workers(pool: ProcessPoolExecutor) -> None:
+    """Убить рабочие процессы пула. `ProcessPoolExecutor` публично не умеет
+    остановить уже идущий расчёт (`shutdown(cancel_futures=True)` снимает лишь
+    ещё не начатые задачи) — а типы посадки идут все сразу, по процессу на
+    каждый. Тянемся к `_processes`: открытого способа нет (появился только в
+    Python 3.14, `terminate_workers`), а оставить воркеры считать впустую
+    минуты после «Остановить» значило бы обмануть кнопку."""
+    for process in list(getattr(pool, "_processes", {}).values()):
+        try:
+            process.terminate()
+        except Exception:  # noqa: BLE001 — процесс мог уже завершиться
+            pass
+    pool.shutdown(wait=False, cancel_futures=True)
+
+
 def _plan_type_items(
     plan_key: str,
     planting_type: str,
@@ -839,6 +870,7 @@ def _plan_type_items(
     density_per_ha: float | None,
     catalogue: SpeciesCatalogue,
     tree_rows: int = 1,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[PlantingItem]:
     """Полная генерация одного типа посадки: палитра пород -> ряд вдоль
     ориентиров -> куртины -> россыпь в остатке -> ограничение по плотности.
@@ -855,11 +887,12 @@ def _plan_type_items(
     только `RowGuide` (frozen dataclass с shapely-геометрией) и
     `PlantingCandidate` — оба уже пиклятся тем же путём, что `Utility`/`Zone`.
     """
+    _checkpoint(should_stop)
     override = species_override
     if planting_type in CROWN_SPACING_TYPES and not override and pattern in ("auto", "row", "accent"):
         return _tree_cascade(
             plan_key, utilities, zones, territory, score_fn, norms, keep_spacing_for, pattern,
-            density_per_ha, catalogue, tree_rows,
+            density_per_ha, catalogue, tree_rows, should_stop,
         )
     if planting_type in CROWN_SPACING_TYPES:
         # Порода дерева решает число и размер посадок — её выбирает площадка
@@ -915,6 +948,7 @@ def _plan_type_items(
             tree_rows=tree_rows,
             area_cache=area_cache,
         )
+        _checkpoint(should_stop)
         spacing = type_norms.spacing_for(planting_type)
         # НЕ пересчитывается заново: `_fit_row_species` уже вернула
         # exclusion/buildable для победившей породы — тем же вызовом
@@ -988,6 +1022,7 @@ def _plan_type_items(
         # что куртины по построению не соприкасаются (радиус 3 м при шаге
         # центров 14 м), так что общий отбор между ними не нужен.
         for index, disc in enumerate(discs):
+            _checkpoint(should_stop)
             disc_species = species if override else _palette_pick(palette, index)
             pitch = group_pitch_for(disc_species)
             group_norms = type_norms.with_spacing_override(planting_type, pitch)
@@ -1314,6 +1349,8 @@ def plan_items(
     catalogue: SpeciesCatalogue | None = None,
     on_progress: Callable[[str, int, int], None] | None = None,
     tree_rows: int = 1,
+    on_items: Callable[[str, list[PlantingItem]], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[PlantingItem]:
     """Сгенерировать посадки для одного плана.
 
@@ -1321,13 +1358,25 @@ def plan_items(
     см. `patterns.row_candidates`. По умолчанию однорядная, как и было.
 
     `on_progress`, when given, is called `(planting_type, types_done,
-    types_total)` once per finished type -- in `planting_types` submission
-    order in the parallel branch, not completion order (same tradeoff
-    `resolve_and_read_bundle`'s own `on_progress` makes and documents), so a
-    slow type earlier in the list still gates when a faster one later in the
-    list gets reported done. Coarse (whole types, not within-type candidate
-    counts) on purpose: the within-type work runs inside a worker process in
-    the parallel branch, and a callback can't cross that process boundary.
+    types_total)` once per finished type -- in COMPLETION order (parallel
+    branch included): `types_done` is how many are finished, and the type
+    named is the one that just finished. It used to wait for submission order,
+    so a slow type early in the list hid a finished later one; with partial
+    results shown on the map as types finish (`on_items`), that would have
+    held the picture back for no reason. Coarse (whole types, not within-type
+    candidate counts) on purpose: the within-type work runs inside a worker
+    process in the parallel branch, and a callback can't cross that process
+    boundary.
+
+    `on_items(planting_type, items)` — те же посадки типа сразу, как только он
+    посчитан, ДО общей пост-обработки (`_diversify_species`, `_mark_in_paving`):
+    для частичного показа на карте нужны места, а не окончательные породы, и
+    ждать конца всех типов незачем.
+
+    `should_stop` — опрашивается между фазами (см. `_checkpoint`); при
+    остановке поднимается `GenerationCancelled`. В параллельной ветке расчёт
+    идёт в чужих процессах, куда функцию не передать, поэтому родитель сам
+    следит за флагом и убивает воркеров (`_terminate_pool_workers`).
 
     Каждый тип посадки генерируется независимо от одной и той же buildable-area,
     без взаимного вычитания — дерево или куст, попавший на площадь газона, это
@@ -1396,7 +1445,7 @@ def plan_items(
         items: list[PlantingItem] = []
         try:
             with process_pool(max_workers=worker_count) as pool:
-                futures = [
+                futures = {
                     pool.submit(
                         _plan_type_items,
                         plan_key,
@@ -1412,14 +1461,27 @@ def plan_items(
                         density_per_ha.get(planting_type),
                         catalogue,
                         tree_rows,
-                    )
-                    for planting_type in planting_types
-                ]
+                    ): index
+                    for index, planting_type in enumerate(planting_types)
+                }
                 total = len(futures)
-                for index, (planting_type, future) in enumerate(zip(planting_types, futures), start=1):
-                    items.extend(future.result())
-                    if on_progress is not None:
-                        on_progress(planting_type, index, total)
+                results: dict[int, list[PlantingItem]] = {}
+                pending = set(futures)
+                while pending:
+                    done, pending = wait(pending, timeout=0.3, return_when=FIRST_COMPLETED)
+                    if should_stop is not None and should_stop():
+                        _terminate_pool_workers(pool)
+                        raise GenerationCancelled()
+                    for future in done:
+                        index = futures[future]
+                        results[index] = future.result()
+                        if on_items is not None:
+                            on_items(planting_types[index], results[index])
+                        if on_progress is not None:
+                            on_progress(planting_types[index], len(results), total)
+                # Порядок позиций — порядок planting_types, не порядок завершения.
+                for index in range(total):
+                    items.extend(results[index])
             return _mark_in_paving(_diversify_species(items, plan_key, norms, catalogue, species_overrides), zones, norms)
         except BrokenProcessPool:
             # Рабочий процесс убит извне — на реальных данных это нехватка
@@ -1444,23 +1506,25 @@ def plan_items(
     items = []
     total = len(planting_types)
     for index, planting_type in enumerate(planting_types, start=1):
-        items.extend(
-            _plan_type_items(
-                plan_key,
-                planting_type,
-                utilities,
-                zones,
-                territory,
-                score_fn,
-                norms,
-                keep_spacing_for,
-                species_overrides.get(planting_type),
-                pattern,
-                density_per_ha.get(planting_type),
-                catalogue,
-                tree_rows,
-            )
+        type_items = _plan_type_items(
+            plan_key,
+            planting_type,
+            utilities,
+            zones,
+            territory,
+            score_fn,
+            norms,
+            keep_spacing_for,
+            species_overrides.get(planting_type),
+            pattern,
+            density_per_ha.get(planting_type),
+            catalogue,
+            tree_rows,
+            should_stop,
         )
+        items.extend(type_items)
+        if on_items is not None:
+            on_items(planting_type, type_items)
         if on_progress is not None:
             on_progress(planting_type, index, total)
     return _mark_in_paving(_diversify_species(items, plan_key, norms, catalogue, species_overrides), zones, norms)

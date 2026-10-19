@@ -291,9 +291,13 @@ export async function getLayersRaster(projectId: string): Promise<LayersRaster> 
 }
 
 export interface GenerateJobStatus {
-  status: "pending" | "done" | "error";
+  status: "pending" | "done" | "error" | "cancelled";
   plan_id: string | null;
   error: string | null;
+  /** Сколько посадок каждого типа уже посчитано и растёт ли это: частичный
+   * результат перечитывается, только когда `partial_version` сменилась. */
+  partial_counts?: Record<string, number>;
+  partial_version?: number;
   /** Best-effort: which planting_type most recently finished ("Готово:
    * Кустарники (2 из 3)"), null before the backend has anything to report. */
   stage: string | null;
@@ -326,6 +330,64 @@ function startGenerate(
   });
 }
 
+/** Пользователь нажал «Остановить»: план не построен и не изменился. Не сбой —
+ * вызывающие показывают нейтральное уведомление, а не красное. */
+export class GenerationCancelledError extends ApiError {
+  constructor() {
+    super("Генерация остановлена — план остался прежним.", 0);
+    this.name = "GenerationCancelledError";
+  }
+}
+
+/** Что уже расставлено, пока план считается: места и типы для предпросмотра на
+ * карте — не редактируемый план (без id и обоснований). */
+export interface GeneratePartial {
+  version: number;
+  counts: Record<string, number>;
+  features: GeoJSONFeatureCollection;
+}
+
+export async function getGeneratePartial(projectId: string, jobId: string): Promise<GeneratePartial> {
+  return request(`/api/projects/${projectId}/generate/${jobId}/partial`);
+}
+
+/** «Остановить»: сервер сразу отмечает задачу отменённой, расчёт останавливается
+ * на ближайшей точке опроса, план не сохраняется. */
+export async function cancelGeneration(projectId: string, jobId: string): Promise<void> {
+  await request(`/api/projects/${projectId}/generate/${jobId}/cancel`, { method: "POST" });
+}
+
+/** «Ожидается»: диапазон числа посадок по настройкам до генерации. */
+export interface EstimateItem {
+  planting_type: PlantingType;
+  low: number;
+  high: number;
+  /** items — штуки (деревья, кусты), m2 — площадь (газон). */
+  unit: "items" | "m2";
+  /** plan — от открытого плана (точнее), area — по допустимой площади (грубо). */
+  basis: "plan" | "area";
+}
+
+export async function estimatePlan(
+  projectId: string,
+  settings: { plantingTypes: PlantingType[]; treeSpacingM?: number; shrubSpacingM?: number; treeRows: number; treesInPaving: boolean },
+  signal?: AbortSignal
+): Promise<EstimateItem[]> {
+  const { estimates } = await request<{ estimates: EstimateItem[] }>(`/api/projects/${projectId}/estimate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      planting_types: settings.plantingTypes,
+      tree_spacing_m: settings.treeSpacingM,
+      shrub_spacing_m: settings.shrubSpacingM,
+      tree_rows: settings.treeRows,
+      trees_in_paving: settings.treesInPaving,
+    }),
+    signal,
+  });
+  return estimates;
+}
+
 function getGenerateStatus(projectId: string, jobId: string): Promise<GenerateJobStatus> {
   return request(`/api/projects/${projectId}/generate/${jobId}`);
 }
@@ -348,6 +410,10 @@ export async function generatePlan(
   options?: {
     signal?: AbortSignal;
     onPoll?: (status: GenerateJobStatus) => void;
+    /** Идентификатор задачи — чтобы «Остановить» знало, что останавливать. */
+    onJob?: (jobId: string) => void;
+    /** Уже расставленные посадки — каждый раз, когда посчитан очередной тип. */
+    onPartial?: (partial: GeneratePartial) => void;
     treeSpacingM?: number;
     shrubSpacingM?: number;
     treeRows?: number;
@@ -365,13 +431,31 @@ export async function generatePlan(
     options?.treesInPaving,
     options?.useOrderBoundary
   );
-  for (;;) {
-    if (options?.signal?.aborted) throw new ApiError("Генерация отменена.", 0);
-    const status = await getGenerateStatus(projectId, job_id);
-    options?.onPoll?.(status);
-    if (status.status === "error") throw new ApiError(status.error ?? "Не удалось сгенерировать план.", 0);
-    if (status.status === "done" && status.plan_id) return getPlan(projectId, status.plan_id);
-    await new Promise((resolve) => setTimeout(resolve, GENERATE_POLL_INTERVAL_MS));
+  options?.onJob?.(job_id);
+  let partialVersion = 0;
+  let finished = false;
+  try {
+    for (;;) {
+      if (options?.signal?.aborted) throw new ApiError("Генерация отменена.", 0);
+      const status = await getGenerateStatus(projectId, job_id);
+      options?.onPoll?.(status);
+      if (status.status === "cancelled") throw new GenerationCancelledError();
+      if (status.status === "error") throw new ApiError(status.error ?? "Не удалось сгенерировать план.", 0);
+      if (status.status === "done" && status.plan_id) return await getPlan(projectId, status.plan_id);
+      // Частичный результат тянем только когда он вырос; запрос не ждём — опрос
+      // идёт дальше, а запоздавший ответ после конца задачи отбрасывается.
+      if (options?.onPartial && status.partial_version && status.partial_version !== partialVersion) {
+        partialVersion = status.partial_version;
+        getGeneratePartial(projectId, job_id)
+          .then((partial) => {
+            if (!finished) options.onPartial?.(partial);
+          })
+          .catch(() => undefined);
+      }
+      await new Promise((resolve) => setTimeout(resolve, GENERATE_POLL_INTERVAL_MS));
+    }
+  } finally {
+    finished = true;
   }
 }
 

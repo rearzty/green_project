@@ -18,7 +18,7 @@ import {
   type PreparedConstraint,
 } from "@/lib/dragNorms";
 import { formatMeters, OBJECT_GENITIVE_RU } from "@/lib/format";
-import { plantingColor, SELECTION_COLOR, VIOLATION_COLOR } from "@/lib/mapStyle";
+import { MAP_BG_COLOR, plantingColor, SELECTION_COLOR, VIOLATION_COLOR } from "@/lib/mapStyle";
 import { boundsOfItems, itemsInBox, type LatLngBox, type PlanIndex } from "@/lib/planIndex";
 
 // Selection is blue on purpose: orange means "violates a setback norm", and
@@ -460,6 +460,60 @@ function CompareOverlay({ marks }: { marks: CompareMarks | null }) {
       renderer.remove();
     };
   }, [map, marks]);
+  return null;
+}
+
+/** Частичный результат генерации (п. 8): пока план считается, уже посчитанные
+ * типы показываются на карте точками и газоном без обоснований — предпросмотр,
+ * а не план (его нельзя выделять и править). Один canvas на всё: тысячи точек
+ * SVG-слоем — ровно то, от чего карта уходила (кластеры, виртуализация). Не
+ * интерактивно, в своей пане над точками прежнего плана, который в это время
+ * приглушён (`dimPlan`). */
+const PARTIAL_PANE = "partialPlan";
+const MAX_PARTIAL_POINTS = 80_000;
+
+function PartialPlanOverlay({ partial }: { partial: GeoJSONFeatureCollection | null }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!partial) return;
+    if (!map.getPane(PARTIAL_PANE)) {
+      const pane = map.createPane(PARTIAL_PANE);
+      pane.style.zIndex = "612";
+      pane.style.pointerEvents = "none";
+    }
+    const renderer = L.canvas({ pane: PARTIAL_PANE, padding: 0.3 });
+    const group = L.layerGroup();
+    let points = 0;
+    for (const feature of partial.features) {
+      const type = String(feature.properties.planting_type ?? "");
+      if (feature.geometry.type === "Point") {
+        if (points++ >= MAX_PARTIAL_POINTS) continue;
+        const [lng, lat] = feature.geometry.coordinates as [number, number];
+        L.circleMarker([lat, lng], {
+          renderer,
+          radius: type === "shrub" ? 2.5 : 4,
+          color: MAP_BG_COLOR,
+          weight: 1,
+          fillColor: plantingColor(type),
+          fillOpacity: 1,
+          interactive: false,
+        }).addTo(group);
+      } else {
+        // `renderer` — опция пути, которую Leaflet передаёт из GeoJSON-слоя в его
+        // полигоны, но в типах GeoJSONOptions её нет.
+        L.geoJSON(feature as never, {
+          renderer,
+          interactive: false,
+          style: { color: plantingColor(type), weight: 1, opacity: 0.5, fillColor: plantingColor(type), fillOpacity: 0.28 },
+        } as L.GeoJSONOptions).addTo(group);
+      }
+    }
+    group.addTo(map);
+    return () => {
+      group.remove();
+      renderer.remove();
+    };
+  }, [map, partial]);
   return null;
 }
 
@@ -1979,6 +2033,8 @@ export interface MapViewProps {
   compareMarks?: CompareMarks | null;
   /** Предпросмотр исправления нарушения: куда встанет посадка. */
   fixPreview?: FixPreviewMark | null;
+  /** Уже расставленное, пока план ещё считается (GET .../generate/{job}/partial). */
+  partialPlan?: GeoJSONFeatureCollection | null;
   /** Охранные зоны вокруг точки — для подсказок при перетаскивании (DragNormsController). */
   loadNearbyConstraints?: (query: { x: number; y: number; radius: number; plantingType: PlantingType; itemId: string }) => Promise<NearbyConstraint[]>;
   /** Alt при перетаскивании: ближайшая допустимая точка для посадки. */
@@ -2021,6 +2077,7 @@ export default function MapView({
   fitRequest,
   compareMarks = null,
   fixPreview = null,
+  partialPlan = null,
   loadNearbyConstraints,
   loadNearestAllowed,
   zoneLayers = null,
@@ -2225,6 +2282,7 @@ export default function MapView({
       )}
       <CompareOverlay marks={compareMarks} />
       <FixPreviewOverlay mark={fixPreview} />
+      <PartialPlanOverlay partial={partialPlan} />
       <SelectionController
         selectMode={selectMode}
         editsLocked={editsLocked}

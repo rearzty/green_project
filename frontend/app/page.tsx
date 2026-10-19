@@ -56,6 +56,7 @@ import {
   type ExportOptions,
   type FixKind,
   type FixOption,
+  GenerationCancelledError,
   type GeoJSONFeatureCollection,
   type ItemCompliance,
   type PlantingType,
@@ -79,7 +80,7 @@ import {
   type SelectTarget,
   type UiAction,
 } from "@/lib/assistantCommands";
-import { countLabel, CROWN_LABELS, formatMeters, OBJECT_FORMS, PLANTING_TYPE_LABELS } from "@/lib/format";
+import { countLabel, CROWN_LABELS, formatMeters, OBJECT_FORMS, PLANTING_TYPE_LABELS, pluralRu } from "@/lib/format";
 import { useCompareVersions } from "@/lib/hooks/useCompareVersions";
 import { useKeyboardShortcuts } from "@/lib/hooks/useKeyboardShortcuts";
 import { usePlanEdits } from "@/lib/hooks/usePlanEdits";
@@ -1156,7 +1157,8 @@ export default function Home() {
       await session.handleGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM, treeRows, treesInPaving });
       setStage("check");
     } catch (e) {
-      toast.error(errorMessage(e));
+      if (e instanceof GenerationCancelledError) toast.info(e.message);
+      else toast.error(errorMessage(e));
     }
   }
 
@@ -1397,6 +1399,11 @@ export default function Home() {
                 consentRequest={consentRequest}
                 generating={session.generating}
                 generateProgress={session.generateProgress}
+                partialCounts={session.generatePartial?.counts}
+                onStopGenerate={() => void session.handleStopGenerate().catch((e) => toast.error(errorMessage(e)))}
+                stopping={session.stopping}
+                projectId={project?.id}
+                planId={plan?.plan_id}
                 editBusy={editing.editBusy}
                 onGenerate={async (types, mode, spacing) => {
                   await session.handleGenerate(types, mode, spacing);
@@ -1497,10 +1504,11 @@ export default function Home() {
                 editsLocked={editing.editBusy || compare.active}
                 compareMarks={compare.marks}
                 fixPreview={mapFixPreview}
+                partialPlan={session.generatePartial?.features ?? null}
                 loadNearbyConstraints={loadNearbyConstraints}
                 loadNearestAllowed={loadNearestAllowed}
                 zoneLayers={zonesShown ? zones.layers : null}
-                dimPlan={zonesShown}
+                dimPlan={zonesShown || session.generatePartial !== null}
                 onSelectionChange={selection.setSelection}
                 onMoveItems={editing.handleMoveItems}
                 onContextMenu={handleContextMenu}
@@ -1512,6 +1520,23 @@ export default function Home() {
                 loadHoverInfo={loadHoverInfo}
                 peekHoverInfo={peekHoverInfo}
               />
+            )}
+            {session.generating && session.generatePartial && !view3d && (
+              <div
+                data-map-overlay
+                role="status"
+                className="pointer-events-none absolute left-1/2 top-[18px] z-[1050] max-w-[calc(100%-2rem)] -translate-x-1/2 rounded-lg border border-gp-border bg-gp-panel px-3.5 py-2 text-[13px] text-gp-text shadow-[0_8px_24px_rgba(0,0,0,0.35)]"
+              >
+                {(() => {
+                  const counts = session.generatePartial.counts;
+                  const parts = [
+                    counts.tree ? `${counts.tree.toLocaleString("ru-RU")} ${pluralRu(counts.tree, ["дерево", "дерева", "деревьев"])}` : null,
+                    counts.shrub ? `${counts.shrub.toLocaleString("ru-RU")} ${pluralRu(counts.shrub, ["куст", "куста", "кустов"])}` : null,
+                    counts.lawn ? "газон" : null,
+                  ].filter(Boolean);
+                  return `Уже расставлено ${parts.join(", ")} — план появляется по мере расчёта`;
+                })()}
+              </div>
             )}
             {fixBanner && !view3d && (
               <div

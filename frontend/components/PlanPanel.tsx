@@ -5,12 +5,39 @@ import { ChevronRight, Loader2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { PanelTitle, ProgressBar, SectionLabel } from "@/components/panel/primitives";
-import type { PlantingType, ScoringMode } from "@/lib/api";
+import { estimatePlan, GenerationCancelledError, type EstimateItem, type PlantingType, type ScoringMode } from "@/lib/api";
+import { pluralRu } from "@/lib/format";
 import type { JobProgress } from "@/lib/hooks/useProjectSession";
 import { PLANTING_COLORS } from "@/lib/mapStyle";
 import { matchPreset, PLAN_PRESETS, type PresetSettings } from "@/lib/planPresets";
 import { errorMessage, toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
+
+const ESTIMATE_FORMS: Record<"tree" | "shrub", [string, string, string]> = {
+  tree: ["дерево", "дерева", "деревьев"],
+  shrub: ["куст", "куста", "кустов"],
+};
+
+const nf = (n: number) => n.toLocaleString("ru-RU");
+
+/** «55–65 деревьев», «≈150 кустов», «≈ 25 000 м²». По площади (плана ещё нет)
+ * диапазон широкий и помечен «~»: цифры грубые, и сказано это прямо. */
+function formatEstimate(e: EstimateItem): { value: string; noun: string } {
+  const mid = (e.low + e.high) / 2;
+  if (e.unit === "m2") return { value: `≈ ${nf(Math.round(mid / 100) * 100)}`, noun: "м² газона" };
+  // Форма по большему числу диапазона: «5–7 кустов», «1–3 дерева».
+  const noun = pluralRu(Math.round(e.high), ESTIMATE_FORMS[e.planting_type === "shrub" ? "shrub" : "tree"]);
+  if (e.low === e.high) return { value: `≈ ${nf(e.low)}`, noun };
+  return { value: `${e.basis === "area" ? "~" : ""}${nf(e.low)}–${nf(e.high)}`, noun };
+}
+
+/** Схема, чей прогноз по деревьям больше всего отличается от текущих настроек:
+ * «Схема «Аллея» даст 100–120». Меньше десяти процентов — не повод говорить. */
+interface PresetEstimate {
+  title: string;
+  low: number;
+  high: number;
+}
 
 const GENERATE_TYPE_LABELS: Record<PlantingType, string> = {
   tree: "Деревья",
@@ -39,6 +66,14 @@ export interface PlanPanelProps {
   consentRequest?: number;
   generating?: boolean;
   generateProgress?: JobProgress | null;
+  /** Сколько посадок каждого типа уже расставлено, пока план считается. */
+  partialCounts?: Record<string, number>;
+  /** «Остановить»: сервер отменяет задачу, план остаётся прежним. */
+  onStopGenerate?: () => void;
+  stopping?: boolean;
+  /** Для прогноза «Ожидается»: проект и открытый план (от него масштабируется). */
+  projectId?: string;
+  planId?: string;
   editBusy: boolean;
   onGenerate: (
     plantingTypes: PlantingType[],
@@ -72,6 +107,11 @@ export function PlanPanel({
   consentRequest = 0,
   generating = false,
   generateProgress = null,
+  partialCounts,
+  onStopGenerate,
+  stopping = false,
+  projectId,
+  planId,
   editBusy,
   onGenerate,
   plantingTypes,
@@ -103,7 +143,9 @@ export function PlanPanel({
     try {
       await action();
     } catch (e) {
-      toast.error(errorMessage(e));
+      // «Остановить» — не сбой: нейтральное уведомление вместо красного.
+      if (e instanceof GenerationCancelledError) toast.info(e.message);
+      else toast.error(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -126,6 +168,61 @@ export function PlanPanel({
     onTreeRowsChange(next.treeRows);
     onTreesInPavingChange(next.treesInPaving);
   }
+
+  // «Ожидается»: прогноз пересчитывается на каждую правку настроек, но не чаще
+  // раза в 400 мс (debounce) и без устаревших ответов. Заодно — прогноз по
+  // другим схемам, чтобы сказать, какая из них даст заметно другое число.
+  const [estimate, setEstimate] = useState<EstimateItem[] | null>(null);
+  const [betterPreset, setBetterPreset] = useState<PresetEstimate | null>(null);
+  const typesKey = plantingTypes.join(",");
+  useEffect(() => {
+    if (!projectId || plantingTypes.length === 0) {
+      setEstimate(null);
+      setBetterPreset(null);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
+      try {
+        const settings = { plantingTypes, treeSpacingM, shrubSpacingM, treeRows, treesInPaving };
+        const others = PLAN_PRESETS.filter((p) => p.key !== activePreset);
+        const [own, ...rest] = await Promise.all([
+          estimatePlan(projectId, settings, controller.signal),
+          ...others.map((p) =>
+            estimatePlan(projectId, { plantingTypes: ["tree"], ...p.settings }, controller.signal).catch(() => [] as EstimateItem[])
+          ),
+        ]);
+        if (controller.signal.aborted) return;
+        setEstimate(own);
+        const ownTree = own.find((e) => e.planting_type === "tree");
+        let best: PresetEstimate | null = null;
+        if (ownTree && plantingTypes.includes("tree")) {
+          const ownMid = (ownTree.low + ownTree.high) / 2;
+          others.forEach((preset, i) => {
+            const tree = rest[i]?.find((e) => e.planting_type === "tree");
+            if (!tree || ownMid <= 0) return;
+            const diff = Math.abs((tree.low + tree.high) / 2 - ownMid) / ownMid;
+            if (diff >= 0.1 && (!best || diff > Math.abs(((best.low + best.high) / 2 - ownMid) / ownMid))) {
+              best = { title: preset.title, low: tree.low, high: tree.high };
+            }
+          });
+        }
+        setBetterPreset(best);
+      } catch {
+        // Прогноз — подсказка: нет ответа — блока просто нет, генерации это не мешает.
+        if (!controller.signal.aborted) {
+          setEstimate(null);
+          setBetterPreset(null);
+        }
+      }
+    }, 400);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+    // plantingTypes — по typesKey (массив новый на каждый рендер страницы)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, planId, typesKey, treeSpacingM, shrubSpacingM, treeRows, treesInPaving]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -273,6 +370,38 @@ export function PlanPanel({
             </section>
           </>
         )}
+
+        {estimate && estimate.length > 0 && (
+          <section aria-labelledby="plan-estimate" className="border-t border-gp-line px-5 pb-5 pt-4">
+            <SectionLabel id="plan-estimate">Ожидается</SectionLabel>
+            <div className="mt-2 flex flex-col gap-1.5">
+              {estimate.map((item) => {
+                const text = formatEstimate(item);
+                return (
+                  <p key={item.planting_type} className="m-0 flex items-baseline gap-2">
+                    <span className="font-mono text-[17px] tabular-nums text-gp-text">{text.value}</span>
+                    <span className="text-sm text-gp-text-2">{text.noun}</span>
+                  </p>
+                );
+              })}
+            </div>
+            <p className="mt-2 text-[13px] leading-5 text-gp-text-3">
+              {estimate.some((e) => e.basis === "area")
+                ? "Грубая оценка по свободной площади — после первой генерации прогноз точнее."
+                : "Оценка от открытой версии плана: меняется только то, что вы поменяли в настройках."}
+              {betterPreset && (
+                <>
+                  {" "}
+                  Схема «{betterPreset.title}» даст{" "}
+                  <span className="font-mono tabular-nums text-gp-text-2">
+                    {betterPreset.low === betterPreset.high ? `≈ ${nf(betterPreset.low)}` : `${nf(betterPreset.low)}–${nf(betterPreset.high)}`}
+                  </span>{" "}
+                  деревьев.
+                </>
+              )}
+            </p>
+          </section>
+        )}
       </div>
 
       <div className="flex-none border-t border-gp-line px-5 pb-5 pt-4">
@@ -307,9 +436,24 @@ export function PlanPanel({
             </div>
           </div>
         )}
-        {generateProgress && (
-          <div className="mb-4">
-            <ProgressBar label={generateProgress.stage} progress={generateProgress.progress} />
+        {generating && (
+          <div className="mb-4 flex flex-col gap-3">
+            {generateProgress ? <ProgressBar label={generateProgress.stage} progress={generateProgress.progress} /> : <ProgressBar label="Считаю…" progress={null} />}
+            {partialCounts && Object.keys(partialCounts).length > 0 && (
+              <p className="m-0 text-[13px] leading-5 text-gp-text-2">
+                Уже расставлено{" "}
+                {(["tree", "shrub"] as const)
+                  .filter((type) => partialCounts[type])
+                  .map((type) => `${nf(partialCounts[type])} ${pluralRu(partialCounts[type], ESTIMATE_FORMS[type])}`)
+                  .join(", ")}
+                {partialCounts.lawn ? `${partialCounts.tree || partialCounts.shrub ? ", " : " "}газон` : ""} — план появляется по мере расчёта.
+              </p>
+            )}
+            {onStopGenerate && (
+              <Button variant="outline" size="sm" className="self-start" disabled={stopping} onClick={onStopGenerate}>
+                {stopping ? "Останавливаю…" : "Остановить"}
+              </Button>
+            )}
           </div>
         )}
         <Button

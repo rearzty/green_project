@@ -19,7 +19,7 @@ from backend.app.services.geo_io import domain_item_to_row, layers_to_domain
 
 from geo_engine.area_budget import area_budget
 from geo_engine.norms import PlantingNorms, load_norms
-from geo_engine.planner import plan_items
+from geo_engine.planner import GenerationCancelled, plan_items  # noqa: F401  (GenerationCancelled — для вызывающих)
 from geo_engine.species import load_catalogue
 from geo_engine.territory import MissingTerritoryError, territory_polygon  # noqa: F401  (re-exported by name for existing callers)
 from ml_scoring.heuristic_scorer import HeuristicScorer
@@ -109,6 +109,8 @@ def _compute_planting_rows(
     keep_spacing_for: tuple[str, ...] = (),
     on_progress: Callable[[str, int, int], None] | None = None,
     tree_rows: int = 1,
+    on_items: Callable[[str, list], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[PlantingItemRow]:
     """Pure CPU work (geometry buffers/candidates/greedy selection) — kept as
     one synchronous function so it can run in a worker thread via
@@ -139,6 +141,8 @@ def _compute_planting_rows(
         keep_spacing_for=keep_spacing_for,
         on_progress=on_progress,
         tree_rows=tree_rows,
+        on_items=on_items,
+        should_stop=should_stop,
     )
     return [domain_item_to_row(plan_id, item) for item in items]
 
@@ -261,7 +265,13 @@ async def generate_plan(
     on_progress: Callable[[str, int, int], None] | None = None,
     tree_rows: int = 1,
     trees_in_paving: bool = False,
+    on_items: Callable[[str, list], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> Plan:
+    """`on_items` — посадки каждого типа сразу, как тип посчитан (частичный
+    показ на карте); `should_stop` — «Остановить»: опрашивается между фазами и
+    прямо перед тем, как план попадает в проект, — остановленная генерация не
+    оставляет ничего (поднимается `GenerationCancelled`)."""
     reusable = _find_reusable_plan(
         project, scoring_mode, planting_types, tree_spacing_m, shrub_spacing_m, tree_rows, trees_in_paving
     )
@@ -274,9 +284,6 @@ async def generate_plan(
     utilities, zones = layers_to_domain(project.layers)
     territory = territory_polygon(zones, utilities, allow_order_boundary=project.use_order_boundary)
     scorer = build_scorer(scoring_mode, norms, utilities, zones, territory)
-
-    for existing_plan in project.plans:
-        existing_plan.is_current = False
 
     plan = Plan(
         project_id=project.id,
@@ -302,11 +309,22 @@ async def generate_plan(
         _spacing_overridden(tree_spacing_m, shrub_spacing_m),
         on_progress,
         tree_rows,
+        on_items,
+        should_stop,
     )
     _attach(plan, items)
     plan.item_count = len(items)
     plan.area_budget = await run_in_threadpool(_area_budgets, territory, utilities, zones, planting_types, items, norms)
 
+    # Точка невозврата: от проверки до `append` нет ни одного await, поэтому
+    # «Остановить», пришедшее позже, уже не может застать план наполовину в
+    # проекте. И `is_current` у прежних планов снимается только здесь, а не
+    # до расчёта, как раньше: упавшая или остановленная генерация оставляла
+    # проект вовсе без текущего плана.
+    if should_stop is not None and should_stop():
+        raise GenerationCancelled()
+    for existing_plan in project.plans:
+        existing_plan.is_current = False
     project.plans.append(plan)
     _prune_stale_plans(project, keep_plan_id=plan.id)
 

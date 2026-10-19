@@ -38,7 +38,7 @@ class GenerateJobOut(BaseModel):
     job_id: str
 
 
-GenerateJobState = Literal["pending", "done", "error"]
+GenerateJobState = Literal["pending", "done", "error", "cancelled"]
 
 
 class GenerateJobStatus(BaseModel):
@@ -50,6 +50,41 @@ class GenerateJobStatus(BaseModel):
     # that most recently finished; `progress` is types-done/types-total.
     stage: str | None = None
     progress: float | None = None
+    # Сколько посадок каждого типа уже посчитано и растёт ли это: фронт
+    # перечитывает частичный результат (GET .../generate/{job_id}/partial),
+    # только когда `partial_version` сменилась.
+    partial_counts: dict[str, int] = {}
+    partial_version: int = 0
+
+
+class EstimateItemOut(BaseModel):
+    planting_type: PlantingType
+    low: int
+    high: int
+    # items — штуки (деревья, кусты), m2 — площадь (газон).
+    unit: Literal["items", "m2"]
+    # plan — от открытого плана (точнее), area — по допустимой площади (грубо).
+    basis: Literal["plan", "area"]
+
+
+class EstimateOut(BaseModel):
+    """«Ожидается» на вкладке «План»: диапазон по каждому запрошенному типу.
+    Типа нет в списке, если оценить не из чего."""
+
+    estimates: list[EstimateItemOut]
+
+
+class GeneratePartialOut(BaseModel):
+    """То, что уже расставлено, пока план считается: только места и типы для
+    предпросмотра на карте — не редактируемый план (ни id, ни обоснований)."""
+
+    version: int
+    counts: dict[str, int]
+    features: GeoJSONFeatureCollection
+
+
+class GenerateCancelOut(BaseModel):
+    status: GenerateJobState
 
 
 class ExportJobOut(BaseModel):
