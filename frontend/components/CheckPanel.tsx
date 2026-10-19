@@ -153,7 +153,8 @@ export interface CheckPanelProps {
    * button is disabled rather than surfacing the error. */
   onDeletePlan: (planId: string) => Promise<void>;
   exporting?: boolean;
-  onExportDxf: () => Promise<void>;
+  /** Открыть диалог «Перед экспортом» — скачивание начинается уже из него. */
+  onOpenExport: () => void;
   onDownloadComplianceReport?: (format: "json" | "csv") => void;
 }
 
@@ -181,7 +182,7 @@ export function CheckPanel({
   onSelectPlan,
   onDeletePlan,
   exporting = false,
-  onExportDxf,
+  onOpenExport,
   onDownloadComplianceReport,
 }: CheckPanelProps) {
   const [shown, setShown] = useState(PAGE);
@@ -389,7 +390,7 @@ export function CheckPanel({
 
       <div className="flex-none border-t border-gp-line px-5 pb-4 pt-4">
         <p className="mb-3 text-[13px] leading-5 text-gp-text-3">Экспорт возможен и с нарушениями — они попадут в отчёт отдельным списком.</p>
-        <Button size="lg" className="w-full" disabled={busy || exporting} onClick={() => guarded(() => onExportDxf())}>
+        <Button size="lg" className="w-full" disabled={busy || exporting} onClick={onOpenExport}>
           {exporting && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />}
           {exporting ? "Экспортируем…" : "Скачать DXF с подосновой"}
         </Button>

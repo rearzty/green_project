@@ -1,13 +1,14 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Loader2 } from "lucide-react";
+import { ChevronRight, Loader2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { PanelTitle, ProgressBar, SectionLabel } from "@/components/panel/primitives";
 import type { PlantingType, ScoringMode } from "@/lib/api";
 import type { JobProgress } from "@/lib/hooks/useProjectSession";
 import { PLANTING_COLORS } from "@/lib/mapStyle";
+import { matchPreset, PLAN_PRESETS, type PresetSettings } from "@/lib/planPresets";
 import { errorMessage, toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
@@ -115,6 +116,17 @@ export function PlanPanel({
   const treesOn = plantingTypes.includes("tree");
   const shrubsOn = plantingTypes.includes("shrub");
 
+  // Тонкая настройка свёрнута: частый путь — выбрать схему и сгенерировать.
+  const [fineOpen, setFineOpen] = useState(false);
+  // Выбранная схема не хранится, а выводится из полей (lib/planPresets.ts).
+  const activePreset = matchPreset({ treeSpacingM, shrubSpacingM, treeRows, treesInPaving });
+  function applyPreset(next: PresetSettings) {
+    onTreeSpacingMChange(next.treeSpacingM);
+    onShrubSpacingMChange(next.shrubSpacingM);
+    onTreeRowsChange(next.treeRows);
+    onTreesInPavingChange(next.treesInPaving);
+  }
+
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -144,85 +156,123 @@ export function PlanPanel({
           </div>
         </section>
 
-        <section aria-labelledby="plan-spacing" className="border-t border-gp-line px-5 pb-4 pt-4">
-          <SectionLabel id="plan-spacing">Интервалы, м</SectionLabel>
-          <div className="mt-2 grid grid-cols-2 gap-3">
-            <label className="flex flex-col gap-1.5 text-[13px] text-gp-text-3">
-              Деревья
-              <input
-                type="number"
-                step={0.5}
-                min={0.5}
-                max={15}
-                value={treeSpacingM ?? ""}
-                onChange={(e) => onTreeSpacingMChange(e.target.value === "" ? undefined : Number(e.target.value))}
-                disabled={!treesOn}
-                // По норме интервал задаёт класс кроны породы, а не одно число;
-                // своё значение только раздвигает деревья (geo_engine/planner.py).
-                placeholder="3–8 (по кроне)"
-                title="По норме — по классу кроны: 8 м широкая, 5 м средняя, 3 м узкая (МГСН 1.02-02 п. 4.2.9.2). Своё значение может только раздвинуть деревья, ближе нормы их не поставить."
-                className="h-10 rounded-lg border border-gp-border bg-gp-field px-3 font-mono text-sm text-gp-text placeholder:font-sans placeholder:text-gp-text-4 disabled:opacity-40"
-              />
-            </label>
-            <label className="flex flex-col gap-1.5 text-[13px] text-gp-text-3">
-              Кустарник
-              <input
-                type="number"
-                step={0.1}
-                min={0.3}
-                max={10}
-                value={shrubSpacingM ?? ""}
-                onChange={(e) => onShrubSpacingMChange(e.target.value === "" ? undefined : Number(e.target.value))}
-                disabled={!shrubsOn}
-                // Почти весь кустарник — живая изгородь, и интервал пользователя
-                // заменяет именно её шаг (planner.IN_ROW_PITCH_M), а не 3 м
-                // из planting_norms.yaml.
-                placeholder="0,5 (изгородь)"
-                title="Шаг кустарника в живой изгороди: по норме 0,5 м (743-ПП табл. 3.6.2). Куртины сажаются по плотности породы (515-ПП табл. 5)."
-                className="h-10 rounded-lg border border-gp-border bg-gp-field px-3 font-mono text-sm text-gp-text placeholder:font-sans placeholder:text-gp-text-4 disabled:opacity-40"
-              />
-            </label>
+        <section aria-labelledby="plan-scheme" className="border-t border-gp-line px-5 pb-3 pt-4">
+          <SectionLabel id="plan-scheme">Схема посадки</SectionLabel>
+          <div role="radiogroup" aria-labelledby="plan-scheme" className="-mx-3 mt-2 flex flex-col gap-0.5">
+            {PLAN_PRESETS.map((preset) => {
+              const on = activePreset === preset.key;
+              return (
+                <button
+                  key={preset.key}
+                  role="radio"
+                  aria-checked={on}
+                  disabled={!hasProject}
+                  onClick={() => applyPreset(preset.settings)}
+                  className={cn("flex w-full gap-3 rounded-lg p-3 text-left transition-colors hover:bg-gp-hover disabled:opacity-40", on && "bg-gp-hover")}
+                >
+                  <span className={cn("mt-0.5 h-4 w-4 flex-none rounded-full border-solid", on ? "border-[5px] border-gp-accent" : "border-[1.5px] border-gp-text-4")} aria-hidden />
+                  <span>
+                    <span className="block text-sm font-medium text-gp-text">{preset.title}</span>
+                    <span className="mt-0.5 block text-[13px] leading-5 text-gp-text-2">{preset.note}</span>
+                  </span>
+                </button>
+              );
+            })}
           </div>
-          <div className="mt-3 flex flex-col gap-1">
-            <Toggle
-              checked={treeRows === 2}
-              onChange={(v) => onTreeRowsChange(v ? 2 : 1)}
-              disabled={!treesOn}
-              title="743-ПП табл. 3.6.2: двухрядная посадка, интервал 7–8 м, второй ряд в шахматном порядке"
-            >
-              Двухрядная аллея вдоль улиц
-            </Toggle>
-            <Toggle
-              checked={treesInPaving}
-              onChange={onTreesInPavingChange}
-              disabled={!treesOn}
-              title="743-ПП п. 9.8: околоствольное пространство Ø 2 м с приствольной решёткой; остальные отступы не меняются"
-            >
-              Деревья в покрытии тротуара <span className="text-gp-text-3">(решётка Ø 2 м)</span>
-            </Toggle>
-          </div>
+          {activePreset === null && <p className="mt-1 text-[13px] leading-5 text-gp-text-3">Свои настройки — они в «Тонкой настройке» ниже.</p>}
+          <button
+            onClick={() => setFineOpen((v) => !v)}
+            aria-expanded={fineOpen}
+            className="mt-1 flex min-h-9 w-full items-center gap-1.5 text-left text-[13px] text-gp-text-2 hover:text-gp-text"
+          >
+            <ChevronRight className={cn("h-4 w-4 transition-transform", fineOpen && "rotate-90")} aria-hidden />
+            Тонкая настройка: интервалы, способ выбора мест
+          </button>
         </section>
 
-        <section aria-labelledby="plan-scoring" className="border-t border-gp-line px-5 pb-5 pt-4">
-          <SectionLabel id="plan-scoring">Выбор лучших мест</SectionLabel>
-          <div role="group" aria-labelledby="plan-scoring" className="mt-2 grid grid-cols-2 rounded-lg border border-gp-border p-0.5 text-[13px]">
-            {(["heuristic", "ml"] as ScoringMode[]).map((mode) => (
-              <button
-                key={mode}
-                onClick={() => onScoringModeChange(mode)}
-                aria-pressed={scoringMode === mode}
-                title={
-                  mode === "heuristic"
-                    ? "Формула: запас по отступам, удалённость от существующей зелени"
-                    : "Модель, обученная на посадочных чертежах проектировщиков 10 улиц пилота: из допустимых мест деревья ставятся туда, где их ставят проектировщики"
-                }
-                className={cn("h-8 rounded-md px-2 font-medium transition-colors", scoringMode === mode ? "bg-gp-border text-gp-text" : "text-gp-text-2 hover:text-gp-text")}
-              >
-                {mode === "heuristic" ? "Формула" : "ML-модель"}
-              </button>
-            ))}
-          </div>
-        </section>
+        {fineOpen && (
+          <>
+            <section aria-labelledby="plan-spacing" className="border-t border-gp-line px-5 pb-4 pt-4">
+              <SectionLabel id="plan-spacing">Интервалы, м</SectionLabel>
+              <div className="mt-2 grid grid-cols-2 gap-3">
+                <label className="flex flex-col gap-1.5 text-[13px] text-gp-text-3">
+                  Деревья
+                  <input
+                    type="number"
+                    step={0.5}
+                    min={0.5}
+                    max={15}
+                    value={treeSpacingM ?? ""}
+                    onChange={(e) => onTreeSpacingMChange(e.target.value === "" ? undefined : Number(e.target.value))}
+                    disabled={!treesOn}
+                    // По норме интервал задаёт класс кроны породы, а не одно число;
+                    // своё значение только раздвигает деревья (geo_engine/planner.py).
+                    placeholder="3–8 (по кроне)"
+                    title="По норме — по классу кроны: 8 м широкая, 5 м средняя, 3 м узкая (МГСН 1.02-02 п. 4.2.9.2). Своё значение может только раздвинуть деревья, ближе нормы их не поставить."
+                    className="h-10 rounded-lg border border-gp-border bg-gp-field px-3 font-mono text-sm text-gp-text placeholder:font-sans placeholder:text-gp-text-4 disabled:opacity-40"
+                  />
+                </label>
+                <label className="flex flex-col gap-1.5 text-[13px] text-gp-text-3">
+                  Кустарник
+                  <input
+                    type="number"
+                    step={0.1}
+                    min={0.3}
+                    max={10}
+                    value={shrubSpacingM ?? ""}
+                    onChange={(e) => onShrubSpacingMChange(e.target.value === "" ? undefined : Number(e.target.value))}
+                    disabled={!shrubsOn}
+                    // Почти весь кустарник — живая изгородь, и интервал пользователя
+                    // заменяет именно её шаг (planner.IN_ROW_PITCH_M), а не 3 м
+                    // из planting_norms.yaml.
+                    placeholder="0,5 (изгородь)"
+                    title="Шаг кустарника в живой изгороди: по норме 0,5 м (743-ПП табл. 3.6.2). Куртины сажаются по плотности породы (515-ПП табл. 5)."
+                    className="h-10 rounded-lg border border-gp-border bg-gp-field px-3 font-mono text-sm text-gp-text placeholder:font-sans placeholder:text-gp-text-4 disabled:opacity-40"
+                  />
+                </label>
+              </div>
+              <div className="mt-3 flex flex-col gap-1">
+                <Toggle
+                  checked={treeRows === 2}
+                  onChange={(v) => onTreeRowsChange(v ? 2 : 1)}
+                  disabled={!treesOn}
+                  title="743-ПП табл. 3.6.2: двухрядная посадка, интервал 7–8 м, второй ряд в шахматном порядке"
+                >
+                  Двухрядная аллея вдоль улиц
+                </Toggle>
+                <Toggle
+                  checked={treesInPaving}
+                  onChange={onTreesInPavingChange}
+                  disabled={!treesOn}
+                  title="743-ПП п. 9.8: околоствольное пространство Ø 2 м с приствольной решёткой; остальные отступы не меняются"
+                >
+                  Деревья в покрытии тротуара <span className="text-gp-text-3">(решётка Ø 2 м)</span>
+                </Toggle>
+              </div>
+            </section>
+
+            <section aria-labelledby="plan-scoring" className="border-t border-gp-line px-5 pb-5 pt-4">
+              <SectionLabel id="plan-scoring">Выбор лучших мест</SectionLabel>
+              <div role="group" aria-labelledby="plan-scoring" className="mt-2 grid grid-cols-2 rounded-lg border border-gp-border p-0.5 text-[13px]">
+                {(["heuristic", "ml"] as ScoringMode[]).map((mode) => (
+                  <button
+                    key={mode}
+                    onClick={() => onScoringModeChange(mode)}
+                    aria-pressed={scoringMode === mode}
+                    title={
+                      mode === "heuristic"
+                        ? "Формула: запас по отступам, удалённость от существующей зелени"
+                        : "Модель, обученная на посадочных чертежах проектировщиков 10 улиц пилота: из допустимых мест деревья ставятся туда, где их ставят проектировщики"
+                    }
+                    className={cn("h-8 rounded-md px-2 font-medium transition-colors", scoringMode === mode ? "bg-gp-border text-gp-text" : "text-gp-text-2 hover:text-gp-text")}
+                  >
+                    {mode === "heuristic" ? "Формула" : "ML-модель"}
+                  </button>
+                ))}
+              </div>
+            </section>
+          </>
+        )}
       </div>
 
       <div className="flex-none border-t border-gp-line px-5 pb-5 pt-4">

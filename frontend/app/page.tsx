@@ -3,7 +3,14 @@
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ArrowRight,
+  Box,
   CheckCheck,
+  Download,
+  FileText,
+  Map as MapIcon,
+  MousePointer2,
+  PanelLeft,
   Redo2,
   Shrub,
   SquareDashedMousePointer,
@@ -16,8 +23,10 @@ import type { Map as LeafletMap } from "leaflet";
 
 import { AssistantChat } from "@/components/AssistantChat";
 import { CheckPanel } from "@/components/CheckPanel";
+import { CommandPalette } from "@/components/CommandPalette";
 import { ContextMenu, type ContextMenuEntry } from "@/components/ContextMenu";
 import { DraftPanel } from "@/components/DraftPanel";
+import { ExportDialog } from "@/components/ExportDialog";
 import { Header, type Stage } from "@/components/Header";
 import { InspectorPanel, type InspectedItem } from "@/components/InspectorPanel";
 import { MapToolbar } from "@/components/map/MapToolbar";
@@ -36,6 +45,7 @@ import {
   type AssistantCommand,
   type AssistantGenerationSettings,
   type AssistantSelection,
+  type ExportOptions,
   type GeoJSONFeatureCollection,
   type ItemCompliance,
   type PlantingType,
@@ -53,6 +63,7 @@ import {
   PLANTING_GEN,
   selectedText,
   settingsFromAction,
+  suggestionChips,
   violationsSelectedText,
   type CommandResult,
   type SelectTarget,
@@ -67,6 +78,7 @@ import type { Season } from "@/lib/mapStyle";
 import { boundsOfItems } from "@/lib/planIndex";
 import { recipeForPlan } from "@/lib/planRecipes";
 import { computePlanStats } from "@/lib/planStats";
+import type { Command } from "@/lib/commands";
 import { errorMessage, toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
@@ -198,9 +210,28 @@ export default function Home() {
     setAssistantUnread(false);
   }
 
+  // Диалог «Перед экспортом» и палитра команд Ctrl+K. Пока любая открыта,
+  // хоткеи карты молчат (useKeyboardShortcuts: suspended).
+  const [exportOpen, setExportOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  // Вопрос Юне из палитры: каждый новый seq — одно сообщение (AssistantChat).
+  const [askRequest, setAskRequest] = useState<{ text: string; seq: number } | null>(null);
+
+  function askYuna(text: string) {
+    setAssistantOpen(true);
+    setAssistantUnread(false);
+    setAskRequest((prev) => ({ text, seq: (prev?.seq ?? 0) + 1 }));
+  }
+
   // Leaflet-карта наружу (MapView.tsx::MapBridge): ей пользуются зум и
   // статус-строка вне контейнера карты. В 3D — null.
   const [leafletMap, setLeafletMap] = useState<LeafletMap | null>(null);
+
+  // Подпись клавиши палитры команд в шапке: на Mac это ⌘K (работают обе).
+  const [paletteHint, setPaletteHint] = useState("Ctrl K");
+  useEffect(() => {
+    if (/Mac|iPhone|iPad/.test(navigator.platform)) setPaletteHint("⌘K");
+  }, []);
 
   // Подсказка при наведении — только там, где есть наведение (не тач).
   const [hoverCapable, setHoverCapable] = useState(false);
@@ -356,8 +387,11 @@ export default function Home() {
     selectTool,
     selectAll: selection.selectAll,
     escape: handleEscape,
+    openPalette: () => setPaletteOpen((open) => !open),
+    nextViolation: goToNextViolation,
     hasPlan: plan !== null,
     hasSelection: selection.selectedIds.size > 0,
+    suspended: exportOpen || paletteOpen,
   });
 
   const hasSelection = selection.selectedIds.size > 0;
@@ -865,6 +899,199 @@ export default function Home() {
 
   const canEditPlan = plan !== null && !editing.editBusy;
   const violationPlants = editing.violations ? editing.violationIds.size : null;
+
+  // --- экспорт: диалог «Перед экспортом» ---
+
+  function openExport() {
+    if (plan) setExportOpen(true);
+  }
+
+  async function exportWithOptions(options: ExportOptions) {
+    try {
+      await session.handleExportDxf(options);
+    } catch (e) {
+      toast.error(errorMessage(e));
+    }
+  }
+
+  /** Показать на 2D-карте с включённым планом — выделение видно только там. */
+  function showOnMap(ids: string[]) {
+    const index = planIndex;
+    if (!index || ids.length === 0) return;
+    setShowPlan(true);
+    setView3d(false);
+    selection.setSelection(ids);
+    const box = boundsOfItems(index, ids);
+    if (box) setFitRequest({ box, ids });
+  }
+
+  function fixViolationsFromExport() {
+    setExportOpen(false);
+    setStage("check");
+    setSidebarOpen(true);
+    const first = editing.violations?.[0];
+    if (first) {
+      setShowPlan(true);
+      setView3d(false);
+      selection.focusItem(first.item_id);
+    }
+  }
+
+  // «Версия N» в диалоге — номер плана по времени создания среди версий проекта.
+  const versionNumber = plan ? [...plans].sort((a, b) => a.created_at.localeCompare(b.created_at)).findIndex((p) => p.plan_id === plan.plan_id) + 1 : 0;
+
+  // --- палитра команд (Ctrl+K) ---
+
+  /** N: к следующему нарушению по кругу; если выделено одно из них — к
+   * следующему за ним. */
+  function goToNextViolation() {
+    if (!plan) return;
+    if (editing.violations === null) {
+      toast.info(editing.validating ? "Нормативы ещё проверяются — попробуйте через пару секунд." : "Нормативы ещё не проверены.");
+      return;
+    }
+    // Одна посадка может нарушать норму дважды (отступ и интервал) — в обходе она одна.
+    const ids = [...new Set(editing.violations.map((v) => v.item_id))].filter((id) => planIndex?.has(id));
+    if (ids.length === 0) {
+      toast.info("Нарушений нет — все посадки в норме.");
+      return;
+    }
+    const current = singleSelectedId ? ids.indexOf(singleSelectedId) : -1;
+    setShowPlan(true);
+    setView3d(false);
+    selection.focusItem(ids[(current + 1) % ids.length]);
+  }
+
+  /** «Сгенерировать с текущими настройками» из палитры: те же поля, что у
+   * кнопки панели, и тот же вопрос о границе заказа. На вкладку «План» — чтобы
+   * ход генерации был виден. */
+  async function generateFromPalette() {
+    if (!project) return;
+    setStage("plan");
+    setSidebarOpen(true);
+    if (session.generating) {
+      toast.info("Генерация уже идёт — дождитесь её.");
+      return;
+    }
+    if (project.territory_source === "order_boundary" && !project.use_order_boundary) {
+      setConsentRequest((n) => n + 1);
+      return;
+    }
+    try {
+      await session.handleGenerate(plantingTypes, scoringMode, { treeSpacingM, shrubSpacingM, treeRows, treesInPaving });
+      setStage("check");
+    } catch (e) {
+      toast.error(errorMessage(e));
+    }
+  }
+
+  const paletteCommands: Command[] = [];
+  if (paletteOpen) {
+    const add = (command: Command | false) => command && paletteCommands.push(command);
+    const has = plan !== null;
+    add(has && Boolean(violationPlants) && {
+      id: "select-violations",
+      title: "Выделить все с нарушениями",
+      keywords: ["нарушения", "ошибки", "проблемы", "выделить"],
+      meta: String(violationPlants),
+      dot: true,
+      run: () => {
+        const picked = selectByAssistant("violations");
+        if (!picked.result.ok) toast.info(picked.result.text);
+      },
+    });
+    add(has && {
+      id: "next-violation",
+      title: "Перейти к следующему нарушению",
+      keywords: ["дальше", "следующее", "нарушения", "ошибка"],
+      meta: "N",
+      icon: ArrowRight,
+      run: goToNextViolation,
+    });
+    add(has && { id: "export", title: "Экспорт DXF…", keywords: ["скачать", "выгрузить", "файл", "чертёж"], icon: Download, run: openExport });
+    add(has && {
+      id: "report-json",
+      title: "Скачать отчёт обоснования посадок (JSON)",
+      keywords: ["отчёт", "обоснование", "нормы"],
+      icon: FileText,
+      run: () => downloadComplianceReport("json").catch((e) => toast.error(errorMessage(e))),
+    });
+    add(has && {
+      id: "report-csv",
+      title: "Скачать отчёт обоснования посадок (CSV для Excel)",
+      keywords: ["отчёт", "обоснование", "таблица", "excel"],
+      icon: FileText,
+      run: () => downloadComplianceReport("csv").catch((e) => toast.error(errorMessage(e))),
+    });
+    add(has && {
+      id: "toggle-3d",
+      title: view3d ? "Вернуться на 2D-карту" : "Показать в 3D",
+      keywords: ["вид", "объём", "карта", "3d", "2d"],
+      icon: view3d ? MapIcon : Box,
+      run: toggleView3d,
+    });
+    add(Boolean(project) && !session.generating && {
+      id: "generate",
+      title: plan ? "Сгенерировать новую версию плана" : "Сгенерировать план",
+      keywords: ["построить", "посадить", "пересчитать", "генерация"],
+      run: () => void generateFromPalette(),
+    });
+    add(has && editing.canUndo && !editing.editBusy && { id: "undo", title: "Отменить", keywords: ["назад", "откатить"], meta: "Ctrl+Z", icon: Undo2, run: () => editing.undo() });
+    add(has && editing.canRedo && !editing.editBusy && { id: "redo", title: "Повторить", keywords: ["вперёд", "вернуть"], meta: "Ctrl+Y", icon: Redo2, run: editing.redo });
+    add(has && hasSelection && canEditPlan && {
+      id: "delete",
+      title: "Удалить выделенное",
+      keywords: ["убрать", "стереть"],
+      meta: "Del",
+      icon: Trash2,
+      run: () => editing.handleDeleteSelection(selection.selectedIds),
+    });
+    add(has && hasSelection && canEditPlan && {
+      id: "to-tree",
+      title: "Сделать выделенное деревом",
+      keywords: ["тип", "дерево"],
+      meta: "1",
+      icon: TreeDeciduous,
+      run: () => editing.handleRetypeSelection(selection.selectedIds, planIndex, "tree"),
+    });
+    add(has && hasSelection && canEditPlan && {
+      id: "to-shrub",
+      title: "Сделать выделенное кустарником",
+      keywords: ["тип", "куст"],
+      meta: "2",
+      icon: Shrub,
+      run: () => editing.handleRetypeSelection(selection.selectedIds, planIndex, "shrub"),
+    });
+    add(has && { id: "select-all", title: "Выделить всё", meta: "Ctrl+A", icon: CheckCheck, run: selection.selectAll });
+    add(hasSelection && { id: "clear-selection", title: "Снять выделение", meta: "Esc", icon: X, run: selection.clear });
+    add(has && !view3d && {
+      id: "tool-box",
+      title: selection.selectMode ? "Выключить режим рамки" : "Режим рамки: выделять протяжкой",
+      keywords: ["выделение", "инструмент"],
+      meta: "S",
+      icon: SquareDashedMousePointer,
+      run: toggleSelectMode,
+    });
+    add(has && !view3d && selection.selectMode && { id: "tool-select", title: "Инструмент «Выбор»", meta: "V", icon: MousePointer2, run: selectTool });
+    add(Boolean(project) && { id: "stage-draft", title: "Перейти к чертежу", keywords: ["загрузка", "вкладка"], run: () => handleStageChange("draft") });
+    add(Boolean(project) && { id: "stage-plan", title: "Перейти к настройкам плана", keywords: ["генерация", "схема", "вкладка"], run: () => handleStageChange("plan") });
+    add(has && { id: "stage-check", title: "Перейти к проверке", keywords: ["нарушения", "вкладка", "состав"], run: () => handleStageChange("check") });
+    add({ id: "toggle-panel", title: sidebarOpen ? "Скрыть левую панель" : "Показать левую панель", icon: PanelLeft, run: () => setSidebarOpen((v) => !v) });
+    add({
+      id: "toggle-yuna",
+      title: assistantOpen ? "Закрыть Юну" : "Открыть Юну",
+      keywords: ["помощник", "чат"],
+      run: toggleAssistant,
+    });
+  }
+  const paletteQuestions = suggestionChips({
+    hasProject: project !== null && !session.projectLost,
+    hasPlan: plan !== null,
+    settings: generationSettings,
+    planTrees: planStats?.trees ?? 0,
+    violationsCount: violationPlants,
+    selection: assistantSelection,
+  });
   // Правая колонка: Юна, если открыта, иначе — инспектор выделения (только 2D).
   const showInspector = !view3d && selection.summary !== null && !assistantOpen;
 
@@ -882,14 +1109,6 @@ export default function Home() {
   const boundary = legendGroup("territory");
   if (boundary) legend.push({ key: "territory", label: "Граница работ", swatch: "dash", color: boundary.color });
 
-  async function exportDxfWithToast() {
-    try {
-      await session.handleExportDxf();
-    } catch (e) {
-      toast.error(errorMessage(e));
-    }
-  }
-
   return (
     <div className="flex h-full w-full flex-col bg-gp-panel text-gp-text">
       <Header
@@ -903,7 +1122,8 @@ export default function Home() {
         assistantOpen={assistantOpen}
         assistantUnread={assistantUnread}
         onToggleAssistant={toggleAssistant}
-        onExport={() => void exportDxfWithToast()}
+        paletteHint={paletteHint}
+        onExport={openExport}
         exportDisabled={plan === null}
         exporting={session.exporting}
         onNewProject={session.handleClearAll}
@@ -986,7 +1206,7 @@ export default function Home() {
                   onSelectPlan={session.handleSelectPlan}
                   onDeletePlan={session.handleDeletePlan}
                   exporting={session.exporting}
-                  onExportDxf={session.handleExportDxf}
+                  onOpenExport={openExport}
                   onDownloadComplianceReport={(format) => {
                     downloadComplianceReport(format).catch((e) => toast.error(errorMessage(e)));
                   }}
@@ -1106,6 +1326,16 @@ export default function Home() {
           open={assistantOpen}
           onClose={() => setAssistantOpen(false)}
           onUnread={() => setAssistantUnread(true)}
+          selectionLabel={
+            selection.summary?.single
+              ? inspectedItem?.species && inspectedItem.species !== "default"
+                ? inspectedItem.species
+                : PLANTING_TYPE_LABELS[selection.summary.single.type]
+              : selection.summary
+                ? countLabel(selection.summary.total, OBJECT_FORMS)
+                : undefined
+          }
+          askRequest={askRequest}
           projectLost={session.projectLost}
           onCommands={handleAssistantCommands}
         />
@@ -1118,6 +1348,29 @@ export default function Home() {
           title={hasSelection ? `Выделено: ${countLabel(selection.selectedIds.size, OBJECT_FORMS)}` : "Ничего не выделено"}
           entries={contextMenuEntries}
           onClose={closeContextMenu}
+        />
+      )}
+      {exportOpen && plan && project && (
+        <ExportDialog
+          projectId={project.id}
+          planId={plan.plan_id}
+          versionLabel={versionNumber > 0 ? `Версия ${versionNumber}` : "Версия плана"}
+          exporting={session.exporting}
+          onClose={() => setExportOpen(false)}
+          onFixViolations={fixViolationsFromExport}
+          onShowItems={(ids) => {
+            setExportOpen(false);
+            showOnMap(ids);
+          }}
+          onExport={exportWithOptions}
+        />
+      )}
+      {paletteOpen && (
+        <CommandPalette
+          commands={paletteCommands}
+          questions={paletteQuestions}
+          onAsk={askYuna}
+          onClose={() => setPaletteOpen(false)}
         />
       )}
       <Toaster />

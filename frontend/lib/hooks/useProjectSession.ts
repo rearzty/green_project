@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   deletePlan,
   exportDxf,
+  type ExportOptions,
   generatePlan,
   getLayersRaster,
   getPlan,
@@ -278,11 +279,11 @@ export function useProjectSession() {
    * simple <a href> anymore (the previous design): writing a real-scale
    * plan can take minutes, too long for a link the browser might time out
    * waiting on. */
-  async function handleExportDxf() {
+  async function handleExportDxf(options?: ExportOptions) {
     if (!project || !plan) return;
     setExporting(true);
     try {
-      const downloadUrl = await exportDxf(project.id, plan.plan_id);
+      const downloadUrl = await exportDxf(project.id, plan.plan_id, { export: options });
       const link = document.createElement("a");
       link.href = downloadUrl;
       document.body.appendChild(link);

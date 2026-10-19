@@ -486,8 +486,52 @@ interface ExportJobStatus {
   error: string | null;
 }
 
-function startDxfExport(projectId: string, planId: string): Promise<{ job_id: string }> {
-  return request(`/api/projects/${projectId}/plans/${planId}/export-dxf`, { method: "POST" });
+/** Что уйдёт в файл (диалог «Перед экспортом»). Без параметров — как раньше:
+ * все слои плана, план поверх исходного чертежа, отчёт обоснования. */
+export interface ExportOptions {
+  /** Слои результата; undefined — все. «violations» — кольца вокруг нарушений. */
+  layers?: ExportLayerKey[];
+  includeBase?: boolean;
+  includeReport?: boolean;
+}
+
+export type ExportLayerKey = "tree" | "shrub" | "lawn" | "violations";
+
+function startDxfExport(projectId: string, planId: string, options?: ExportOptions): Promise<{ job_id: string }> {
+  if (!options) return request(`/api/projects/${projectId}/plans/${planId}/export-dxf`, { method: "POST" });
+  return postJson(`/api/projects/${projectId}/plans/${planId}/export-dxf`, {
+    layers: options.layers,
+    include_base: options.includeBase ?? true,
+    include_report: options.includeReport ?? true,
+  });
+}
+
+export interface ExportSummaryLayer {
+  key: ExportLayerKey;
+  /** Имя слоя в DXF — ровно то, что пишет экспорт. */
+  name: string;
+  count: number;
+  /** Только у газона, м². */
+  area_m2: number | null;
+}
+
+export interface ExportSummary {
+  total_items: number;
+  /** Посадок, не прошедших проверку отступов (те же, что в отчёте). */
+  violations: number;
+  /** Ссылки на нормы, у которых число взято не из текста акта. */
+  unverified_citations: { citation: string; items: number; item_ids: string[] }[];
+  layers: ExportSummaryLayer[];
+  /** Исходный чертёж доступен — план ляжет на подоснову в тех же координатах. */
+  base_available: boolean;
+  /** Сколько слоёв исходного чертежа прочиталось; null — неизвестно. */
+  base_layer_count: number | null;
+}
+
+/** Сводка для диалога «Перед экспортом». Считается на сервере тем же
+ * обоснованием, что пишется в отчёт, — числа совпадают с файлом. */
+export async function getExportSummary(projectId: string, planId: string): Promise<ExportSummary> {
+  return request(`/api/projects/${projectId}/plans/${planId}/export-summary`);
 }
 
 function getDxfExportStatus(projectId: string, planId: string, jobId: string): Promise<ExportJobStatus> {
@@ -505,8 +549,12 @@ const EXPORT_POLL_INTERVAL_MS = 700;
  * from the URL (see useProjectSession.ts::handleExportDxf) so a
  * multi-hundred-MB file streams straight to disk instead of through a JS
  * blob. */
-export async function exportDxf(projectId: string, planId: string, options?: { signal?: AbortSignal }): Promise<string> {
-  const { job_id } = await startDxfExport(projectId, planId);
+export async function exportDxf(
+  projectId: string,
+  planId: string,
+  options?: { signal?: AbortSignal; export?: ExportOptions }
+): Promise<string> {
+  const { job_id } = await startDxfExport(projectId, planId, options?.export);
   for (;;) {
     if (options?.signal?.aborted) throw new ApiError("Экспорт отменён.", 0);
     const status = await getDxfExportStatus(projectId, planId, job_id);

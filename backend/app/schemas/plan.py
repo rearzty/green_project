@@ -62,6 +62,53 @@ class ExportJobOut(BaseModel):
     job_id: str
 
 
+ExportLayerKey = Literal["tree", "shrub", "lawn", "violations"]
+
+
+class ExportOptionsIn(BaseModel):
+    """Что уйдёт в файл (диалог «Перед экспортом»). Всё необязательное: пустое
+    тело — прежний экспорт целиком."""
+
+    # Слои результата; None — все. «violations» — кольца вокруг нарушений.
+    layers: list[ExportLayerKey] | None = None
+    # План поверх исходного чертежа (и файлы его внешних ссылок рядом). Без
+    # подосновы план пишется отдельным чертежом.
+    include_base: bool = True
+    # plan.report.json и plan.trace.csv — обоснование каждой посадки.
+    include_report: bool = True
+
+
+class ExportLayerOut(BaseModel):
+    key: ExportLayerKey
+    # Имя слоя в DXF — ровно то, что пишет экспорт (geo_engine/io/dxf_writer.py).
+    name: str
+    count: int
+    # Только у газона: площадь, м².
+    area_m2: float | None = None
+
+
+class UnverifiedCitationOut(BaseModel):
+    citation: str
+    items: int
+    # Посадки, у которых решающее ограничение держится на этой ссылке (не
+    # больше MAX_UNVERIFIED_ITEM_IDS) — чтобы показать их на карте.
+    item_ids: list[str]
+
+
+class ExportSummaryOut(BaseModel):
+    """Сводка для диалога «Перед экспортом»: считается тем же `explain_items`,
+    что пишет отчёт, — числа в диалоге и в скачанном файле не расходятся."""
+
+    total_items: int
+    violations: int
+    unverified_citations: list[UnverifiedCitationOut]
+    layers: list[ExportLayerOut]
+    # Исходный чертёж доступен: план ляжет на подоснову в тех же координатах.
+    base_available: bool
+    # Сколько слоёв исходного чертежа прочиталось (None — неизвестно).
+    base_layer_count: int | None = None
+
+
 ExportJobState = Literal["pending", "done", "error"]
 
 

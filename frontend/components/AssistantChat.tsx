@@ -77,6 +77,13 @@ export interface AssistantChatProps {
   onClose: () => void;
   /** Юна ответила, пока колонка была закрыта: у кнопки в шапке появляется точка. */
   onUnread: () => void;
+  /** Как называется то, что выделено, — для метки-контекста у поля ввода
+   * («Липа мелколистная», «14 объектов»). */
+  selectionLabel?: string;
+  /** Вопрос извне (палитра команд, Tab): каждый новый `seq` отправляется как
+   * сообщение от пользователя. Чат смонтирован всегда, так что вопрос уйдёт и
+   * при закрытой колонке — она открывается страницей. */
+  askRequest?: { text: string; seq: number } | null;
   /** Сервер ответил, что этого проекта у него больше нет (перезапуск). */
   projectLost?: boolean;
   /** Выполнить команды ответа по порядку (app/page.tsx); не бросает —
@@ -89,6 +96,7 @@ export interface AssistantChatProps {
  * разговором, а для «сделай их кустами» хватает и пары последних. */
 const HISTORY_LIMIT = 20;
 const NO_ENTRIES: ChatEntry[] = [];
+const NO_IDS: ReadonlySet<string> = new Set();
 /** Сколько готовых вопросов показываем под разговором. */
 const MAX_QUESTION_ROWS = 4;
 
@@ -195,6 +203,8 @@ export function AssistantChat({
   open,
   onClose,
   onUnread,
+  selectionLabel,
+  askRequest = null,
   projectLost = false,
   onCommands,
 }: AssistantChatProps) {
@@ -212,6 +222,11 @@ export function AssistantChat({
   // initial via onError so the widget works identically before and after
   // that file shows up, no code change needed either way.
   const [avatarError, setAvatarError] = useState(false);
+  // Метка-контекст у поля ввода снята крестиком: пока выделение то же самое,
+  // Юне оно не передаётся. useSelection на каждое изменение создаёт новый Set,
+  // так что «то же самое» — это та же ссылка, и новое выделение метку
+  // возвращает само.
+  const [dismissedContext, setDismissedContext] = useState<ReadonlySet<string> | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // Ref, а не модульная переменная: Fast Refresh пересоздаёт модуль, но не
@@ -230,6 +245,18 @@ export function AssistantChat({
   const busy = phase !== "idle" || generating || undoing;
   // Проекта на сервере больше нет: любая просьба ответила бы тем же 404.
   const canTalk = Boolean(projectId) && !projectLost;
+
+  // Что Юна услышит про выделение. Метку сняли — нули, чтобы на «удали
+  // выделенные» она честно ответила, что ничего не выделено, а не работала с
+  // тем, от чего пользователь сам отказался.
+  const contextOn = selectedIds.size > 0 && dismissedContext !== selectedIds;
+  const sentSelectedIds: ReadonlySet<string> = contextOn ? selectedIds : NO_IDS;
+  const sentSelectedItemId = contextOn ? selectedItemId : undefined;
+  const sentSelection: AssistantSelection | undefined = contextOn
+    ? selection
+    : selection
+      ? { count: 0, trees: 0, shrubs: 0, lawns: 0 }
+      : undefined;
 
   useEffect(() => {
     // Отмены — замыкания над планом прошлого проекта, к этому не относятся.
@@ -300,7 +327,7 @@ export function AssistantChat({
     // Пока она отвечает, карта не заблокирована: Ctrl+A до ответа на «удали
     // выделенные» не должен превратить его в «удали всё». useSelection
     // каждый раз создаёт новый Set, так что ссылка — уже снимок.
-    const sentSelection = selectedIds;
+    const snapshotIds = sentSelectedIds;
     // The backend holds no conversation state of its own (see
     // assistant_service.py) -- the transcript rides along on every message,
     // built from what's already on screen rather than a second copy.
@@ -310,7 +337,13 @@ export function AssistantChat({
     try {
       let result: AssistantMessageResult;
       try {
-        result = await askAssistant(forProject, text, history, settings, { planId, selectedItemId, selection, violationsCount, view });
+        result = await askAssistant(forProject, text, history, settings, {
+          planId,
+          selectedItemId: sentSelectedItemId,
+          selection: sentSelection,
+          violationsCount,
+          view,
+        });
       } catch (e) {
         // Единственный 404 этого маршрута — «проекта нет» (ProjectDep):
         // сервер перезапускался, и «Повторить» не поможет никогда.
@@ -333,7 +366,7 @@ export function AssistantChat({
       setPhase("acting");
       let results: CommandResult[];
       try {
-        results = await onCommands(commands, { selectedIds: sentSelection });
+        results = await onCommands(commands, { selectedIds: snapshotIds });
       } catch (e) {
         results = [{ ok: false, text: errorMessage(e) }];
       }
@@ -413,13 +446,25 @@ export function AssistantChat({
     return <img src="/yuna-avatar.png" alt="Юна" className={cn(className, "rounded-full object-cover")} onError={() => setAvatarError(true)} />;
   }
 
+  // Вопрос извне (палитра команд): каждый новый seq — одно сообщение.
+  // Обработанный seq запоминаем в ref, а не в состоянии: повторный рендер с тем
+  // же запросом не должен отправить его второй раз.
+  const handledAskRef = useRef(0);
+  useEffect(() => {
+    if (!askRequest || askRequest.seq === handledAskRef.current) return;
+    handledAskRef.current = askRequest.seq;
+    void send(askRequest.text);
+    // send — замыкание этого рендера; запрос обрабатывается ровно один раз
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [askRequest?.seq]);
+
   const chips = suggestionChips({
     hasProject: canTalk,
     hasPlan: Boolean(planId),
     settings,
     planTrees,
     violationsCount,
-    selection,
+    selection: sentSelection,
   });
 
   function renderResult(entry: ChatEntry, line: ResultLine, index: number) {
@@ -568,7 +613,9 @@ export function AssistantChat({
       <div className="flex-none border-t border-gp-line px-5 pb-5 pt-3">
         {chips.length > 0 && (
           <>
-            <p className="mb-1 text-[13px] text-gp-text-2">{entries.length === 0 ? "Можно спросить" : "Ещё можно"}</p>
+            <p className="mb-1 text-[13px] text-gp-text-2">
+              {contextOn ? "Про выделенное и не только" : entries.length === 0 ? "Можно спросить" : "Ещё можно"}
+            </p>
             <div className="-mx-3 mb-3">
               {chips.slice(0, MAX_QUESTION_ROWS).map((text) => (
                 <QuestionRow key={text} text={text} disabled={busy} onClick={() => void send(text)} />
@@ -577,6 +624,23 @@ export function AssistantChat({
           </>
         )}
         <div className="rounded-[10px] border border-gp-border bg-gp-field focus-within:border-gp-accent-soft-border">
+          {contextOn && (
+            // Метка-контекст: что Юна услышит как «выделенное». Крестик снимает
+            // её — тогда вопрос уходит без выделения (см. sentSelection).
+            <div className="flex items-center gap-2 px-2.5 pt-2">
+              <span className="inline-flex h-[26px] max-w-full items-center gap-1.5 rounded-md bg-gp-selection-soft pl-2 pr-1.5 text-xs text-gp-selection-text">
+                <span className="h-[7px] w-[7px] flex-none rounded-full bg-gp-selection" aria-hidden />
+                <span className="truncate">{selectionLabel ?? "Выделено"}</span>
+                <button
+                  onClick={() => setDismissedContext(selectedIds)}
+                  className="flex h-[18px] w-[18px] flex-none items-center justify-center rounded text-gp-selection hover:bg-white/10"
+                  aria-label="Убрать контекст: спросить без выделения"
+                >
+                  <X className="h-3 w-3" strokeWidth={2} aria-hidden />
+                </button>
+              </span>
+            </div>
+          )}
           <div className="flex items-end gap-2 py-1.5 pl-3 pr-1.5">
             <label htmlFor="yuna-input" className="sr-only">
               Вопрос Юне
@@ -602,7 +666,9 @@ export function AssistantChat({
                 }
               }}
               disabled={!canTalk}
-              placeholder={projectLost ? "Загрузите чертёж заново" : projectId ? "Напишите Юне…" : "Сначала загрузите проект"}
+              placeholder={
+                projectLost ? "Загрузите чертёж заново" : !projectId ? "Сначала загрузите проект" : contextOn && selectedItemId ? "Спросите про эту посадку" : "Напишите Юне…"
+              }
               className="min-w-0 flex-1 resize-none border-0 bg-transparent py-[7px] text-[15px] leading-[22px] text-gp-text outline-none placeholder:text-gp-text-4 disabled:opacity-50"
             />
             <button

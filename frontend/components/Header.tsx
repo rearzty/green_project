@@ -31,6 +31,8 @@ export interface HeaderProps {
   /** Юна ответила, пока чат был закрыт. */
   assistantUnread: boolean;
   onToggleAssistant: () => void;
+  /** Как выглядит клавиша палитры команд на этой машине: «Ctrl K» или «⌘K». */
+  paletteHint?: string;
   onExport: () => void;
   exportDisabled: boolean;
   exporting: boolean;
@@ -51,6 +53,7 @@ export function Header({
   assistantOpen,
   assistantUnread,
   onToggleAssistant,
+  paletteHint,
   onExport,
   exportDisabled,
   exporting,
@@ -166,6 +169,7 @@ export function Header({
         >
           <span className="flex h-5 w-5 items-center justify-center rounded-full bg-[#3A4A2C] text-[11px] font-semibold text-gp-accent-text">Ю</span>
           <span className="hidden sm:inline">Юна</span>
+          {paletteHint && <span className="hidden text-[11px] font-normal text-gp-text-3 lg:inline">{paletteHint}</span>}
           {assistantUnread && !assistantOpen && (
             <span className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-gp-panel bg-gp-warn" aria-label="Есть новый ответ" />
           )}
