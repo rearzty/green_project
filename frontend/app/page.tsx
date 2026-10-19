@@ -142,22 +142,15 @@ export default function Home() {
   const [cameraCommand, setCameraCommand] = useState<CameraCommand | null>(null);
   const [autoRotate, setAutoRotate] = useState(false);
   const [walk, setWalk] = useState<WalkState>({ index: 0, total: 0 });
-  const [firstPerson, setFirstPerson] = useState(false);
   const handleCameraPose = useCallback((pose: CameraCommand["pose"]) => {
     // Перелёт заканчивает облёт: иначе камера тут же поплыла бы дальше.
     setAutoRotate(false);
-    // «Общий» и «Сверху» — это обзорная камера: из ходьбы они выходят; обход по участкам остаётся в ней.
-    if (pose === "overview" || pose === "top") setFirstPerson(false);
     setCameraCommand((previous) => ({ pose, seq: (previous?.seq ?? 0) + 1 }));
   }, []);
   // ← → в 3D — по участкам посадок, как кнопки ‹ ›. В полях ввода стрелки нужны
   // самому полю (курсор в тексте Юны), с модификаторами — браузеру/системе.
   useEffect(() => {
-    if (!view3d) setFirstPerson(false);
-  }, [view3d]);
-  useEffect(() => {
-    // От первого лица стрелки — поворот и шаг, а не «следующий участок».
-    if (!view3d || firstPerson) return;
+    if (!view3d) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
       if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
@@ -168,7 +161,7 @@ export default function Home() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [view3d, firstPerson, handleCameraPose]);
+  }, [view3d, handleCameraPose]);
   // ThreeDView is the only remaining consumer of the full vector layer
   // geometry (its building extrusion needs real polygons, not a raster) --
   // fetched lazily on the first toggle into 3D rather than unconditionally
@@ -1521,8 +1514,6 @@ export default function Home() {
                 cameraCommand={cameraCommand}
                 autoRotate={autoRotate}
                 onWalkChange={setWalk}
-                firstPerson={firstPerson}
-                onFirstPersonChange={setFirstPerson}
                 storageKey={project?.id}
               />
             ) : (
@@ -1625,11 +1616,6 @@ export default function Home() {
                 walk={walk}
                 autoRotate={autoRotate}
                 onToggleAutoRotate={() => setAutoRotate((on) => !on)}
-                firstPerson={firstPerson}
-                onToggleFirstPerson={() => {
-                  setAutoRotate(false);
-                  setFirstPerson((on) => !on);
-                }}
               />
             )}
             {!view3d && <ZoomControls map={leafletMap} />}

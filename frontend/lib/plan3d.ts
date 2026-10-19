@@ -571,32 +571,3 @@ export function pointInRing(x: number, y: number, ring: [number, number][]): boo
   }
   return inside;
 }
-
-/** «Стена» для хождения от первого лица: точка внутри контура любого здания.
- * Сначала по габаритной рамке (массивом, без обращения к вершинам), потом точно —
- * зданий в сцене сотни-тысячи, а проверка идёт на каждом кадре движения. */
-export function buildingCollider(buildings: { outer: [number, number][] }[]): (x: number, y: number) => boolean {
-  const n = buildings.length;
-  const box = new Float64Array(n * 4);
-  buildings.forEach((b, i) => {
-    let minX = Infinity;
-    let minY = Infinity;
-    let maxX = -Infinity;
-    let maxY = -Infinity;
-    for (const [x, y] of b.outer) {
-      minX = Math.min(minX, x);
-      maxX = Math.max(maxX, x);
-      minY = Math.min(minY, y);
-      maxY = Math.max(maxY, y);
-    }
-    box.set([minX, minY, maxX, maxY], i * 4);
-  });
-  return (x, y) => {
-    for (let i = 0; i < n; i++) {
-      const k = i * 4;
-      if (x < box[k] || x > box[k + 2] || y < box[k + 1] || y > box[k + 3]) continue;
-      if (pointInRing(x, y, buildings[i].outer)) return true;
-    }
-    return false;
-  };
-}

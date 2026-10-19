@@ -6,7 +6,7 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { mergeGeometries, mergeVertices } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 
 import { getPlantingNorms, type GeoJSONFeatureCollection, type PlantingNorms } from "@/lib/api";
-import { buildScene3DData, hashToUnit, MAX_3D_ITEMS, walkStops, buildingCollider, pointInRing, type Building3D, type PlantingPoint3D, type Polygon3D } from "@/lib/plan3d";
+import { buildScene3DData, hashToUnit, MAX_3D_ITEMS, walkStops, pointInRing, type Building3D, type PlantingPoint3D, type Polygon3D } from "@/lib/plan3d";
 import { lookOf, type CrownForm, type PlantLook } from "@/lib/plantLook";
 import { applySceneTheme, SEASON_PALETTES, type SceneTheme, type Season } from "@/lib/mapStyle";
 import { PLANTING_TYPE_LABELS } from "@/lib/format";
@@ -36,28 +36,6 @@ const FLY_TO_PLANT_REACH_M = 15;
  * камеры лежит ближняя плоскость отсечения. */
 const MIN_CAMERA_DISTANCE_M = 2;
 
-/** Вид от первого лица: рост наблюдателя, поле зрения, скорости. Идти по улице в
- * километр шагом 1,4 м/с слишком долго, поэтому обычная ходьба быстрее реальной,
- * а с Shift — бегом. */
-const FPV_EYE_HEIGHT_M = 1.7;
-const FPV_FOV_DEG = 70;
-const FPV_NEAR_M = 0.15;
-const FPV_WALK_SPEED_MS = 4;
-const FPV_RUN_SPEED_MS = 12;
-const FPV_TURN_RAD_S = 1.6;
-const FPV_LOOK_RAD_PER_PX = 0.0025;
-/** Максимальный шаг по времени при проверке столкновений, с. */
-const FPV_SUBSTEP_S = 0.05;
-const FPV_MAX_PITCH = 1.45;
-/** Радиус «тела» для столкновения со зданиями. */
-const FPV_BODY_RADIUS_M = 0.4;
-/** Дальше этого от участка не уйти — иначе можно потеряться в пустом поле. */
-const FPV_ROAM_M = 60;
-/** С какого расстояния подсказка показывает посадку под прицелом. */
-const FPV_AIM_RANGE_M = 45;
-const FPV_AIM_INTERVAL_MS = 140;
-/** Вход встаёт позади участка обхода, чтобы посадки были впереди, а не под ногами. */
-const FPV_START_BACK_M = 8;
 
 export interface CameraCommand {
   pose: CameraPose;
@@ -94,10 +72,6 @@ export interface ThreeDViewProps {
   autoRotate?: boolean;
   /** Сообщает, на каком участке обхода камера (для подписи «3 из 24»). */
   onWalkChange?: (state: WalkState) => void;
-  /** Вид от первого лица: ходьба WASD со столкновением со зданиями и взглядом мышью. */
-  firstPerson?: boolean;
-  /** Режим закончился сам (Esc) — страница снимает свой флаг. */
-  onFirstPersonChange?: (on: boolean) => void;
 }
 
 // Ground stacked in thin slabs (territory, then road/greenery/lawn on top)
@@ -1033,22 +1007,19 @@ function saveStoredCamera(key: string, position: THREE.Vector3, target: THREE.Ve
  * lib/plan3d.ts for how the GeoJSON is turned into local-meter geometry
  * (including what's deliberately left out -- zoning, utilities, real
  * building heights we don't have). */
-export default function ThreeDView({ layers, plan, crsVerified, season = "summer", storageKey, sceneTheme = "day", cameraCommand = null, autoRotate = false, onWalkChange, firstPerson = false, onFirstPersonChange }: ThreeDViewProps) {
+export default function ThreeDView({ layers, plan, crsVerified, season = "summer", storageKey, sceneTheme = "day", cameraCommand = null, autoRotate = false, onWalkChange }: ThreeDViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [hover, setHover] = useState<PlantHover | null>(null);
   // Что нужно командам камеры и облёту, чтобы не пересобирать сцену ради них:
   // эффект сцены кладёт сюда живые камеру и управление.
-  const viewRef = useRef<{ flyTo: (pose: CameraPose) => void; controls: OrbitControls; setFirstPerson: (on: boolean) => void } | null>(null);
+  const viewRef = useRef<{ flyTo: (pose: CameraPose) => void; controls: OrbitControls } | null>(null);
   const autoRotateRef = useRef(autoRotate);
   autoRotateRef.current = autoRotate;
   // Колбэк живёт дольше рендера (его зовёт обработчик внутри эффекта сцены) —
   // через реф, чтобы не пересобирать сцену из-за новой функции на каждый рендер.
   const onWalkChangeRef = useRef(onWalkChange);
   onWalkChangeRef.current = onWalkChange;
-  const firstPersonRef = useRef(firstPerson);
-  firstPersonRef.current = firstPerson;
-  const onFirstPersonChangeRef = useRef(onFirstPersonChange);
-  onFirstPersonChangeRef.current = onFirstPersonChange;
+
   const [norms, setNorms] = useState<PlantingNorms | undefined>(undefined);
   // Distinct from `norms` itself being set -- without this, the very first
   // render (before the fetch below resolves) would already have `data`
@@ -1335,238 +1306,8 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     onWalkChangeRef.current?.({ index: 0, total: stops.length });
     let flight: { fromPosition: THREE.Vector3; fromTarget: THREE.Vector3; toPosition: THREE.Vector3; toTarget: THREE.Vector3; startedAt: number } | null = null;
 
-    // --- вид от первого лица --------------------------------------------------
-    // Свой маленький контроллер, а не PointerLockControls: нужна ходьба с
-    // коллизией, а взгляд должен работать и без захвата мыши (зажатая кнопка) —
-    // захват браузер даёт не везде и не всегда.
-    const collides = buildingCollider(data?.buildings ?? []);
-    const roam = bounds ? { minX: bounds.minX - FPV_ROAM_M, maxX: bounds.maxX + FPV_ROAM_M, minY: bounds.minY - FPV_ROAM_M, maxY: bounds.maxY + FPV_ROAM_M } : null;
-    const isBlocked = (x: number, y: number) =>
-      collides(x, y) || collides(x + FPV_BODY_RADIUS_M, y) || collides(x - FPV_BODY_RADIUS_M, y) || collides(x, y + FPV_BODY_RADIUS_M) || collides(x, y - FPV_BODY_RADIUS_M);
-    const fpv = {
-      active: false,
-      x: 0, // координаты плана: x — на восток, y — на север (в сцене z = −y)
-      y: 0,
-      yaw: 0,
-      pitch: 0,
-      keys: new Set<string>(),
-      saved: null as { position: THREE.Vector3; target: THREE.Vector3 } | null,
-      lastTime: 0,
-      lastAim: 0,
-      lastReport: 0,
-      aimedEntry: null as PlantEntry | null,
-    };
-    const applyFpvCamera = () => {
-      camera.position.set(fpv.x, FPV_EYE_HEIGHT_M, -fpv.y);
-      camera.rotation.order = "YXZ";
-      camera.rotation.set(fpv.pitch, fpv.yaw, 0);
-    };
-    /** Свободная точка рядом с желаемой: старт не должен оказаться внутри дома. */
-    const freeSpotNear = (x: number, y: number): [number, number] => {
-      if (!isBlocked(x, y)) return [x, y];
-      for (let r = 2; r <= 40; r += 2) {
-        for (let a = 0; a < 16; a++) {
-          const nx = x + r * Math.cos((a / 16) * Math.PI * 2);
-          const ny = y + r * Math.sin((a / 16) * Math.PI * 2);
-          if (!isBlocked(nx, ny)) return [nx, ny];
-        }
-      }
-      return [x, y];
-    };
-    /** Встать у участка обхода лицом по ходу улицы (yaw: 0 — на север, + — налево). */
-    const placeAtStop = (index: number) => {
-      const stop = stops[index];
-      const [px, py] = freeSpotNear(stop.x - stop.heading[0] * FPV_START_BACK_M, stop.y - stop.heading[1] * FPV_START_BACK_M);
-      fpv.x = px;
-      fpv.y = py;
-      fpv.yaw = Math.atan2(-stop.heading[0], stop.heading[1]);
-      fpv.pitch = -0.04;
-      applyFpvCamera();
-    };
-    const setFirstPerson = (on: boolean) => {
-      if (on === fpv.active) return;
-      if (on) {
-        fpv.saved = { position: camera.position.clone(), target: controls.target.clone() };
-        flight = null;
-        controls.autoRotate = false;
-        controls.enabled = false;
-        camera.fov = FPV_FOV_DEG;
-        camera.near = FPV_NEAR_M;
-        camera.updateProjectionMatrix();
-        if (stops.length > 0) {
-          if (walkIndex < 0) {
-            // С какого участка начать: ближайший к тому, на что смотрит обзорная камера.
-            let best = 0;
-            let bestDistance = Infinity;
-            stops.forEach((stop, index) => {
-              const d = Math.hypot(stop.x - controls.target.x, stop.y + controls.target.z);
-              if (d < bestDistance) {
-                bestDistance = d;
-                best = index;
-              }
-            });
-            walkIndex = best;
-            onWalkChangeRef.current?.({ index: best + 1, total: stops.length });
-          }
-          placeAtStop(walkIndex);
-        } else {
-          const [px, py] = freeSpotNear(controls.target.x, -controls.target.z);
-          fpv.x = px;
-          fpv.y = py;
-          fpv.yaw = Math.atan2(-(camera.position.x - controls.target.x), -(camera.position.z - controls.target.z)) + Math.PI;
-          fpv.pitch = 0;
-          applyFpvCamera();
-        }
-        fpv.active = true;
-        fpv.lastTime = performance.now();
-        setHover(null);
-      } else {
-        fpv.active = false;
-        fpv.keys.clear();
-        fpv.aimedEntry = null;
-        if (document.pointerLockElement === renderer.domElement) document.exitPointerLock?.();
-        delete container.dataset.fpvState;
-        camera.fov = 55;
-        camera.near = 0.5;
-        camera.updateProjectionMatrix();
-        controls.enabled = true;
-        setHover(null);
-        // Обратно в обзорную камеру — плавно, из того места, где стоял наблюдатель.
-        if (fpv.saved) {
-          flight = { fromPosition: camera.position.clone(), fromTarget: controls.target.clone(), toPosition: fpv.saved.position, toTarget: fpv.saved.target, startedAt: performance.now() };
-        }
-      }
-    };
-    const fpvKeyActions: Record<string, string> = {
-      KeyW: "forward",
-      ArrowUp: "forward",
-      KeyS: "back",
-      ArrowDown: "back",
-      KeyA: "left",
-      KeyD: "right",
-      ArrowLeft: "turn-left",
-      ArrowRight: "turn-right",
-      ShiftLeft: "run",
-      ShiftRight: "run",
-    };
-    const inField = (target: EventTarget | null) => {
-      const el = target as HTMLElement | null;
-      return !!el && (el.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName));
-    };
-    const handleFpvKeyDown = (event: KeyboardEvent) => {
-      if (!fpv.active || inField(event.target) || event.ctrlKey || event.metaKey || event.altKey) return;
-      if (event.code === "Escape") {
-        event.stopImmediatePropagation();
-        onFirstPersonChangeRef.current?.(false);
-        return;
-      }
-      const action = fpvKeyActions[event.code];
-      if (!action) return;
-      event.preventDefault();
-      event.stopImmediatePropagation(); // W/A/S/D — это ещё и горячие клавиши страницы
-      fpv.keys.add(action);
-    };
-    const handleFpvKeyUp = (event: KeyboardEvent) => {
-      const action = fpvKeyActions[event.code];
-      if (action) fpv.keys.delete(action);
-    };
-    const handleFpvBlur = () => fpv.keys.clear();
-    const handleFpvLook = (event: PointerEvent) => {
-      if (!fpv.active) return;
-      if (document.pointerLockElement !== renderer.domElement && (event.buttons & 1) === 0) return;
-      fpv.yaw -= event.movementX * FPV_LOOK_RAD_PER_PX;
-      fpv.pitch = Math.max(-FPV_MAX_PITCH, Math.min(FPV_MAX_PITCH, fpv.pitch - event.movementY * FPV_LOOK_RAD_PER_PX));
-      applyFpvCamera();
-    };
-    const handleFpvPointerDown = (event: PointerEvent) => {
-      if (!fpv.active) return;
-      try {
-        renderer.domElement.setPointerCapture(event.pointerId);
-      } catch {
-        // pointer already gone
-      }
-    };
-    const handleFpvClick = () => {
-      if (!fpv.active || document.pointerLockElement === renderer.domElement) return;
-      try {
-        // Захват мыши — удобнее зажатой кнопки; не дали — взгляд работает и без него.
-        Promise.resolve(renderer.domElement.requestPointerLock?.()).catch(() => undefined);
-      } catch {
-        // not allowed here
-      }
-    };
-    window.addEventListener("keydown", handleFpvKeyDown, true);
-    window.addEventListener("keyup", handleFpvKeyUp, true);
-    window.addEventListener("blur", handleFpvBlur);
-    renderer.domElement.addEventListener("pointermove", handleFpvLook);
-    renderer.domElement.addEventListener("pointerdown", handleFpvPointerDown);
-    renderer.domElement.addEventListener("click", handleFpvClick);
-    /** Шаг ходьбы за кадр: скольжение вдоль стены — сначала по обеим осям, потом по одной. */
-    const updateFirstPerson = (now: number) => {
-      // Время кадра делится на подшаги: скорость не зависит от частоты кадров (на
-      // слабой машине сцена идёт в несколько кадров в секунду, и «ходьба» бы
-      // отставала от реального времени), а столкновение проверяется на каждом
-      // подшаге — через стену не перескочить и при просевшей частоте.
-      const total = Math.min(1, (now - fpv.lastTime) / 1000);
-      fpv.lastTime = now;
-      const k = fpv.keys;
-      const turn = (k.has("turn-left") ? 1 : 0) - (k.has("turn-right") ? 1 : 0);
-      if (turn !== 0) fpv.yaw += turn * FPV_TURN_RAD_S * total;
-      const along = (k.has("forward") ? 1 : 0) - (k.has("back") ? 1 : 0);
-      const side = (k.has("right") ? 1 : 0) - (k.has("left") ? 1 : 0);
-      if (along !== 0 || side !== 0) {
-        const length = Math.hypot(along, side);
-        const substeps = Math.max(1, Math.ceil(total / FPV_SUBSTEP_S));
-        const speed = ((k.has("run") ? FPV_RUN_SPEED_MS : FPV_WALK_SPEED_MS) * total) / substeps;
-        // Вперёд при yaw=0 — на север (+y плана); вправо — на восток.
-        const fx = -Math.sin(fpv.yaw);
-        const fy = Math.cos(fpv.yaw);
-        const dx = ((fx * along + fy * side) / length) * speed;
-        const dy = ((fy * along - fx * side) / length) * speed;
-        const clampX = (x: number) => (roam ? Math.max(roam.minX, Math.min(roam.maxX, x)) : x);
-        const clampY = (y: number) => (roam ? Math.max(roam.minY, Math.min(roam.maxY, y)) : y);
-        for (let i = 0; i < substeps; i++) {
-          const nx = clampX(fpv.x + dx);
-          const ny = clampY(fpv.y + dy);
-          if (!isBlocked(nx, ny)) {
-            fpv.x = nx;
-            fpv.y = ny;
-          } else if (!isBlocked(nx, fpv.y)) fpv.x = nx;
-          else if (!isBlocked(fpv.x, ny)) fpv.y = ny;
-        }
-      }
-      applyFpvCamera();
-      // Подсказка по прицелу: посадка в центре кадра.
-      if (now - fpv.lastAim > FPV_AIM_INTERVAL_MS) {
-        fpv.lastAim = now;
-        let entry: PlantEntry | null = null;
-        let plantingType: "tree" | "shrub" = "tree";
-        if (plantInstances <= HOVER_INSTANCE_LIMIT) {
-          const aim = new THREE.Raycaster();
-          aim.setFromCamera(new THREE.Vector2(0, 0), camera);
-          aim.far = FPV_AIM_RANGE_M;
-          const hit = aim.intersectObjects(plantMeshes.map(({ mesh }) => mesh), false)[0];
-          if (hit && hit.instanceId !== undefined) {
-            entry = (hit.object.userData.entries as PlantEntry[] | undefined)?.[hit.instanceId] ?? null;
-            plantingType = plantMeshes.find(({ mesh }) => mesh === hit.object)?.plantingType ?? "tree";
-          }
-        }
-        if (entry !== fpv.aimedEntry) {
-          fpv.aimedEntry = entry;
-          if (entry) setHover({ x: container.clientWidth / 2 + 22, y: container.clientHeight / 2 + 22, ...plantHoverText(entry, plantingType) });
-          else setHover(null);
-        }
-      }
-      // Положение — в атрибут: по нему видно, где стоит наблюдатель (и это проверяет стенд).
-      if (now - fpv.lastReport > 200) {
-        fpv.lastReport = now;
-        container.dataset.fpvState = `${fpv.x.toFixed(2)},${fpv.y.toFixed(2)},${fpv.yaw.toFixed(3)}`;
-      }
-    };
-
     viewRef.current = {
       controls,
-      setFirstPerson,
       flyTo(pose) {
         let next: { position: THREE.Vector3; target: THREE.Vector3 };
         if (pose === "walk-next" || pose === "walk-prev") {
@@ -1574,14 +1315,8 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
           // Первое нажатие «вперёд» — первый участок, «назад» — последний; дальше по кругу.
           walkIndex = walkIndex < 0 ? (pose === "walk-next" ? 0 : stops.length - 1) : (walkIndex + (pose === "walk-next" ? 1 : -1) + stops.length) % stops.length;
           onWalkChangeRef.current?.({ index: walkIndex + 1, total: stops.length });
-          if (fpv.active) {
-            // От первого лица «участок» — это телепорт, а не перелёт камеры.
-            placeAtStop(walkIndex);
-            return;
-          }
           next = walkPose(walkIndex);
         } else {
-          if (fpv.active) return;
           walkIndex = -1;
           onWalkChangeRef.current?.({ index: 0, total: stops.length });
           next = poseOf(pose);
@@ -1601,7 +1336,6 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     const flyRaycaster = new THREE.Raycaster();
     const flyPointer = new THREE.Vector2();
     const handleDoubleClick = (event: MouseEvent) => {
-      if (fpv.active) return;
       const rect = renderer.domElement.getBoundingClientRect();
       flyPointer.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
       flyRaycaster.setFromCamera(flyPointer, camera);
@@ -1661,7 +1395,6 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     const pointer = new THREE.Vector2();
     let hoverTimer: ReturnType<typeof setTimeout> | undefined;
     const handlePointerMove = (event: PointerEvent) => {
-      if (fpv.active) return; // от первого лица подсказка идёт по прицелу, а не по курсору
       clearTimeout(hoverTimer);
       // Тянут камеру или облёт идёт — подсказка не нужна и мешала бы.
       if (event.buttons !== 0 || controls.autoRotate) {
@@ -1696,11 +1429,6 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     let frameId = 0;
     const animate = () => {
       frameId = requestAnimationFrame(animate);
-      if (fpv.active) {
-        updateFirstPerson(performance.now());
-        renderer.render(scene, camera);
-        return;
-      }
       if (flight) {
         const k = Math.min((performance.now() - flight.startedAt) / FLIGHT_MS, 1);
         const eased = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
@@ -1712,19 +1440,9 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
       renderer.render(scene, camera);
     };
     animate();
-    // Режим включён до пересборки сцены (смена сезона/темы) — войти в него заново.
-    if (firstPersonRef.current) setFirstPerson(true);
 
     return () => {
       cancelAnimationFrame(frameId);
-      window.removeEventListener("keydown", handleFpvKeyDown, true);
-      window.removeEventListener("keyup", handleFpvKeyUp, true);
-      window.removeEventListener("blur", handleFpvBlur);
-      renderer.domElement.removeEventListener("pointermove", handleFpvLook);
-      renderer.domElement.removeEventListener("pointerdown", handleFpvPointerDown);
-      renderer.domElement.removeEventListener("click", handleFpvClick);
-      if (document.pointerLockElement === renderer.domElement) document.exitPointerLock?.();
-      delete container.dataset.fpvState;
       clearTimeout(saveTimeout);
       clearTimeout(hoverTimer);
       renderer.domElement.removeEventListener("dblclick", handleDoubleClick);
@@ -1758,9 +1476,7 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
     if (viewRef.current) viewRef.current.controls.autoRotate = autoRotate;
     if (autoRotate) setHover(null);
   }, [autoRotate]);
-  useEffect(() => {
-    viewRef.current?.setFirstPerson(firstPerson);
-  }, [firstPerson]);
+
 
   if (!plan) {
     return <div className="flex h-full w-full items-center justify-center text-sm text-stone-500">Нет плана для 3D-просмотра.</div>;
@@ -1775,12 +1491,6 @@ export default function ThreeDView({ layers, plan, crsVerified, season = "summer
   return (
     <div className="relative h-full w-full">
       <div ref={containerRef} className="h-full w-full" />
-      {firstPerson && (
-        <>
-          {/* Прицел: подсказка показывает посадку, на которую он наведён. */}
-          <div aria-hidden className="pointer-events-none absolute left-1/2 top-1/2 z-10 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/80 bg-black/30 shadow-[0_0_4px_rgba(0,0,0,.7)]" />
-        </>
-      )}
       {hover && (
         <div
           role="tooltip"
