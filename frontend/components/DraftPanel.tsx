@@ -56,6 +56,12 @@ export function DraftPanel({
   const [busy, setBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadFormOpen, setUploadFormOpen] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+
+  function pickFile(picked: File | null) {
+    setFile(picked);
+    if (picked && !name) setName(picked.name.replace(/\.[^.]+$/, ""));
+  }
 
   async function guarded(action: () => Promise<void>) {
     setBusy(true);
@@ -79,13 +85,35 @@ export function DraftPanel({
         Граница участка обычно лежит именно в ссылках.
       </p>
       <label
+        // Перетаскивание файла: без preventDefault на dragover браузер не
+        // разрешает бросить файл и открывает его вместо страницы.
+        onDragOver={(e) => {
+          e.preventDefault();
+          setDragOver(true);
+        }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragOver(false);
+          const dropped = e.dataTransfer.files?.[0];
+          if (!dropped) return;
+          if (!/\.(dxf|dwg|zip|geojson|json)$/i.test(dropped.name)) {
+            toast.error("Нужен файл .zip, .dwg, .dxf или .geojson.");
+            return;
+          }
+          pickFile(dropped);
+        }}
         className={cn(
           "flex cursor-pointer flex-col items-center gap-1.5 rounded-lg border border-dashed px-3 py-5 text-center transition-colors",
-          file ? "border-gp-accent-soft-border bg-gp-accent-soft/40" : "border-gp-border hover:border-gp-text-4 hover:bg-gp-hover"
+          dragOver
+            ? "border-gp-accent bg-gp-accent-soft/60"
+            : file
+              ? "border-gp-accent-soft-border bg-gp-accent-soft/40"
+              : "border-gp-border hover:border-gp-text-4 hover:bg-gp-hover"
         )}
       >
         <FileArchive className={cn("h-6 w-6", file ? "text-gp-accent" : "text-gp-text-3")} aria-hidden />
-        <span className="max-w-full truncate text-sm text-gp-text">{file ? file.name : "Выберите .zip, .dwg или .dxf"}</span>
+        <span className="max-w-full truncate text-sm text-gp-text">{file ? file.name : "Перетащите или выберите .zip, .dwg, .dxf"}</span>
         <span className="text-xs text-gp-text-3">
           {file ? <span className="font-mono tabular-nums">{(file.size / 1024 / 1024).toFixed(1)} МБ</span> : "один чертёж — если граница участка в нём"}
         </span>
@@ -93,11 +121,7 @@ export function DraftPanel({
           type="file"
           accept=".dxf,.dwg,.zip,.geojson,.json"
           className="sr-only"
-          onChange={(e) => {
-            const picked = e.target.files?.[0] ?? null;
-            setFile(picked);
-            if (picked && !name) setName(picked.name.replace(/\.[^.]+$/, ""));
-          }}
+          onChange={(e) => pickFile(e.target.files?.[0] ?? null)}
         />
       </label>
       <label className="flex flex-col gap-1.5 text-[13px] text-gp-text-2">

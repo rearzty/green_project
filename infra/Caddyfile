@@ -1,0 +1,17 @@
+# Публичный сервер: один адрес с HTTPS, сертификат Caddy получает сам
+# (Let's Encrypt). Домен — переменная GREENPROJECT_DOMAIN из infra/.env.
+# Фронт ходит в API по тому же адресу (lib/api.ts::defaultApiUrl), поэтому
+# CORS и открытый порт 8000 не нужны.
+{$GREENPROJECT_DOMAIN} {
+	encode gzip
+
+	# Swagger бэкенда — для экспертов, по тому же адресу.
+	@backend path /api/* /docs /docs/* /openapi.json /redoc
+	handle @backend {
+		reverse_proxy backend:8000
+	}
+
+	handle {
+		reverse_proxy frontend:3000
+	}
+}
