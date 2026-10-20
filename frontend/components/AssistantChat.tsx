@@ -217,10 +217,9 @@ export function AssistantChat({
   const [undoing, setUndoing] = useState(false);
   const [status, setStatus] = useState<AssistantStatus | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
-  // /yuna-avatar.png isn't checked into the repo (it's the user's own art,
-  // dropped into frontend/public/ by hand) -- falls back to a plain "Ю"
-  // initial via onError so the widget works identically before and after
-  // that file shows up, no code change needed either way.
+  // /yuna-avatar.png лежит в frontend/public/ (256×256: показывается 28 px,
+  // запас под экраны с высокой плотностью). Если файла нет, onError
+  // подставляет букву «Ю», и виджет работает так же.
   const [avatarError, setAvatarError] = useState(false);
   // Метка-контекст у поля ввода снята крестиком: пока выделение то же самое,
   // Юне оно не передаётся. useSelection на каждое изменение создаёт новый Set,
