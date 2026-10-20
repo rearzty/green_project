@@ -8,6 +8,7 @@ import type { ComplianceCheck, ItemCompliance, PlantingType } from "@/lib/api";
 import { countLabel, CROWN_LABELS, formatDistancePair, formatMeters, OBJECT_FORMS, PLANTING_TYPE_FORMS, PLANTING_TYPE_LABELS } from "@/lib/format";
 import type { SelectionSummary } from "@/lib/hooks/useSelection";
 import { cn } from "@/lib/utils";
+import { YunaAvatar } from "@/components/YunaAvatar";
 
 /** Сколько самых критичных отступов видно сразу: остальные — по раскрытию. */
 const TOP_CHECKS = 3;
@@ -258,7 +259,7 @@ export function InspectorPanel({
       {single && (
         <div className="flex-none border-t border-gp-line px-5 pb-4 pt-3">
           <Button variant="soft" className="w-full" onClick={onAskYuna}>
-            <span className="flex h-5 w-5 items-center justify-center rounded-full bg-[#3A4A2C] text-[11px] font-semibold text-gp-accent-text">Ю</span>
+            <YunaAvatar className="h-5 w-5" letterClassName="text-[11px]" />
             Спросить Юну об этой посадке
           </Button>
         </div>

@@ -5,6 +5,7 @@ import { Search } from "lucide-react";
 
 import { normalizeQuery, searchCommands, type Command } from "@/lib/commands";
 import { cn } from "@/lib/utils";
+import { YunaAvatar } from "@/components/YunaAvatar";
 
 function Highlighted({ text, ranges }: { text: string; ranges: [number, number][] }) {
   if (ranges.length === 0) return <>{text}</>;
@@ -146,7 +147,7 @@ export function CommandPalette({ commands, questions, onAsk, onClose }: CommandP
           </>
         ) : (
           <>
-            <span className="flex h-5 w-5 flex-none items-center justify-center rounded-full bg-[#3A4A2C] text-[11px] font-semibold text-gp-accent-text">Ю</span>
+            <YunaAvatar className="h-5 w-5" letterClassName="text-[11px]" />
             <span className="min-w-0 flex-1 truncate text-gp-text-2">«{row.text}»</span>
             {selected && <span className="flex-none font-mono text-xs text-gp-text-3">{row.typed ? "Tab / Enter" : "Enter"}</span>}
           </>
