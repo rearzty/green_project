@@ -18,8 +18,19 @@ PlantingItemRow).
 from __future__ import annotations
 
 from backend.app.db.models import Plan, PlantingItemRow, Project
-from backend.app.services.geo_io import db_to_shape, layers_to_domain
-from geo_engine.compliance import SPACING_CHECKED_TYPES, ComplianceRecord, explain_items, report_payload, write_trace_csv
+from backend.app.services.geo_io import db_to_shape, display_crs, from_wgs84, layers_to_domain
+from geo_engine.compliance import (
+    SPACING_CHECKED_TYPES,
+    ComplianceRecord,
+    RejectionReason,
+    explain_items,
+    explain_rejection,
+    report_payload,
+    write_trace_csv,
+)
+from geo_engine.territory import MissingTerritoryError, territory_polygon
+from shapely.geometry import Point
+
 from geo_engine.model import PlantingItem
 from geo_engine.norms import PlantingNorms
 
@@ -82,3 +93,34 @@ def full_trace_csv(project: Project, plan: Plan, norms: PlantingNorms, path) -> 
     pairs = explain_rows(project, list(plan.items), norms)
     records = [record for _, record in pairs]
     return write_trace_csv(records, path)
+
+
+def explain_spot(
+    project: Project,
+    plan: Plan,
+    x: float,
+    y: float,
+    planting_type: str,
+    species: str,
+    norms: PlantingNorms,
+) -> list[RejectionReason]:
+    """Почему в этой точке нельзя посадить `planting_type` — с актом и пунктом.
+
+    Точка приходит в координатах карты и переводится в СК проекта тем же
+    `from_wgs84`, что и любая правка. Соседи по плану нужны для интервала между
+    деревьями (МГСН 1.02-02 п. 4.2.9.2), как и в `explain_items_by_id`.
+    """
+    utilities, zones = layers_to_domain(project.layers)
+    point = from_wgs84(Point(x, y), display_crs(project))
+    try:
+        territory = territory_polygon(zones, utilities, allow_order_boundary=project.use_order_boundary)
+    except MissingTerritoryError:
+        territory = None
+    neighbours = (
+        [_row_to_domain(row) for row in plan.items if row.planting_type in SPACING_CHECKED_TYPES]
+        if planting_type in SPACING_CHECKED_TYPES
+        else None
+    )
+    return explain_rejection(
+        point, planting_type, utilities, zones, norms, territory=territory, species=species, neighbours=neighbours
+    )

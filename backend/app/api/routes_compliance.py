@@ -23,7 +23,15 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from backend.app.api.deps import PlanDep
 from backend.app.db.models import Plan
-from backend.app.schemas.compliance import ComplianceCheckOut, ItemComplianceOut, ItemsComplianceRequest, ItemsComplianceResponse
+from backend.app.schemas.compliance import (
+    ComplianceCheckOut,
+    ItemComplianceOut,
+    ItemsComplianceRequest,
+    ItemsComplianceResponse,
+    RejectionReasonOut,
+    SpotRequest,
+    SpotResponse,
+)
 from backend.app.services import compliance_service
 from backend.app.services.pipeline_service import plan_norms
 from geo_engine.compliance import OBJECT_LABELS_RU
@@ -73,6 +81,20 @@ async def compliance_for_items(request: ItemsComplianceRequest, plan: PlanDep) -
     norms = _norms_for(plan)
     pairs = await run_in_threadpool(compliance_service.explain_items_by_id, plan.project, plan, request.ids, norms)
     return ItemsComplianceResponse(items=[_to_schema(item_id, record) for item_id, record in pairs])
+
+
+@router.post("/compliance/spot", response_model=SpotResponse)
+async def compliance_for_spot(request: SpotRequest, plan: PlanDep) -> SpotResponse:
+    """«Почему здесь нельзя?» — причина отказа для конкретной точки со ссылкой
+    на акт и пункт (требование ТЗ: отклонённая посадка тоже объясняется нормой)."""
+    reasons = await run_in_threadpool(
+        compliance_service.explain_spot,
+        plan.project, plan, request.x, request.y, request.planting_type, request.species, _norms_for(plan),
+    )
+    return SpotResponse(
+        allowed=not reasons,
+        reasons=[RejectionReasonOut(**vars(reason)) for reason in reasons],
+    )
 
 
 @router.get("/compliance-report.json")

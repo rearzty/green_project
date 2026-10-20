@@ -24,7 +24,7 @@ import shapely
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
-from geo_engine.buffers import build_exclusion_zone, buildable_area
+from geo_engine.buffers import build_exclusion_zone, buildable_area, point_obstacle_radius_m
 from geo_engine.candidates import ExclusionIndex, ZoningIndex, generate_candidates
 from geo_engine.model import PlantingCandidate, PlantingItem, Utility, Zone
 from geo_engine.norms import PlantingNorms
@@ -293,6 +293,7 @@ def _fit_row_species(
         buildable = buildable_area(
             territory, exclusion, zones, territory_margin_m=type_norms.territory_margin_for(planting_type),
             plantable_types=_plantable_types(type_norms, planting_type),
+            point_obstacle_radius_m=point_obstacle_radius_m(type_norms, planting_type),
         )
         guides = collect_row_guides(
             zones, planting_type, type_norms, candidate_species, catalogue.crown_reference_diameter_m
@@ -986,6 +987,7 @@ def _plan_type_items(
         buildable = buildable_area(
             territory, exclusion, zones, territory_margin_m=margin,
             plantable_types=_plantable_types(type_norms, planting_type),
+            point_obstacle_radius_m=point_obstacle_radius_m(type_norms, planting_type),
         )
         spacing = type_norms.spacing_for(planting_type)
         remaining = buildable
@@ -1102,6 +1104,7 @@ def _plan_type_items(
                     territory, loose_exclusion, zones,
                     territory_margin_m=loose_norms.territory_margin_for(planting_type),
                     plantable_types=_plantable_types(loose_norms, planting_type),
+                    point_obstacle_radius_m=point_obstacle_radius_m(loose_norms, planting_type),
                 )
             # Пересечение, а не замена: из `remaining` уже вычтены кроны
             # поставленного ряда, и терять это нельзя.

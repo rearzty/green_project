@@ -247,6 +247,42 @@ def build_exclusion_zone(
 # project where sidewalk is still only ever a line, like before.
 HARD_OBSTACLE_ZONE_TYPES = ("building", "road", "existing_greenery", "sidewalk")
 
+# Существующее дерево на съёмке — ТОЧКА (ось ствола), а не контур: фильтр по
+# Polygon выше её отбрасывал, и новая посадка могла встать прямо на него.
+# Живой пример — «4. Харьковская улица»: 1708 одиночных деревьев из 34123
+# объектов существующей зелени, и ни одно не мешало посадке.
+POINT_OBSTACLE_ZONE_TYPES = ("existing_greenery",)
+
+
+def point_obstacle_radius_m(norms: PlantingNorms, planting_type: PlantingType) -> float:
+    """Сколько вокруг стоящего дерева закрыто для новой посадки.
+
+    Съёмка даёт только ось ствола: ни породы, ни диаметра кроны существующего
+    дерева в ней нет, так что нормативный интервал по классу кроны
+    (МГСН 1.02-02 п. 4.2.9.2) применить не к чему. Берётся минимум, который
+    геометрически необходим: ствол существующего дерева не должен оказаться под
+    кроной новой посадки — её собственный радиус кроны. Это ограничение
+    практики, а не пункт акта, и в обосновании так и сказано.
+
+    Газону — 0: дерево на газоне это норма, а не конфликт (см. раздел про
+    «дерево поверх газона» в CLAUDE.md); газон полигон и накрывает ствол.
+    """
+    if planting_type == "lawn":
+        return 0.0
+    return float(norms.spacing_for(planting_type).canopy_radius_m)
+
+
+def existing_point_geometries(zones: list[Zone]) -> list[BaseGeometry]:
+    """Точечные объекты существующей зелени (отдельно стоящие деревья)."""
+    return [
+        z.geometry
+        for z in zones
+        if z.zone_type in POINT_OBSTACLE_ZONE_TYPES
+        and z.geometry is not None
+        and z.geometry.geom_type in ("Point", "MultiPoint")
+        and not z.geometry.is_empty
+    ]
+
 
 def buildable_area(
     territory: BaseGeometry,
@@ -254,6 +290,7 @@ def buildable_area(
     other_zones: list[Zone],
     territory_margin_m: float = 0.0,
     plantable_types: tuple[str, ...] = (),
+    point_obstacle_radius_m: float = 0.0,
 ) -> BaseGeometry:
     """Territory minus the exclusion zone minus any hard obstacles (buildings,
     existing pavement/roads, already-planted greenery) that are never
@@ -271,6 +308,11 @@ def buildable_area(
     no obstacle geometry to grow, the boundary itself is the constraint).
     Without this, a candidate could land right at the edge of the plot --
     found live on real data.
+
+    `point_obstacle_radius_m` — радиус круга вокруг каждого точечного
+    существующего дерева (`point_obstacle_radius_m()` выше). Ноль — точки
+    ничего не закрывают, прежнее поведение: так сделано у вызывающих, которым
+    радиус кроны неизвестен (обучение скоринга), а не по умолчанию «правильно».
     """
     if territory_margin_m > 0:
         territory = territory.buffer(-territory_margin_m)
@@ -293,6 +335,12 @@ def buildable_area(
         and z.zone_type not in plantable_types
         and z.geometry.geom_type in ("Polygon", "MultiPolygon")
     ]
+    if point_obstacle_radius_m > 0:
+        points = existing_point_geometries(other_zones)
+        if points:
+            hard_obstacles.extend(
+                shapely.buffer(np.array(points, dtype=object), point_obstacle_radius_m, quad_segs=_BUFFER_QUAD_SEGS)
+            )
     if exclusion_zone is not None and not exclusion_zone.is_empty:
         result = territory.difference(exclusion_zone)
     else:
