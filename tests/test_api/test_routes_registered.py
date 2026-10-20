@@ -60,6 +60,7 @@ def test_expected_routes_are_registered():
     assert "/api/config/assistant" in paths
     assert "/api/projects/{project_id}/assistant/message" in paths
     assert "/api/projects/{project_id}/plans/{plan_id}/compliance/items" in paths
+    assert "/api/projects/{project_id}/plans/{plan_id}/compliance/spot" in paths
     assert "/api/projects/{project_id}/plans/{plan_id}/compliance-report.json" in paths
     assert "/api/projects/{project_id}/plans/{plan_id}/compliance-report.csv" in paths
     assert "/api/projects/{project_id}/layers" in paths

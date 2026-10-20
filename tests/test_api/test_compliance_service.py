@@ -14,7 +14,7 @@ import csv
 from shapely.geometry import LineString, Point, Polygon
 
 from backend.app.db.models import Layer, Plan, PlantingItemRow, Project
-from backend.app.services.compliance_service import explain_items_by_id, full_report, full_trace_csv
+from backend.app.services.compliance_service import explain_items_by_id, explain_spot, full_report, full_trace_csv
 from backend.app.services.geo_io import shape_to_db
 from geo_engine.norms import load_norms
 
@@ -156,3 +156,42 @@ class TestOneItemSeesItsNeighbours:
         assert item_id == "tree-far"
         neighbour = next(c for c in record.checks if c.object_type == "neighbour_tree")
         assert neighbour.actual_m < neighbour.required_m and not record.compliant
+
+
+class TestExplainSpot:
+    """«Почему здесь нельзя?» — причина отказа в точке, с актом и пунктом."""
+
+    def test_a_spot_next_to_the_gas_pipe_is_refused_with_a_cited_reason(self):
+        plan = _plan_with_gas_pipe_and_two_trees()
+
+        reasons = explain_spot(plan.project, plan, 60.0, 49.0, "tree", "", load_norms())
+
+        setback = [r for r in reasons if r.kind == "setback"]
+        assert [r.object_type for r in setback] == ["gas_pipe"]
+        assert setback[0].required_m == 1.5
+        assert "п." in setback[0].citation
+
+    def test_a_clear_spot_has_no_reasons(self):
+        plan = _plan_with_gas_pipe_and_two_trees()
+
+        assert explain_spot(plan.project, plan, 60.0, 20.0, "tree", "", load_norms()) == []
+
+    def test_a_spot_crowding_an_existing_plan_tree_cites_the_crown_interval(self):
+        plan = _plan_with_gas_pipe_and_two_trees()  # tree-far стоит в (10, 10)
+
+        reasons = explain_spot(plan.project, plan, 11.0, 10.0, "tree", "Липа мелколистная", load_norms())
+
+        assert [r.kind for r in reasons if r.kind == "interval"] == ["interval"]
+
+
+class TestReportNamesAllThreeReferenceActs:
+    def test_623_pp_is_listed_as_a_reference_act_without_a_clause_invented_for_it(self):
+        plan = _plan_with_gas_pipe_and_two_trees()
+
+        report = full_report(plan.project, plan, load_norms())
+
+        [act] = [a for a in report["reference_acts"] if "623" in a["act"]]
+        assert act["used_for_setbacks"] is False
+        assert act["verified"] is False
+        # Ни одна проверка не ссылается на 623-ПП: пункта у нас нет, и выдумывать нельзя.
+        assert not any("623" in source["act"] for source in report["sources"].values())

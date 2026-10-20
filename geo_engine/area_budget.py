@@ -25,7 +25,7 @@ import shapely
 from shapely.geometry.base import BaseGeometry
 from shapely.strtree import STRtree
 
-from geo_engine.buffers import HARD_OBSTACLE_ZONE_TYPES
+from geo_engine.buffers import HARD_OBSTACLE_ZONE_TYPES, existing_point_geometries, point_obstacle_radius_m
 from geo_engine.compliance import OBJECT_LABELS_RU
 from geo_engine.model import Utility, Zone
 from geo_engine.norms import PlantingNorms
@@ -153,7 +153,13 @@ def _blocker_masks(
         and not (z.zone_type == "sidewalk" and norms.paving_plantable(planting_type))
         and z.geometry.geom_type in ("Polygon", "MultiPolygon")
     ]
-    masks[HARD_OBSTACLES_KEY] = _blocked_by(points, hard, 0.0)
+    hard_mask = _blocked_by(points, hard, 0.0)
+    # Отдельно стоящие деревья съёмки — точки: закрывают круг радиуса кроны
+    # новой посадки, как в buffers.buildable_area (те же числа, не копия правил).
+    radius = point_obstacle_radius_m(norms, planting_type)
+    if radius > 0:
+        hard_mask |= _blocked_by(points, existing_point_geometries(zones), radius)
+    masks[HARD_OBSTACLES_KEY] = hard_mask
 
     labels = {
         **OBJECT_LABELS_RU,

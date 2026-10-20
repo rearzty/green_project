@@ -26,9 +26,12 @@ import csv
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+import numpy as np
+import shapely
 from shapely.geometry.base import BaseGeometry
 from shapely.strtree import STRtree
 
+from geo_engine.buffers import existing_point_geometries, point_obstacle_radius_m
 from geo_engine.model import PlantingItem, Utility, Zone
 from geo_engine.norms import PlantingNorms
 from geo_engine.species import SpeciesCatalogue, load_catalogue
@@ -357,6 +360,144 @@ def explain_items(
     return records
 
 
+@dataclass
+class RejectionReason:
+    """Одна причина, по которой в этом месте посадка невозможна.
+
+    Требование ТЗ — «если посадка отклонена, причина со ссылкой на норму».
+    До этого отчёт объяснял только принятые посадки, а про отклонённое место
+    говорил лишь общую долю закрытой площади (`area_budget`). Здесь — про
+    конкретную точку: что именно мешает и по какому пункту.
+
+    `citation` пуст не бывает: там, где норматива нет (отступ от границы
+    участка, существующее дерево), стоит «Инженерная практика (не норматив)» и
+    `verified=False` — эксперт видит, что это не пункт акта, а не читает
+    ссылку как норму.
+    """
+
+    kind: str
+    text: str
+    citation: str
+    verified: bool
+    object_type: str | None = None
+    required_m: float | None = None
+    actual_m: float | None = None
+
+
+def _practice_citation(norms: PlantingNorms) -> str:
+    source = norms.sources.get("practice")
+    return source.citation() if source is not None else "Инженерная практика (не норматив)"
+
+
+def explain_rejection(
+    point: BaseGeometry,
+    planting_type: str,
+    utilities: list[Utility],
+    zones: list[Zone],
+    norms: PlantingNorms,
+    territory: BaseGeometry | None = None,
+    species: str = "",
+    catalogue: SpeciesCatalogue | None = None,
+    neighbours: list[PlantingItem] | None = None,
+) -> list[RejectionReason]:
+    """Почему в точке `point` нельзя посадить `planting_type`.
+
+    Пустой список — место допустимо. Расстояния до сетей и зданий считает тот
+    же `explain_items`, что объясняет принятые посадки, а не копия правил:
+    причина отказа и обоснование принятия не могут разойтись в одном и том же
+    месте. Сверх него — то, что в `explain_items` не входит, потому что не
+    отступ от объекта с нормой: ствол существующего дерева под кроной новой
+    посадки, существующая зелень под ногами, граница участка.
+    """
+    catalogue = catalogue or load_catalogue()
+    reasons: list[RejectionReason] = []
+
+    probe = PlantingItem(geometry=point, planting_type=planting_type, species=species, score=0.0, rationale="")
+    (record,) = explain_items([probe], utilities, zones, norms, catalogue, neighbours=neighbours)
+    for check in record.checks:
+        if check.satisfied:
+            continue
+        label = OBJECT_LABELS_RU.get(check.object_type, check.object_type)
+        reasons.append(
+            RejectionReason(
+                kind="interval" if check.source_id == CROWN_SPACING_SOURCE_ID else "setback",
+                text=f"{label}: требуется {check.required_m:.2f} м, в этой точке {check.actual_m:.2f} м",
+                citation=check.citation,
+                verified=check.verified,
+                object_type=check.object_type,
+                required_m=check.required_m,
+                actual_m=check.actual_m,
+            )
+        )
+
+    practice = _practice_citation(norms)
+
+    radius = point_obstacle_radius_m(norms, planting_type)
+    if radius > 0:
+        trees = existing_point_geometries(zones)
+        if trees:
+            distances = shapely.distance(np.array(trees, dtype=object), point)
+            nearest = float(distances.min())
+            if nearest < radius - _TOLERANCE_M:
+                reasons.append(
+                    RejectionReason(
+                        kind="existing_tree",
+                        text=(
+                            f"Существующее дерево: ствол в {nearest:.2f} м, а крона новой посадки "
+                            f"({radius:.2f} м) накрыла бы его"
+                        ),
+                        citation=practice,
+                        verified=False,
+                        object_type="existing_greenery",
+                        required_m=radius,
+                        actual_m=nearest,
+                    )
+                )
+
+    for zone in zones:
+        if (
+            zone.zone_type == "existing_greenery"
+            and zone.geometry.geom_type in ("Polygon", "MultiPolygon")
+            and zone.geometry.covers(point)
+        ):
+            reasons.append(
+                RejectionReason(
+                    kind="existing_object",
+                    text="Место занято существующей зеленью (контур по съёмке)",
+                    citation=practice,
+                    verified=False,
+                    object_type="existing_greenery",
+                )
+            )
+            break
+
+    if territory is not None and not territory.is_empty:
+        if not territory.covers(point):
+            reasons.append(
+                RejectionReason(
+                    kind="outside_territory",
+                    text="Точка за границей участка",
+                    citation=practice,
+                    verified=False,
+                )
+            )
+        else:
+            margin = norms.territory_margin_for(planting_type)
+            actual = float(territory.boundary.distance(point))
+            if margin > 0 and actual < margin - _TOLERANCE_M:
+                reasons.append(
+                    RejectionReason(
+                        kind="territory_margin",
+                        text=f"Отступ от границы участка: требуется {margin:.2f} м, в этой точке {actual:.2f} м",
+                        citation=practice,
+                        verified=False,
+                        required_m=margin,
+                        actual_m=actual,
+                    )
+                )
+    return reasons
+
+
 def _record(index: int, item: PlantingItem, checks: list[ConstraintCheck]) -> ComplianceRecord:
     violations = [c for c in checks if not c.satisfied]
     compliant = not violations
@@ -428,6 +569,26 @@ def unverified_sources(records: list[ComplianceRecord]) -> dict[str, int]:
     return counts
 
 
+# Акты, которые ТЗ называет опорными, но на которых не стоит ни одно число
+# отступа в этом проекте. Идут в отчёт отдельной таблицей, чтобы эксперт видел
+# позицию по каждому из трёх актов, а не искал 623-ПП в `sources` и не находил.
+REFERENCE_ACTS_WITHOUT_SETBACKS: list[dict] = [
+    {
+        "act": "Постановление Правительства Москвы № 623-ПП",
+        "role_in_brief": "дополнительные городские требования к размещению насаждений и их согласованию (ТЗ, с. 2)",
+        "used_for_setbacks": False,
+        "verified": False,
+        "note": (
+            "Текста акта нет в переданном комплекте нормативных документов, поэтому ни одно значение "
+            "отступа и ни одна ссылка на пункт на нём не основаны: отступы заданы СП 42.13330.2016, "
+            "743-ПП и МГСН 1.02-02. Пункт 623-ПП в обосновании не называется намеренно — назвать его "
+            "без текста значило бы выдать догадку за ссылку. Порядок согласования посадок — вне "
+            "геометрического расчёта."
+        ),
+    }
+]
+
+
 def report_payload(records: list[ComplianceRecord], norms: PlantingNorms, **meta) -> dict:
     """The machine-readable justification file the brief asks to ship with the plan.
 
@@ -496,6 +657,7 @@ def report_payload(records: list[ComplianceRecord], norms: PlantingNorms, **meta
         "violations": violations,
         "unverified_citations": unverified_sources(records),
         "sources": sources,
+        "reference_acts": REFERENCE_ACTS_WITHOUT_SETBACKS,
         "table_rows": rows,
         "items": items,
     }

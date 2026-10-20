@@ -45,3 +45,30 @@ class ItemsComplianceRequest(BaseModel):
 
 class ItemsComplianceResponse(BaseModel):
     items: list[ItemComplianceOut]
+
+
+class SpotRequest(BaseModel):
+    """Точка на карте (те же координаты, что у правок: WGS84 lng/lat или
+    локальные метры, если СК проекта не проверена) и тип посадки, который в неё
+    хотели поставить."""
+
+    x: float
+    y: float
+    planting_type: str = "tree"
+    species: str = ""
+
+
+class RejectionReasonOut(BaseModel):
+    kind: str
+    text: str
+    citation: str
+    verified: bool
+    object_type: str | None = None
+    required_m: float | None = None
+    actual_m: float | None = None
+
+
+class SpotResponse(BaseModel):
+    # Пустой список reasons — место допустимо.
+    allowed: bool
+    reasons: list[RejectionReasonOut]
