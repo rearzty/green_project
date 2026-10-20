@@ -1,6 +1,6 @@
 # API-контракт backend ↔ frontend
 
-Все геометрические ответы — GeoJSON (RFC 7946), `EPSG:4326` (WGS84), готовые для Leaflet. Базовый URL берётся фронтендом из `NEXT_PUBLIC_API_URL`.
+Все геометрические ответы — GeoJSON (RFC 7946), `EPSG:4326` (WGS84), готовые для Leaflet. Базовый URL берётся фронтендом из `NEXT_PUBLIC_API_URL`; без неё — тот же адрес, что у страницы, если она открыта на стандартном порту (сервер за Caddy: [greenproject.space](https://greenproject.space), Swagger — [/docs](https://greenproject.space/docs)), иначе `http://<хост страницы>:8000` (локальный запуск).
 
 | Метод | Путь | Описание |
 |---|---|---|

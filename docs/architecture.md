@@ -26,8 +26,9 @@ frontend/     Next.js + TypeScript + Tailwind + react-leaflet + three.js —
               интерактивная карта, ручная правка, 3D-просмотр, экспорт.
 scripts/      plan_dxf.py (основной CLI), generate_synthetic_data.py, train_synthetic.py.
 tests/        Зеркалит geo_engine/ml_scoring/backend — единый каталог, не внутри пакетов.
-infra/        Dockerfile.backend (компилирует LibreDWG, использует ODA File Converter),
-              Dockerfile.frontend, docker-compose.yml.
+infra/        Dockerfile.backend (ODA File Converter из infra/vendor, LibreDWG — запасной),
+              Dockerfile.frontend, docker-compose.yml; для сервера с доменом —
+              docker-compose.prod.yml + Caddyfile (HTTPS, наружу только 80/443).
 ```
 
 `geo_engine` и `ml_scoring` не знают друг о друге и не знают о FastAPI — `backend/app/services/pipeline_service.py` и `scripts/plan_dxf.py` независимо друг от друга связывают их вместе (оба — тонкие вызывающие слои над одним и тем же `geo_engine.planner.plan_items()`).
@@ -69,4 +70,4 @@ python -m scripts.plan_dxf --input <чертёж или папка проект�
 docker compose -f infra/docker-compose.yml up --build
 ```
 
-Backend+Swagger — `localhost:8000/docs`, frontend — `localhost:3000`. Без Docker: `pip install -e ".[dev]"`, `pytest`, `python -m uvicorn backend.app.main:app --reload` (БД не нужна). Полная инструкция, включая сборку DWG-конвертера, — `docs/submission_documentation.md`.
+Backend+Swagger — `localhost:8000/docs`, frontend — `localhost:3000`. Рабочая версия — [greenproject.space](https://greenproject.space) (развёртывание — раздел 8.5 `docs/submission_documentation.md`). Без Docker: `pip install -e ".[dev]"`, `pytest`, `python -m uvicorn backend.app.main:app --reload` (БД не нужна). Полная инструкция, включая сборку DWG-конвертера, — `docs/submission_documentation.md`.
