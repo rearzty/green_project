@@ -20,6 +20,7 @@ import { RightColumn } from "@/components/RightColumn";
 import { suggestionChips, type CommandResult } from "@/lib/assistantCommands";
 import { errorMessage } from "@/lib/toast";
 import { cn } from "@/lib/utils";
+import { YunaAvatar } from "@/components/YunaAvatar";
 
 /** Итог одной команды под ответом Юны. Сама функция отмены живёт в undoFns
  * компонента: в состоянии чата — только то, что рисуется. */
@@ -217,10 +218,6 @@ export function AssistantChat({
   const [undoing, setUndoing] = useState(false);
   const [status, setStatus] = useState<AssistantStatus | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
-  // /yuna-avatar.png лежит в frontend/public/ (256×256: показывается 28 px,
-  // запас под экраны с высокой плотностью). Если файла нет, onError
-  // подставляет букву «Ю», и виджет работает так же.
-  const [avatarError, setAvatarError] = useState(false);
   // Метка-контекст у поля ввода снята крестиком: пока выделение то же самое,
   // Юне оно не передаётся. useSelection на каждое изменение создаёт новый Set,
   // так что «то же самое» — это та же ссылка, и новое выделение метку
@@ -438,13 +435,6 @@ export function AssistantChat({
     setConfirmClear(false);
   }
 
-  function avatar(className: string) {
-    if (avatarError) {
-      return <span className={cn(className, "flex items-center justify-center rounded-full bg-[#3A4A2C] font-semibold text-gp-accent-text")}>Ю</span>;
-    }
-    return <img src="/yuna-avatar.png" alt="Юна" className={cn(className, "rounded-full object-cover")} onError={() => setAvatarError(true)} />;
-  }
-
   // Вопрос извне (палитра команд): каждый новый seq — одно сообщение.
   // Обработанный seq запоминаем в ref, а не в состоянии: повторный рендер с тем
   // же запросом не должен отправить его второй раз.
@@ -509,7 +499,7 @@ export function AssistantChat({
   return (
     <RightColumn label="Юна">
       <div className="flex items-center gap-2.5 border-b border-gp-line py-2.5 pl-5 pr-2">
-        {avatar("h-7 w-7 flex-none text-[13px]")}
+        <YunaAvatar className="h-7 w-7" letterClassName="text-[13px]" />
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <p className="flex-none text-[15px] font-medium text-gp-text">Юна</p>
           {status && <ModeBadge status={status} />}
