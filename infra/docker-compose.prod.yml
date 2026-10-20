@@ -1,0 +1,32 @@
+# Публичный сервер поверх docker-compose.yml:
+#   docker compose -f infra/docker-compose.yml -f infra/docker-compose.prod.yml up -d --build
+# Наружу смотрит только Caddy (80/443, HTTPS). Бэкенд и фронт доступны
+# лишь внутри сети compose: Docker публикует порты в обход ufw, поэтому
+# закрыть их файрволом хоста нельзя — их просто не публикуем.
+services:
+  backend:
+    ports: !reset []
+
+  frontend:
+    ports: !reset []
+
+  caddy:
+    image: caddy:2.10.2
+    restart: unless-stopped
+    environment:
+      GREENPROJECT_DOMAIN: ${GREENPROJECT_DOMAIN:?в infra/.env нужен GREENPROJECT_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+      - frontend
+
+volumes:
+  caddy_data:
+  caddy_config:

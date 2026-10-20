@@ -8,8 +8,17 @@
 // unmodified for localhost, 127.0.0.1, or a LAN IP (e.g. a phone on the
 // same wifi hitting http://192.168.1.43:3000), including across a DHCP
 // lease renewal that changes that IP, since nothing here is hardcoded to it.
-const API_URL =
-  process.env.NEXT_PUBLIC_API_URL ?? (typeof window !== "undefined" ? `http://${window.location.hostname}:8000` : "http://localhost:8000");
+// Страница на стандартном порту (80/443, без номера в адресе) — это сервер
+// за обратным прокси (infra/Caddyfile), который отдаёт /api с того же
+// адреса: тогда API — тот же origin. Иначе по https браузер заблокировал
+// бы запросы на http://…:8000 как смешанное содержимое.
+function defaultApiUrl(): string {
+  if (typeof window === "undefined") return "http://localhost:8000";
+  if (window.location.port === "") return window.location.origin;
+  return `http://${window.location.hostname}:8000`;
+}
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? defaultApiUrl();
 
 export type GeoJSONGeometry = { type: string; coordinates: unknown };
 export type GeoJSONFeature = { type: "Feature"; geometry: GeoJSONGeometry; properties: Record<string, unknown> };
